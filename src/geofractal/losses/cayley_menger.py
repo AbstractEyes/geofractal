@@ -3,7 +3,7 @@ from torch import Tensor, nn
 from typing import Dict
 
 from geovocab2.shapes.formula import SimplexQuality, SimplexVolumeExtended
-from geovocab2.train.config.pentachoron_flow import PentachoronFlowConfig
+from geofractal.config.pentachoron_flow import PentachoronFlowConfig
 
 
 class CayleyMengerValidator(nn.Module):

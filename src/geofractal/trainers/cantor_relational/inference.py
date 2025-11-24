@@ -5,7 +5,7 @@
 import torch
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 from transformers import T5EncoderModel, T5Tokenizer
-from geovocab2.train.model.relational.cantor_relational import create_cantor_relational
+from geofractal.model.relational.cantor_relational import create_cantor_relational
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 

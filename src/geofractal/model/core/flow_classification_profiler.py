@@ -19,8 +19,8 @@ import time
 from typing import Dict, Optional
 from torch import Tensor
 
-from geovocab2.train.config.pentachoron_flow import PentachoronFlowConfig
-from geovocab2.train.model.core.flow_classification import PentachoronFlowNetwork
+from geofractal.config.pentachoron_flow import PentachoronFlowConfig
+from geofractal.model.core.flow_classification import PentachoronFlowNetwork
 
 class ProfiledPentachoronFlow(torch.nn.Module):
     """Profiling wrapper for PentachoronFlowNetwork."""

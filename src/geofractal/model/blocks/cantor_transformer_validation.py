@@ -11,7 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from typing import Dict, List
 
-from geovocab2.train.model.layers.attention.cantor_global import (
+from geofractal.model.layers.attention.cantor_global import (
     CantorAttention, CantorAttentionConfig
 )
 

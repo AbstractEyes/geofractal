@@ -1,4 +1,4 @@
-# geovocab2/train/model/layers/position/cantor_pe.py
+# geofractal/model/layers/position/cantor_pe.py
 
 """
 Simple Cantor Position Encoding
@@ -335,7 +335,7 @@ def test_with_attention():
     print("PE + ATTENTION HARMONY TEST")
     print("=" * 70)
 
-    from geovocab2.train.model.layers.attention.cantor_global import (
+    from geofractal.model.layers.attention.cantor_global import (
         CantorAttention, CantorAttentionConfig
     )
 

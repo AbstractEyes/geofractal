@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 import csv
 
-import geovocab2.train.model.blocks.geometric_basin
+import geofractal.model.blocks.geometric_basin
 
 # Hugging Face Hub integration
 try:
@@ -296,7 +296,7 @@ class GeometricBasinClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Devil's Staircase PE
-        self.pe = geovocab2.train.model.blocks.geometric_basin.BeatrixStaircasePositionalEncodings(pe_levels, pe_features_per_level)
+        self.pe = geofractal.model.blocks.geometric_basin.BeatrixStaircasePositionalEncodings(pe_levels, pe_features_per_level)
 
         # PE modulator
         self.pe_modulator = nn.Sequential(

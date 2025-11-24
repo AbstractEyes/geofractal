@@ -1,4 +1,4 @@
-# geovocab2/train/model/vae/loader.py
+# geofractal/model/vae/loader.py
 
 """
 VAE Lyra Model Loader - Intelligent Version Detection and Loading
@@ -22,13 +22,13 @@ Known Models:
 - AbstractPhil/vae-lyra-xl-adaptive-cantor: Adaptive Cantor with decoupled T5 (v2)
 
 Usage:
-    from geovocab2.train.model.vae.loader import load_vae_lyra
+    from geofractal.model.vae.loader import load_vae_lyra
 
     # Auto-detect version
     model = load_vae_lyra("AbstractPhil/vae-lyra-xl-adaptive-cantor")
 
     # List all known models
-    from geovocab2.train.model.vae.loader import list_known_models
+    from geofractal.model.vae.loader import list_known_models
     list_known_models()
 
     # Get model info
@@ -286,7 +286,7 @@ def load_vae_lyra_v1(
     Returns:
         VAE Lyra v1 model
     """
-    from geovocab2.train.model.vae.vae_lyra import (
+    from geofractal.model.vae.vae_lyra import (
         MultiModalVAE,
         MultiModalVAEConfig
     )
@@ -362,7 +362,7 @@ def load_vae_lyra_v2(
     Returns:
         VAE Lyra v2 model
     """
-    from geovocab2.train.model.vae.vae_lyra_v2 import (
+    from geofractal.model.vae.vae_lyra_v2 import (
         MultiModalVAE,
         MultiModalVAEConfig
     )
@@ -733,7 +733,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("✨ VAE Lyra Loader ready for use!")
     print("\nQuick start:")
-    print("  from geovocab2.train.model.vae.loader import load_vae_lyra, list_known_models")
+    print("  from geofractal.model.vae.loader import load_vae_lyra, list_known_models")
     print("  ")
     print("  # See what's available")
     print("  list_known_models()")

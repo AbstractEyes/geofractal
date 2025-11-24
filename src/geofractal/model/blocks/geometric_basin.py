@@ -43,7 +43,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, Dict
 from geovocab2.shapes.formula import CayleyMengerFromSimplex
 from geovocab2.shapes.formula.symbolic.cantor import SimplexCapacityController
-from geovocab2.train.model.positional.beatrix_staircase import BeatrixStaircasePositionalEncodings
+from geofractal.model.positional.beatrix_staircase import BeatrixStaircasePositionalEncodings
 
 
 class GeometricBasin(nn.Module):

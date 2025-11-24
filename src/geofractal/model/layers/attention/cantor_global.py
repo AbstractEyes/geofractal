@@ -1,4 +1,4 @@
-# geovocab2/train/model/layers/attention/cantor_global.py
+# geofractal/model/layers/attention/cantor_global.py
 
 """
 Cantor Global Attention - O(n) Sparse Attention Mechanism

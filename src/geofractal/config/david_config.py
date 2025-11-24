@@ -4,7 +4,7 @@ David Configuration System
 Configuration and presets for David multi-scale crystal classifier.
 Separated from model implementation for clean architecture.
 
-Should be placed at: geovocab2/train/config/david_config.py
+Should be placed at: geofractal/config/david_config.py
 
 Author: AbstractPhil
 """

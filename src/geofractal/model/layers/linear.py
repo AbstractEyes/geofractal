@@ -1,4 +1,4 @@
-# geovocab2.train.model.layers.linear.py
+# geofractal.model.layers.linear.py
 # ============================================================
 # CantorLinear: Fractal‑structured linear transformation layer
 # Author: AbstractPhil

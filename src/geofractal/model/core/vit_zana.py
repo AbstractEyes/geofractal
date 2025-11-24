@@ -10,7 +10,7 @@ import numpy as np
 import math
 from typing import Optional, Tuple, Dict, Any
 
-from geovocab2.train.utils.pentachoron_stabilizer import PentachoronStabilizer
+from geofractal.utils.pentachoron_stabilizer import PentachoronStabilizer
 
 
 class PentachoraEmbedding(nn.Module):

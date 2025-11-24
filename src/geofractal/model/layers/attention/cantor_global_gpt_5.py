@@ -1,4 +1,4 @@
-# geovocab2/train/model/layers/attention/cantor_global_plus.py
+# geofractal/layers/attention/cantor_global_plus.py
 import math, torch
 import torch.nn as nn
 import torch.nn.functional as F

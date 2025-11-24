@@ -21,7 +21,7 @@ import json
 from safetensors.torch import save_file, load_file
 
 # Assuming David imports
-from geovocab2.train.model.core.david import (
+from geofractal.model.core.david import (
     David,
     DavidArchitectureConfig,
     RoseLoss,

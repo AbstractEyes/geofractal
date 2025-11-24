@@ -1,4 +1,4 @@
-# geovocab2/train/model/layers/attention/cantor_multiheaded_fusion.py
+# geofractal/layers/attention/cantor_multiheaded_fusion.py
 # OPTIMIZED VERSION - ALL FIXES APPLIED
 
 """

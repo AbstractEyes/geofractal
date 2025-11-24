@@ -24,9 +24,9 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
 
-from geovocab2.train.train_epoch import TrainEpoch
-from geovocab2.train.config.config_train_epoch import TrainEpochConfig
-from geovocab2.train.model.simple_classifier import SimpleClassifier
+from geofractal.train_epoch import TrainEpoch
+from geofractal.config.config_train_epoch import TrainEpochConfig
+from geofractal.model.simple_classifier import SimpleClassifier
 
 
 class TrainSimpleClassifier(TrainEpoch):

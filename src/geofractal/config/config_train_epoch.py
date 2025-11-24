@@ -16,7 +16,7 @@ License: MIT
 
 from dataclasses import dataclass
 from typing import Optional
-from geovocab2.train.config.config_base import BaseConfig
+from geofractal.config.config_base import BaseConfig
 
 
 @dataclass

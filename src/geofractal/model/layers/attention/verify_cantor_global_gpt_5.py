@@ -1,4 +1,4 @@
-# geovocab2/train/model/layers/attention/validation_cantor_global.py
+# geofractal/model/layers/attention/validation_cantor_global.py
 
 """
 Comprehensive Cantor Attention Validation and Benchmark
@@ -6,10 +6,10 @@ Tests functionality and performance of Cantor Attention vs Standard Attention
 Includes testing of adaptive window sizing for improved memory efficiency
 
 Usage:
-    python -m geovocab2.train.model.layers.attention.validation_cantor_global              # Quick tests only (default)
-    python -m geovocab2.train.model.layers.attention.validation_cantor_global --bench      # Quick tests + full benchmark
-    python -m geovocab2.train.model.layers.attention.validation_cantor_global --bench-only # Benchmark only (no tests)
-    python -m geovocab2.train.model.layers.attention.validation_cantor_global --adaptive   # Test adaptive window mode
+    python -m geofractal.model.layers.attention.validation_cantor_global              # Quick tests only (default)
+    python -m geofractal.model.layers.attention.validation_cantor_global --bench      # Quick tests + full benchmark
+    python -m geofractal.model.layers.attention.validation_cantor_global --bench-only # Benchmark only (no tests)
+    python -m geofractal.model.layers.attention.validation_cantor_global --adaptive   # Test adaptive window mode
 """
 
 import torch
@@ -23,7 +23,7 @@ from typing import Dict
 import argparse
 import sys
 
-from geovocab2.train.model.layers.attention.cantor_global_gpt_5 import (
+from geofractal.model.layers.attention.cantor_global_gpt_5 import (
     CantorAttentionPlus,
     CantorAttentionPlusConfig,
     create_cantor_attention_plus,
@@ -656,11 +656,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m geovocab2.train.model.layers.attention.validation_cantor_global              # Quick tests only (default)
-  python -m geovocab2.train.model.layers.attention.validation_cantor_global --bench      # Quick tests + full benchmark
-  python -m geovocab2.train.model.layers.attention.validation_cantor_global --bench-only # Full benchmark only
-  python -m geovocab2.train.model.layers.attention.validation_cantor_global --adaptive   # Test adaptive window mode
-  python -m geovocab2.train.model.layers.attention.validation_cantor_global --bench --adaptive  # Benchmark with adaptive window
+  python -m geofractal.model.layers.attention.validation_cantor_global              # Quick tests only (default)
+  python -m geofractal.model.layers.attention.validation_cantor_global --bench      # Quick tests + full benchmark
+  python -m geofractal.model.layers.attention.validation_cantor_global --bench-only # Full benchmark only
+  python -m geofractal.model.layers.attention.validation_cantor_global --adaptive   # Test adaptive window mode
+  python -m geofractal.model.layers.attention.validation_cantor_global --bench --adaptive  # Benchmark with adaptive window
         """
     )
     parser.add_argument('--bench', action='store_true',

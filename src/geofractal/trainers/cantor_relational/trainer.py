@@ -1,13 +1,10 @@
-# geovocab2/train/trainers/cantor_relational/trainer.py
+# geofractal/trainers/cantor_relational/trainer.py
 
 """
 Trainer for Cantor Relational Model - Colab Optimized
 
-Install via:
-    !pip install git+https://github.com/YourUsername/geovocab2.git
-
 Usage:
-    from geovocab2.train.trainers.cantor_relational_trainer import (
+    from geofractal.trainers.cantor_relational_trainer import (
         CantorRelationalTrainer, TrainerConfig
     )
 """
@@ -29,11 +26,11 @@ import requests
 import random
 from collections import Counter
 
-from geovocab2.train.model.relational.cantor_relational import (
+from geofractal.model.relational.cantor_relational import (
     create_cantor_relational,
     CantorRelationalConfig
 )
-from geovocab2.train.losses.cantor import CantorRelationalVAELoss
+from geofractal.losses.cantor import CantorRelationalVAELoss
 from geovocab2.data.prompt.symbolic_tree import SynthesisSystem
 
 
@@ -537,10 +534,10 @@ class CantorRelationalTrainer:
 # learned to reconstruct images from text prompts using the Cantor
 # relational architecture.
 
-#!pip install -q git+https://github.com/AbstractPhil/geovocab2.git
+#!pip install -q git+https://github.com/AbstractPhil/geofractal.git
 
 import torch
-from geovocab2.train.trainers.cantor_relational.trainer import (
+from geofractal.trainers.cantor_relational.trainer import (
     CantorRelationalTrainer,
     TrainerConfig
 )

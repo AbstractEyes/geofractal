@@ -1,4 +1,4 @@
-# geovocab2/train/model/layers/attention/cantor_multiheaded_fusion.py
+# geofractal/model/layers/attention/cantor_multiheaded_fusion.py
 # OPTIMIZED VERSION - BUFFER & DTYPE MANAGEMENT
 
 """

@@ -1,4 +1,4 @@
-# geovocab2/train/model/losses/cantor_relational_loss.py
+# geofractal/model/losses/cantor_relational_loss.py
 
 """
 VAE-style Loss for Cantor Relational Model

@@ -1,4 +1,4 @@
-# geovocab2/train/model/cantor_relational.py
+# geofractal/model/cantor_relational.py
 
 """
 Cantor Relational Model - Cross-Modal Geometric Understanding
@@ -25,7 +25,7 @@ import torch.nn as nn
 from typing import Optional, Tuple
 from dataclasses import dataclass
 
-from geovocab2.train.model.layers.attention.cantor_global import CantorAttention, CantorAttentionConfig
+from geofractal.model.layers.attention.cantor_global import CantorAttention, CantorAttentionConfig
 
 
 @dataclass

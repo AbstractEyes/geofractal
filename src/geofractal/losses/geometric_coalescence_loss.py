@@ -1,4 +1,4 @@
-# geovocab2/train/losses/geometric_coalescence_loss.py
+# geofractal/losses/geometric_coalescence_loss.py
 
 """
 GeometricCoalescenceLoss - Unsupervised Supervision for Shatter-Reconstruct Training

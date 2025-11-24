@@ -1,4 +1,4 @@
-# geovocab2.train.model.layers.conv.py
+# geofractal.model.layers.conv.py
 # ============================================================
 # CantorConv2d: Fractal‑structured convolutional layer
 # Author: AbstractPhil

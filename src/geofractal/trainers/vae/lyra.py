@@ -1,13 +1,13 @@
-# geovocab2/train/trainers/vae_lyra/trainer.py
+# geofractal/trainers/vae_lyra/trainer.py
 
 """
 Trainer for VAE Lyra - Multi-Modal Variational Autoencoder with HF Integration
 
 Install via:
-    !pip install git+https://github.com/AbstractPhil/geovocab2.git
+    !pip install git+https://github.com/AbstractPhil/geofractal.git
 
 Usage:
-    from geovocab2.train.trainers.vae_lyra_trainer import (
+    from geofractal.trainers.vae_lyra_trainer import (
         VAELyraTrainer, VAELyraTrainerConfig
     )
 """
@@ -31,7 +31,7 @@ import random
 from collections import Counter
 import shutil
 
-from geovocab2.train.model.vae.vae_lyra import (
+from geofractal.model.vae.vae_lyra import (
     MultiModalVAE,
     MultiModalVAEConfig,
     MultiModalVAELoss,
@@ -400,7 +400,7 @@ Multi-modal Variational Autoencoder for text embedding transformation using geom
 
 ## Usage
 ```python
-from geovocab2.train.model.vae.vae_lyra import MultiModalVAE, MultiModalVAEConfig
+from geofractal.model.vae.vae_lyra import MultiModalVAE, MultiModalVAEConfig
 from huggingface_hub import hf_hub_download
 import torch
 

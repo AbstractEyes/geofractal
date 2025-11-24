@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from geovocab2.train.model.core.david import CantorScaleFusion
+from geofractal.model.core.david import CantorScaleFusion
 
 
 class CantorDustLoss(nn.Module):

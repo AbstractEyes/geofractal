@@ -1,4 +1,4 @@
-# geovocab2.train.model.architectures.cantor_resnet.py
+# geofractal.model.architectures.cantor_resnet.py
 # ============================================================
 # CantorResNet: Fractal-structured residual network
 # Author: AbstractPhil
@@ -14,8 +14,8 @@ from typing import Literal
 
 
 # Assuming CantorConv2d and CantorLinear are importable - adjust path as needed
-from geovocab2.train.model.layers.conv import CantorConv2d, CantorConv2dConfig
-from geovocab2.train.model.layers.linear import CantorLinear, CantorLinearConfig
+from geofractal.model.layers.conv import CantorConv2d, CantorConv2dConfig
+from geofractal.model.layers.linear import CantorLinear, CantorLinearConfig
 
 
 # ============================================================

@@ -30,7 +30,7 @@ import json
 from datetime import datetime
 import logging
 
-from geovocab2.train.train_base import TrainBase
+from geofractal.train_base import TrainBase
 
 
 class TrainEpoch(TrainBase):
@@ -72,7 +72,7 @@ class TrainEpoch(TrainBase):
         global_step: Total training steps across all epochs
 
     Example:
-        from geovocab2.train.config.config_train_epoch import TrainEpochConfig
+        from geofractal.config.config_train_epoch import TrainEpochConfig
 
         config = TrainEpochConfig(
             name="simplex_volume_trainer",
@@ -157,7 +157,7 @@ class TrainEpoch(TrainBase):
         super().__init__(trainer_name, trainer_uid)
 
         # Setup logging
-        self.logger = logging.getLogger("geovocab2.training")
+        self.logger = logging.getLogger("geofractal.training")
         self.logger.setLevel(logging.INFO)
         if not self.logger.handlers:
             handler = logging.StreamHandler()
@@ -780,7 +780,7 @@ class TrainEpoch(TrainBase):
 
 if __name__ == "__main__":
     from torch.utils.data import DataLoader, TensorDataset
-    from geovocab2.train.config.config_train_epoch import TrainEpochConfig
+    from geofractal.config.config_train_epoch import TrainEpochConfig
 
     # Example trainer implementation
     class MinimalTrainer(TrainEpoch):

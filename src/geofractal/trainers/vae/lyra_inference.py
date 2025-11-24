@@ -5,7 +5,7 @@
 import torch
 from diffusers import StableDiffusionPipeline, DDIMScheduler
 from transformers import T5EncoderModel, T5Tokenizer
-from geovocab2.train.trainers.vae.lyra import load_lyra_from_hub
+from geofractal.trainers.vae.lyra import load_lyra_from_hub
 import matplotlib.pyplot as plt
 from tqdm.auto import tqdm
 from PIL import Image

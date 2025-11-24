@@ -3,7 +3,7 @@ David - Multi-Scale Crystal Classifier
 ========================================
 Model implementation for multi-scale deep learning with crystal representations.
 
-Should be placed at: geovocab2/train/model/core/david.py
+Should be placed at: geofractal/model/core/david.py
 
 Author: AbstractPhil
 """
@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional, Union
 import math
 
-from geovocab2.train.config.david_config import (
+from geofractal.config.david_config import (
     DavidArchitectureConfig,
     DavidPresets,
     SharingMode,

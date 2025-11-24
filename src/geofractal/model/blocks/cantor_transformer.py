@@ -10,10 +10,10 @@ import torch.nn.functional as F
 from typing import Optional
 from dataclasses import dataclass
 
-from geofractal.model.layers.attention.cantor_global import (
+from geofractal.model.layers.attention.cantor_multiheaded_fusion import (
     CantorGlobalAttention, CantorGlobalAttentionConfig
 )
-from geovocab2.train.model.positional.cantor import (
+from geofractal.model.positional.cantor import (
     CantorPositionEncoding, SimpleCantorPE
 )
 

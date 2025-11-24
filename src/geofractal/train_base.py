@@ -47,7 +47,7 @@ class TrainBase(ABC):
 
     Logging Recommendation:
         Subclasses should create their own logger in __init__:
-            self.logger = logging.getLogger("geovocab2.training")
+            self.logger = logging.getLogger("geofractal.training")
         Or use custom backends (wandb, tensorboard, mlflow, etc.)
 
     Example:
@@ -286,7 +286,7 @@ if __name__ == "__main__":
         def __init__(self):
             super().__init__("minimal_example", "t.example.minimal")
             # Subclass handles logging setup
-            self.logger = logging.getLogger("geovocab2.training")
+            self.logger = logging.getLogger("geofractal.training")
             self.logger.setLevel(logging.INFO)
             if not self.logger.handlers:
                 handler = logging.StreamHandler()

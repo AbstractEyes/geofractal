@@ -9,11 +9,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# src/geovocab2/train/config/alucard_formula_config.py
+# geofractal/config/alucard_formula_config.py
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
-from geovocab2.train.config.config_base import BaseConfig
+from geofractal.config.config_base import BaseConfig
 
 @dataclass
 class AlucardFormulaConfig(BaseConfig):
