@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from typing import Optional
 from dataclasses import dataclass
 
-from geofractal.model.layers.attention.cantor_multiheaded_fusion import (
-    CantorGlobalAttention, CantorGlobalAttentionConfig
+from geofractal.model.layers.attention.cantor_global import (
+    CantorAttention, CantorAttentionConfig
 )
 from geofractal.model.positional.cantor import (
     CantorPositionEncoding, SimpleCantorPE
@@ -83,23 +83,23 @@ class CantorTransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(config.dim, eps=config.norm_eps)
 
         # Cantor Attention
-        attn_config = CantorGlobalAttentionConfig(
+        attn_config = CantorAttentionConfig(
             dim=config.dim,
             num_heads=config.num_heads,
             head_dim=config.head_dim,
             depth=config.cantor_depth,
             max_seq_len=config.cantor_max_seq_len,
             local_window=config.cantor_local_window,
-            local_ratio=config.cantor_local_ratio,
-            medium_ratio=config.cantor_medium_ratio,
-            global_ratio=config.cantor_global_ratio,
+            #local_ratio=config.cantor_local_ratio,
+            #medium_ratio=config.cantor_medium_ratio,
+            #global_ratio=config.cantor_global_ratio,
             dropout=config.attention_dropout,
             causal=config.causal,
-            use_bias=config.use_bias,
+            #use_bias=config.use_bias,
             qkv_bias=config.use_bias,
             out_bias=config.use_bias,
         )
-        self.attention = CantorGlobalAttention(attn_config)
+        self.attention = CantorAttention(attn_config)
 
         # Feed-Forward Network
         self.ffn = FeedForward(
