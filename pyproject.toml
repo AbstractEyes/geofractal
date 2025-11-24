@@ -3,14 +3,14 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "geometricvocab"
+name = "geofractal"
 version = "0.2.1"
-description = "Deterministic geometric vocabulary: pentachora crystals, Unicode cobbling, and rose-aware utilities."
+description = "multimodal, geometric, fractal, geofractal, audio, visual, classification, predictive, and symbiosis-based models."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { file = "LICENSE" }
 authors = [{ name = "AbstractPhil", email = "abstractpowered@outlook.com" }]
-keywords = ["vocabulary", "geometry", "nlp", "symbolic", "embeddings", "pentachoron", "deterministic"]
+keywords = ["fractal", "geometry", "multimodal", "multi-modal", "geofractal", "nlp", "symbolic", "embeddings", "simplex", "ksimplex"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
