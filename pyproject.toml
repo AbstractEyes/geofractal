@@ -24,7 +24,7 @@ classifiers = [
 dependencies = [
   "numpy>=1.23",
   "datasets>=2.15",
-  "torch>=2.1",  # Move torch to main deps since formulas require
+  "torch>=2.1",
   "git+https://github.com/AbstractEyes/lattice_vocabulary.git",
 ]
 
