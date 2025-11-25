@@ -738,7 +738,7 @@ class VAELyraTrainer:
             temperature=self.config.summarizer_temperature,
             device=self.config.device,
             batch_size=self.config.summarizer_batch_size,
-            keep_model_loaded=False,  # We'll load/unload as needed
+            keep_model_loaded=True,  # We control unload explicitly
         )
 
         self.summarizer = CaptionFactory(summarizer_config)
@@ -782,16 +782,25 @@ class VAELyraTrainer:
 
         print(f"\n📝 Generating summaries for {len(tags_list):,} prompts...")
 
-        # Load summarizer
-        self.summarizer.load()
-
         try:
-            # Process in batches
-            summaries = self.summarizer.summarize_batch(tags_list)
+            # Process in chunks with progress bar
+            chunk_size = self.config.summarizer_batch_size * 10  # Process 10 batches at a time for progress updates
+            all_summaries = []
+
+            pbar = tqdm(range(0, len(tags_list), chunk_size), desc="Summarizing")
+            for start_idx in pbar:
+                end_idx = min(start_idx + chunk_size, len(tags_list))
+                chunk = tags_list[start_idx:end_idx]
+
+                # CaptionFactory uses lazy loading - just call summarize_batch
+                chunk_summaries = self.summarizer.summarize_batch(chunk)
+                all_summaries.extend(chunk_summaries)
+
+                pbar.set_postfix({"done": len(all_summaries)})
 
             # Clean up summaries
             cleaned = []
-            for s in summaries:
+            for s in all_summaries:
                 # Remove any accidental separators in the summary
                 s = s.replace(self.config.summary_separator, ' ')
                 # Trim excessive whitespace
@@ -799,12 +808,20 @@ class VAELyraTrainer:
                 cleaned.append(s)
 
             print(f"  ✓ Generated {len(cleaned):,} summaries")
+
+            # Show a few examples
+            print(f"\n  Sample summaries:")
+            for i in range(min(3, len(cleaned))):
+                sample = cleaned[i][:80] + "..." if len(cleaned[i]) > 80 else cleaned[i]
+                print(f"    [{i}] {sample}")
+
             return cleaned
 
         finally:
             # Unload to free VRAM for CLIP/T5
-            self.summarizer.unload()
-            print(f"  ✓ Unloaded summarizer to free VRAM")
+            if hasattr(self.summarizer, 'unload_model'):
+                self.summarizer.unload_model()
+                print(f"  ✓ Unloaded summarizer to free VRAM")
 
     def _build_t5_text(self, tags: str, summary: str) -> str:
         """
