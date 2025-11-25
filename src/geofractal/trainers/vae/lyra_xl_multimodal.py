@@ -1,14 +1,19 @@
-# geofractal/trainers/vae_lyra/trainer.py
+# geofractal/trainers/vae_lyra/lyra_xl_multimodal_illustrious.py
 
 """
 Trainer for VAE Lyra - Multi-Modal Variational Autoencoder
-CLIP-L + CLIP-G + T5-XL (Decoupled) for SDXL Compatibility
+Using Custom Illustrious CLIP-L + CLIP-G + T5-XL for SDXL Compatibility
+
+Downloads custom CLIP weights from AbstractPhil/clips:
+- IllustriousXL20_v20_clip_l.safetensors
+- IllustriousXL20_v20_clip_g.safetensors
 
 Install via:
-    !pip install git+https://github.com/AbstractPhil/geofractal.git
+    !pip install git+https://github.com/AbstractEyes/geofractal.git
+    !pip install safetensors
 
 Usage:
-    from geofractal.trainers.vae_lyra_trainer import (
+    from lyra_xl_multimodal_illustrious import (
         VAELyraTrainer, VAELyraTrainerConfig
     )
 """
@@ -22,10 +27,12 @@ from transformers import (
     CLIPTextModel,
     CLIPTokenizer,
     CLIPTextModelWithProjection,
+    CLIPTextConfig,
     T5EncoderModel,
     T5Tokenizer
 )
-from huggingface_hub import HfApi, hf_hub_download, create_repo, upload_file
+from safetensors.torch import load_file as load_safetensors
+from huggingface_hub import HfApi, hf_hub_download, create_repo
 from tqdm.auto import tqdm
 import wandb
 import os
@@ -36,7 +43,6 @@ from dataclasses import dataclass, asdict
 import requests
 import random
 from collections import Counter
-import shutil
 
 from geofractal.model.vae.vae_lyra import (
     MultiModalVAE,
@@ -47,14 +53,179 @@ from geofractal.model.vae.vae_lyra import (
 from geovocab2.data.prompt.symbolic_tree import SynthesisSystem
 
 
+# ============================================================================
+# CUSTOM CLIP LOADING FROM SAFETENSORS
+# ============================================================================
+
+def load_illustrious_clip_l(
+        safetensors_path: str,
+        device: str = 'cuda',
+        base_model: str = "openai/clip-vit-large-patch14"
+) -> Tuple[CLIPTextModel, CLIPTokenizer]:
+    """
+    Load CLIP-L text encoder with custom Illustrious weights.
+
+    Args:
+        safetensors_path: Path to IllustriousXL20_v20_clip_l.safetensors
+        device: Target device
+        base_model: Base model for architecture and tokenizer
+
+    Returns:
+        Tuple of (model, tokenizer)
+    """
+    print(f"    Loading CLIP-L architecture from {base_model}...")
+
+    # Get tokenizer from base model
+    tokenizer = CLIPTokenizer.from_pretrained(base_model)
+
+    # Initialize model architecture
+    model = CLIPTextModel.from_pretrained(base_model)
+
+    # Load custom weights
+    print(f"    Loading Illustrious weights from {Path(safetensors_path).name}...")
+    state_dict = load_safetensors(safetensors_path)
+
+    # Debug: show some keys to understand structure
+    sample_keys = list(state_dict.keys())[:5]
+    print(f"    Sample keys: {sample_keys}")
+
+    # Try to load - may need key remapping
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    if missing:
+        print(f"    ⚠️  Missing keys: {len(missing)} (may be expected)")
+    if unexpected:
+        print(f"    ⚠️  Unexpected keys: {len(unexpected)}")
+
+        # If keys have different prefix, try remapping
+        if unexpected and not missing:
+            print("    Attempting key remapping...")
+            # Common pattern: 'text_model.' prefix
+            remapped = {}
+            for k, v in state_dict.items():
+                if k.startswith('text_model.'):
+                    remapped[k] = v
+                else:
+                    remapped[f'text_model.{k}'] = v
+
+            missing2, unexpected2 = model.load_state_dict(remapped, strict=False)
+            if len(missing2) < len(missing) or len(unexpected2) < len(unexpected):
+                print(f"    ✓ Remapping improved: {len(missing2)} missing, {len(unexpected2)} unexpected")
+
+    model.to(device).eval()
+    print(f"    ✓ CLIP-L loaded: {sum(p.numel() for p in model.parameters()):,} params")
+
+    return model, tokenizer
+
+
+def load_illustrious_clip_g(
+        safetensors_path: str,
+        device: str = 'cuda',
+        base_model: str = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
+) -> Tuple[CLIPTextModelWithProjection, CLIPTokenizer]:
+    """
+    Load CLIP-G text encoder with custom Illustrious weights.
+
+    Args:
+        safetensors_path: Path to IllustriousXL20_v20_clip_g.safetensors
+        device: Target device
+        base_model: Base model for architecture and tokenizer
+
+    Returns:
+        Tuple of (model, tokenizer)
+    """
+    print(f"    Loading CLIP-G architecture from {base_model}...")
+
+    # Get tokenizer from base model
+    tokenizer = CLIPTokenizer.from_pretrained(base_model)
+
+    # Initialize model architecture
+    model = CLIPTextModelWithProjection.from_pretrained(base_model)
+
+    # Load custom weights
+    print(f"    Loading Illustrious weights from {Path(safetensors_path).name}...")
+    state_dict = load_safetensors(safetensors_path)
+
+    # Debug: show some keys
+    sample_keys = list(state_dict.keys())[:5]
+    print(f"    Sample keys: {sample_keys}")
+
+    # Try to load
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+    if missing:
+        print(f"    ⚠️  Missing keys: {len(missing)} (may be expected)")
+    if unexpected:
+        print(f"    ⚠️  Unexpected keys: {len(unexpected)}")
+
+        # Try remapping if needed
+        if unexpected and not missing:
+            print("    Attempting key remapping...")
+            remapped = {}
+            for k, v in state_dict.items():
+                if k.startswith('text_model.'):
+                    remapped[k] = v
+                else:
+                    remapped[f'text_model.{k}'] = v
+
+            missing2, unexpected2 = model.load_state_dict(remapped, strict=False)
+            if len(missing2) < len(missing) or len(unexpected2) < len(unexpected):
+                print(f"    ✓ Remapping improved: {len(missing2)} missing, {len(unexpected2)} unexpected")
+
+    model.to(device).eval()
+    print(f"    ✓ CLIP-G loaded: {sum(p.numel() for p in model.parameters()):,} params")
+
+    return model, tokenizer
+
+
+def download_illustrious_clips(
+        repo_id: str = "AbstractPhil/clips",
+        clip_l_filename: str = "IllustriousXL20_v20_clip_l.safetensors",
+        clip_g_filename: str = "IllustriousXL20_v20_clip_g.safetensors"
+) -> Tuple[str, str]:
+    """
+    Download Illustrious CLIP weights from HuggingFace.
+
+    Returns:
+        Tuple of (clip_l_path, clip_g_path)
+    """
+    print(f"\n📥 Downloading Illustrious CLIP weights from {repo_id}...")
+
+    clip_l_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=clip_l_filename,
+        repo_type="model"
+    )
+    print(f"  ✓ CLIP-L: {clip_l_path}")
+
+    clip_g_path = hf_hub_download(
+        repo_id=repo_id,
+        filename=clip_g_filename,
+        repo_type="model"
+    )
+    print(f"  ✓ CLIP-G: {clip_g_path}")
+
+    return clip_l_path, clip_g_path
+
+
+# ============================================================================
+# CONFIG
+# ============================================================================
+
 @dataclass
 class VAELyraTrainerConfig:
     """Training configuration for VAE Lyra with SDXL support and decoupled T5."""
 
+    # Custom CLIP configuration
+    use_illustrious_clips: bool = True
+    illustrious_repo: str = "AbstractPhil/clips"
+    clip_l_filename: str = "IllustriousXL20_v20_clip_l.safetensors"
+    clip_g_filename: str = "IllustriousXL20_v20_clip_g.safetensors"
+
     # Model architecture - SDXL with decoupled T5
-    modality_dims: Dict[str, int] = None  # {"clip_l": 768, "clip_g": 1280, "t5_xl_l": 2048, "t5_xl_g": 2048}
-    modality_seq_lens: Dict[str, int] = None  # {"clip_l": 77, "clip_g": 77, "t5_xl_l": 512, "t5_xl_g": 512}
-    binding_config: Dict[str, Dict[str, float]] = None  # T5 binding configuration
+    modality_dims: Dict[str, int] = None
+    modality_seq_lens: Dict[str, int] = None
+    binding_config: Dict[str, Dict[str, float]] = None
 
     latent_dim: int = 2048
     seq_len: int = 77
@@ -64,7 +235,7 @@ class VAELyraTrainerConfig:
     dropout: float = 0.1
 
     # Fusion
-    fusion_strategy: str = "adaptive_cantor"  # Default to adaptive
+    fusion_strategy: str = "adaptive_cantor"
     fusion_heads: int = 8
     fusion_dropout: float = 0.1
     cantor_depth: int = 8
@@ -92,7 +263,7 @@ class VAELyraTrainerConfig:
     kl_start_beta: float = 0.0
 
     # Training hyperparameters
-    batch_size: int = 8  # Reduced for larger models with longer sequences
+    batch_size: int = 8
     num_epochs: int = 100
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
@@ -100,26 +271,26 @@ class VAELyraTrainerConfig:
 
     # Scheduler
     use_scheduler: bool = True
-    scheduler_type: str = 'cosine'  # 'cosine' or 'onecycle'
+    scheduler_type: str = 'cosine'
 
     # Data
     num_samples: int = 10000
     synthetic_ratio: float = 0.15
 
     # Checkpointing
-    checkpoint_dir: str = './checkpoints_lyra_adaptive'
+    checkpoint_dir: str = './checkpoints_lyra_illustrious'
     save_every: int = 1000
     keep_last_n: int = 3
 
     # HuggingFace Hub
-    hf_repo: str = "AbstractPhil/vae-lyra-adaptive-cantor"
+    hf_repo: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious"
     push_to_hub: bool = True
     push_every: int = 2000
     auto_load_from_hub: bool = True
 
     # Logging
-    use_wandb: bool = True
-    wandb_project: str = 'vae-lyra-adaptive-cantor'
+    use_wandb: bool = False
+    wandb_project: str = 'vae-lyra-illustrious'
     wandb_entity: Optional[str] = None
     log_every: int = 50
 
@@ -132,45 +303,45 @@ class VAELyraTrainerConfig:
     num_workers: int = 0
 
     def __post_init__(self):
-        # Default: SDXL configuration with decoupled T5
         if self.modality_dims is None:
             self.modality_dims = {
                 "clip_l": 768,
                 "clip_g": 1280,
-                "t5_xl_l": 2048,  # T5 for CLIP-L
-                "t5_xl_g": 2048  # T5 for CLIP-G
+                "t5_xl_l": 2048,
+                "t5_xl_g": 2048
             }
 
-        # Default: Different sequence lengths
         if self.modality_seq_lens is None:
             self.modality_seq_lens = {
                 "clip_l": 77,
                 "clip_g": 77,
-                "t5_xl_l": 512,  # Longer context for T5
+                "t5_xl_l": 512,
                 "t5_xl_g": 512
             }
 
-        # Default binding: Decoupled T5 scales
         if self.binding_config is None:
             self.binding_config = {
-                "clip_l": {"t5_xl_l": 0.3},  # CLIP-L uses T5-L scale
-                "clip_g": {"t5_xl_g": 0.3},  # CLIP-G uses T5-G scale
-                "t5_xl_l": {},  # T5-L stays independent
-                "t5_xl_g": {}  # T5-G stays independent
+                "clip_l": {"t5_xl_l": 0.3},
+                "clip_g": {"t5_xl_g": 0.3},
+                "t5_xl_l": {},
+                "t5_xl_g": {}
             }
 
-        # Default weights: prioritize CLIP outputs for SDXL
         if self.modality_recon_weights is None:
             self.modality_recon_weights = {
-                "clip_l": 1.0,  # Full weight - SDXL primary
-                "clip_g": 1.0,  # Full weight - SDXL primary
-                "t5_xl_l": 0.3,  # Lower weight - auxiliary signal
-                "t5_xl_g": 0.3  # Lower weight - auxiliary signal
+                "clip_l": 1.0,
+                "clip_g": 1.0,
+                "t5_xl_l": 0.3,
+                "t5_xl_g": 0.3
             }
 
 
+# ============================================================================
+# DATASET
+# ============================================================================
+
 class TextEmbeddingDataset(Dataset):
-    """Dataset that generates CLIP-L, CLIP-G, and decoupled T5-XL embeddings on-the-fly."""
+    """Dataset that generates CLIP-L, CLIP-G, and T5-XL embeddings on-the-fly."""
 
     def __init__(
             self,
@@ -196,7 +367,6 @@ class TextEmbeddingDataset(Dataset):
         self.clip_max_length = clip_max_length
         self.t5_max_length = t5_max_length
 
-        # Move models to device and set to eval
         self.clip_l_model.to(device).eval()
         self.clip_g_model.to(device).eval()
         self.t5_model.to(device).eval()
@@ -208,7 +378,7 @@ class TextEmbeddingDataset(Dataset):
     def __getitem__(self, idx):
         text = self.texts[idx]
 
-        # CLIP-L embedding (SD1.5 / SDXL text_encoder)
+        # CLIP-L embedding
         clip_l_tokens = self.clip_l_tokenizer(
             text,
             max_length=self.clip_max_length,
@@ -220,7 +390,7 @@ class TextEmbeddingDataset(Dataset):
         clip_l_output = self.clip_l_model(**clip_l_tokens)
         clip_l_embed = clip_l_output.last_hidden_state.squeeze(0)
 
-        # CLIP-G embedding (SDXL text_encoder_2)
+        # CLIP-G embedding
         clip_g_tokens = self.clip_g_tokenizer(
             text,
             max_length=self.clip_max_length,
@@ -232,7 +402,7 @@ class TextEmbeddingDataset(Dataset):
         clip_g_output = self.clip_g_model(**clip_g_tokens)
         clip_g_embed = clip_g_output.last_hidden_state.squeeze(0)
 
-        # T5-XL embeddings (longer sequence for richer context)
+        # T5-XL embeddings
         t5_tokens = self.t5_tokenizer(
             text,
             max_length=self.t5_max_length,
@@ -244,18 +414,21 @@ class TextEmbeddingDataset(Dataset):
         t5_output = self.t5_model(**t5_tokens)
         t5_embed = t5_output.last_hidden_state.squeeze(0)
 
-        # Duplicate T5 for decoupled scales (same embedding, different learned binding)
         return {
             'clip_l': clip_l_embed.cpu(),
             'clip_g': clip_g_embed.cpu(),
-            't5_xl_l': t5_embed.cpu(),  # T5 scale for CLIP-L
-            't5_xl_g': t5_embed.cpu(),  # T5 scale for CLIP-G (same input, different learned path)
+            't5_xl_l': t5_embed.cpu(),
+            't5_xl_g': t5_embed.cpu(),
             'text': text
         }
 
 
+# ============================================================================
+# TRAINER
+# ============================================================================
+
 class VAELyraTrainer:
-    """Trainer for VAE Lyra - SDXL-compatible Multi-Modal VAE with Adaptive Cantor Fusion."""
+    """Trainer for VAE Lyra with Illustrious CLIP weights."""
 
     def __init__(self, config: VAELyraTrainerConfig):
         self.config = config
@@ -265,22 +438,18 @@ class VAELyraTrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(config.seed)
 
-        # HuggingFace API
         self.hf_api = HfApi()
         self._init_hf_repo()
 
-        print("🎵 Initializing VAE Lyra (Adaptive Cantor Edition)...")
-        print(f"   Modalities: CLIP-L (768@77), CLIP-G (1280@77)")
-        print(f"   T5-XL-L (2048@512), T5-XL-G (2048@512)")
+        print("🎵 Initializing VAE Lyra (Illustrious Edition)...")
+        print(f"   CLIP weights: {config.illustrious_repo}")
         print(f"   Fusion: {config.fusion_strategy}")
 
-        # Try to load from HF first
         if config.auto_load_from_hub:
             loaded = self._try_load_from_hub()
             if loaded:
                 print("✓ Loaded model from HuggingFace Hub")
 
-        # Build model if not loaded
         if not hasattr(self, 'model'):
             self.model = self._build_model()
             self.optimizer = None
@@ -291,11 +460,9 @@ class VAELyraTrainer:
 
         self.loss_fn = self._build_loss_fn()
 
-        # Initialize optimizer if not loaded
         if self.optimizer is None:
             self.optimizer = self._build_optimizer()
 
-        # Initialize scheduler if not loaded
         if self.scheduler is None and config.use_scheduler:
             self.scheduler = self._build_scheduler()
 
@@ -303,7 +470,6 @@ class VAELyraTrainer:
 
         Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-        # Initialize prompt generation
         print("Initializing prompt generation...")
         self.prompt_gen = SynthesisSystem(seed=config.seed)
         self.flavors = self._load_flavors()
@@ -315,15 +481,13 @@ class VAELyraTrainer:
                 project=config.wandb_project,
                 entity=config.wandb_entity,
                 config=asdict(config),
-                name=f"lyra_{config.fusion_strategy}_alpha{config.alpha_init}_beta{config.beta_init}",
+                name=f"lyra_illustrious_{config.fusion_strategy}",
                 resume="allow"
             )
 
     def _init_hf_repo(self):
-        """Initialize HuggingFace repository."""
         if not self.config.push_to_hub:
             return
-
         try:
             create_repo(
                 self.config.hf_repo,
@@ -331,67 +495,46 @@ class VAELyraTrainer:
                 exist_ok=True,
                 private=False
             )
-            print(f"✓ HuggingFace repo: https://huggingface.co/{self.config.hf_repo}")
+            print(f"✓ HF repo: https://huggingface.co/{self.config.hf_repo}")
         except Exception as e:
             print(f"⚠️  Could not create HF repo: {e}")
-            print("   (Repo may already exist or you may need to login)")
 
     def _try_load_from_hub(self) -> bool:
-        """Try to load the latest model from HuggingFace Hub."""
         try:
-            print(f"🔍 Checking for existing model on HF: {self.config.hf_repo}")
-
-            # Try to download model checkpoint
+            print(f"🔍 Checking for existing model: {self.config.hf_repo}")
             try:
                 model_path = hf_hub_download(
                     repo_id=self.config.hf_repo,
                     filename="model.pt",
                     repo_type="model"
                 )
-
                 checkpoint = torch.load(model_path, map_location=self.device)
-
-                # Build model and load state
                 self.model = self._build_model()
                 self.model.load_state_dict(checkpoint['model_state_dict'])
-
-                # Load optimizer
                 self.optimizer = self._build_optimizer()
                 if 'optimizer_state_dict' in checkpoint:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-                # Load training state
                 self.global_step = checkpoint.get('global_step', 0)
                 self.epoch = checkpoint.get('epoch', 0)
                 self.best_loss = checkpoint.get('best_loss', float('inf'))
-
-                # Load scheduler if exists
                 if 'scheduler_state_dict' in checkpoint and self.config.use_scheduler:
                     self.scheduler = self._build_scheduler()
                     self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
                 print(f"✓ Resumed from step {self.global_step}, epoch {self.epoch}")
                 return True
-
             except Exception as e:
                 print(f"   No existing model found: {e}")
                 return False
-
         except Exception as e:
             print(f"⚠️  Could not access HF Hub: {e}")
             return False
 
     def _push_to_hub(self, is_best: bool = False):
-        """Push current model to HuggingFace Hub."""
         if not self.config.push_to_hub:
             return
-
         try:
-            print(f"\n📤 Pushing to HuggingFace Hub...", end=" ", flush=True)
-
-            # Save checkpoint locally first
+            print(f"\n📤 Pushing to HF Hub...", end=" ", flush=True)
             temp_path = Path(self.config.checkpoint_dir) / "temp_upload.pt"
-
             checkpoint = {
                 'model_state_dict': self.model.state_dict(),
                 'optimizer_state_dict': self.optimizer.state_dict(),
@@ -400,50 +543,34 @@ class VAELyraTrainer:
                 'best_loss': self.best_loss,
                 'config': asdict(self.config)
             }
-
             if self.scheduler is not None:
                 checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-
             torch.save(checkpoint, temp_path)
-
-            # Upload to HF
             self.hf_api.upload_file(
                 path_or_fileobj=str(temp_path),
                 path_in_repo="model.pt",
                 repo_id=self.config.hf_repo,
                 repo_type="model",
-                commit_message=f"Step {self.global_step}: loss={self.best_loss:.4f}" if is_best else f"Training step {self.global_step}"
+                commit_message=f"Step {self.global_step}: loss={self.best_loss:.4f}" if is_best else f"Step {self.global_step}"
             )
-
-            # Save config as well
             config_path = Path(self.config.checkpoint_dir) / "config.json"
             with open(config_path, 'w') as f:
                 json.dump(asdict(self.config), f, indent=2)
-
             self.hf_api.upload_file(
                 path_or_fileobj=str(config_path),
                 path_in_repo="config.json",
                 repo_id=self.config.hf_repo,
                 repo_type="model",
-                commit_message=f"Config update at step {self.global_step}"
+                commit_message=f"Config @ step {self.global_step}"
             )
-
-            # Create model card if this is the best model
             if is_best:
                 self._create_model_card()
-
-            # Cleanup
             temp_path.unlink()
-
-            print(f"✓ Pushed to https://huggingface.co/{self.config.hf_repo}")
-
+            print(f"✓")
         except Exception as e:
-            print(f"✗ Failed: {e}")
+            print(f"✗ {e}")
 
     def _create_model_card(self):
-        """Create/update model card on HuggingFace."""
-
-        # Get fusion parameters if available
         fusion_params_str = ""
         if hasattr(self.model, 'get_fusion_params'):
             params = self.model.get_fusion_params()
@@ -462,21 +589,23 @@ class VAELyraTrainer:
 tags:
 - vae
 - multimodal
-- text-embeddings
 - clip
 - t5
 - sdxl
-- stable-diffusion
+- illustrious
 - adaptive-cantor
-- geometric-fusion
 license: mit
 ---
 
-# VAE Lyra 🎵 - Adaptive Cantor Edition
+# VAE Lyra 🎵 - Illustrious Edition
 
-Multi-modal Variational Autoencoder for SDXL text embedding transformation using adaptive Cantor fractal fusion with learned alpha (visibility) and beta (capacity) parameters.
+Multi-modal VAE trained with **Illustrious XL 2.0 CLIP weights**.
 
-Fuses CLIP-L, CLIP-G, and decoupled T5-XL scales into a unified latent space.
+## CLIP Encoders
+
+Uses custom fine-tuned CLIP weights from `AbstractPhil/clips`:
+- `IllustriousXL20_v20_clip_l.safetensors` (768d)
+- `IllustriousXL20_v20_clip_g.safetensors` (1280d)
 
 ## Model Details
 
@@ -486,139 +615,40 @@ Fuses CLIP-L, CLIP-G, and decoupled T5-XL scales into a unified latent space.
 - **Best Loss**: {self.best_loss:.4f}
 {fusion_params_str}
 
-## Architecture
-
-- **Modalities** (with sequence lengths): 
-  - CLIP-L (768d @ 77 tokens) - SDXL text_encoder
-  - CLIP-G (1280d @ 77 tokens) - SDXL text_encoder_2  
-  - T5-XL-L (2048d @ 512 tokens) - Auxiliary for CLIP-L
-  - T5-XL-G (2048d @ 512 tokens) - Auxiliary for CLIP-G
-- **Encoder Layers**: {self.config.encoder_layers}
-- **Decoder Layers**: {self.config.decoder_layers}
-- **Hidden Dimension**: {self.config.hidden_dim}
-- **Cantor Depth**: {self.config.cantor_depth}
-- **Local Window**: {self.config.cantor_local_window}
-
-## Key Features
-
-### Adaptive Cantor Fusion
-- **Cantor Fractal Routing**: Sparse attention based on fractal coordinate mapping
-- **Learned Alpha (Visibility)**: Per-modality parameters controlling latent space usage (tied to KL divergence)
-- **Learned Beta (Capacity)**: Per-binding-pair parameters controlling source influence strength
-
-### Decoupled T5 Scales
-- T5-XL-L binds specifically to CLIP-L (weight: {self.config.binding_config.get('clip_l', {}).get('t5_xl_l', 0.3)})
-- T5-XL-G binds specifically to CLIP-G (weight: {self.config.binding_config.get('clip_g', {}).get('t5_xl_g', 0.3)})
-- Independent T5 representations allow specialized semantic enrichment per CLIP encoder
-
-### Variable Sequence Lengths
-- CLIP: 77 tokens (standard)
-- T5: 512 tokens (extended context for richer semantic capture)
-
-## SDXL Compatibility
-
-This model outputs both CLIP embeddings needed for SDXL:
-- `clip_l`: [batch, 77, 768] → text_encoder output
-- `clip_g`: [batch, 77, 1280] → text_encoder_2 output
-
-T5 information is encoded into the latent space and influences both CLIP outputs through learned binding weights.
-
 ## Usage
+
 ```python
-from geofractal.model.vae.vae_lyra import MultiModalVAE, MultiModalVAEConfig
-from huggingface_hub import hf_hub_download
-import torch
+from lyra_xl_multimodal_illustrious import load_lyra_from_hub
 
-# Download model
-model_path = hf_hub_download(
-    repo_id="{self.config.hf_repo}",
-    filename="model.pt"
-)
-
-# Load checkpoint
-checkpoint = torch.load(model_path)
-
-# Create model
-config = MultiModalVAEConfig(
-    modality_dims={{
-        "clip_l": 768,
-        "clip_g": 1280,
-        "t5_xl_l": 2048,
-        "t5_xl_g": 2048
-    }},
-    modality_seq_lens={{
-        "clip_l": 77,
-        "clip_g": 77,
-        "t5_xl_l": 512,
-        "t5_xl_g": 512
-    }},
-    binding_config={{
-        "clip_l": {{"t5_xl_l": 0.3}},
-        "clip_g": {{"t5_xl_g": 0.3}},
-        "t5_xl_l": {{}},
-        "t5_xl_g": {{}}
-    }},
-    latent_dim={self.config.latent_dim},
-    fusion_strategy="{self.config.fusion_strategy}",
-    cantor_depth={self.config.cantor_depth},
-    cantor_local_window={self.config.cantor_local_window}
-)
-
-model = MultiModalVAE(config)
-model.load_state_dict(checkpoint['model_state_dict'])
+model = load_lyra_from_hub("{self.config.hf_repo}")
 model.eval()
 
-# Use model - train on all four modalities
+# Inputs (use Illustrious CLIP encoders for best results)
 inputs = {{
     "clip_l": clip_l_embeddings,     # [batch, 77, 768]
     "clip_g": clip_g_embeddings,     # [batch, 77, 1280]
-    "t5_xl_l": t5_xl_l_embeddings,   # [batch, 512, 2048]
-    "t5_xl_g": t5_xl_g_embeddings    # [batch, 512, 2048]
+    "t5_xl_l": t5_xl_embeddings,     # [batch, 512, 2048]
+    "t5_xl_g": t5_xl_embeddings      # [batch, 512, 2048]
 }}
 
-# For SDXL inference - only decode CLIP outputs
-recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "clip_g"])
-
-# Use recons["clip_l"] and recons["clip_g"] with SDXL
-```
-
-## Training Details
-
-- Trained on {len(self.used_prompts):,} diverse prompts
-- Mix of LAION flavors ({100 * (1 - self.config.synthetic_ratio):.0f}%) and synthetic prompts ({100 * self.config.synthetic_ratio:.0f}%)
-- KL Annealing: {self.config.use_kl_annealing}
-- Learning Rate: {self.config.learning_rate}
-- Alpha Init: {self.config.alpha_init}
-- Beta Init: {self.config.beta_init}
-
-## Citation
-```bibtex
-@software{{vae_lyra_adaptive_cantor_2025,
-  author = {{AbstractPhil}},
-  title = {{VAE Lyra: Adaptive Cantor Multi-Modal Variational Autoencoder}},
-  year = {{2025}},
-  url = {{https://huggingface.co/{self.config.hf_repo}}}
-}}
+recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
 ```
 """
-
         try:
             card_path = Path(self.config.checkpoint_dir) / "README.md"
             with open(card_path, 'w') as f:
                 f.write(model_card)
-
             self.hf_api.upload_file(
                 path_or_fileobj=str(card_path),
                 path_in_repo="README.md",
                 repo_id=self.config.hf_repo,
                 repo_type="model",
-                commit_message=f"Update model card (step {self.global_step})"
+                commit_message=f"Model card @ step {self.global_step}"
             )
         except Exception as e:
-            print(f"⚠️  Could not update model card: {e}")
+            print(f"⚠️  Model card update failed: {e}")
 
     def _build_model(self) -> nn.Module:
-        """Build VAE Lyra model with adaptive fusion."""
         vae_config = MultiModalVAEConfig(
             modality_dims=self.config.modality_dims,
             modality_seq_lens=self.config.modality_seq_lens,
@@ -641,30 +671,14 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
             beta_alpha_regularization=self.config.beta_alpha_regularization,
             seed=self.config.seed
         )
-
         model = MultiModalVAE(vae_config)
         model.to(self.device)
-
         total_params = sum(p.numel() for p in model.parameters())
-        print(f"✓ VAE Lyra parameters: {total_params:,}")
-        print(f"✓ Fusion strategy: {self.config.fusion_strategy}")
-
-        # Print learned parameters info
-        if hasattr(model, 'get_fusion_params'):
-            params = model.get_fusion_params()
-            if params:
-                print(f"✓ Adaptive parameters:")
-                print(f"   Alpha (visibility): {len(params.get('alphas', {}))}")
-                print(f"   Beta (capacity): {len(params.get('betas', {}))}")
-
+        print(f"✓ VAE Lyra: {total_params:,} params")
         return model
 
     def _build_optimizer(self):
-        """Build optimizer with different learning rates for alpha/beta."""
-        # Separate parameters for different learning rates
         param_groups = []
-
-        # Regular parameters
         regular_params = []
         alpha_params = []
         beta_params = []
@@ -677,34 +691,28 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
             else:
                 regular_params.append(param)
 
-        # Regular parameters - standard learning rate
         if regular_params:
             param_groups.append({
                 'params': regular_params,
                 'lr': self.config.learning_rate,
                 'weight_decay': self.config.weight_decay
             })
-
-        # Alpha parameters - scaled learning rate
         if alpha_params:
             param_groups.append({
                 'params': alpha_params,
                 'lr': self.config.learning_rate * self.config.alpha_lr_scale,
-                'weight_decay': 0.0  # No weight decay for learned scalars
+                'weight_decay': 0.0
             })
-
-        # Beta parameters - scaled learning rate
         if beta_params:
             param_groups.append({
                 'params': beta_params,
                 'lr': self.config.learning_rate * self.config.beta_lr_scale,
-                'weight_decay': 0.0  # No weight decay for learned scalars
+                'weight_decay': 0.0
             })
 
         return AdamW(param_groups)
 
     def _build_loss_fn(self):
-        """Build VAE loss function."""
         return MultiModalVAELoss(
             beta_kl=self.config.beta_kl,
             beta_reconstruction=self.config.beta_reconstruction,
@@ -715,20 +723,15 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
         )
 
     def _build_scheduler(self):
-        """Build learning rate scheduler."""
         if self.config.scheduler_type == 'cosine':
             return CosineAnnealingLR(
                 self.optimizer,
                 T_max=self.config.num_epochs,
                 eta_min=self.config.learning_rate * 0.1
             )
-        elif self.config.scheduler_type == 'onecycle':
-            return None  # Initialized after knowing steps per epoch
-        else:
-            raise ValueError(f"Unknown scheduler type: {self.config.scheduler_type}")
+        return None
 
     def _load_flavors(self):
-        """Load LAION flavors from clip-interrogator."""
         print("Loading LAION flavors...")
         try:
             r = requests.get(
@@ -736,102 +739,83 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
                 timeout=30
             )
             flavors = [line.strip() for line in r.text.split('\n') if line.strip()]
-            print(f"✓ Loaded {len(flavors):,} LAION flavors")
+            print(f"✓ Loaded {len(flavors):,} flavors")
             return flavors
         except Exception as e:
-            print(f"⚠️  Failed to load flavors: {e}")
-            print("Using fallback prompts...")
-            return [
-                "a beautiful landscape",
-                "abstract art",
-                "a detailed portrait",
-                "futuristic architecture",
-                "natural scenery"
-            ]
+            print(f"⚠️  Fallback flavors: {e}")
+            return ["a beautiful landscape", "abstract art", "detailed portrait"]
 
     def _generate_prompt(self):
-        """Generate a prompt (synthetic or LAION)."""
         if random.random() < self.config.synthetic_ratio:
             complexity = random.choice([2, 3, 4, 5])
             prompt = self.prompt_gen.synthesize(complexity=complexity)['text']
-            source = "synthetic"
-        else:
-            prompt = random.choice(self.flavors)
-            source = "laion"
-
-        return prompt, source
+            return prompt, "synthetic"
+        return random.choice(self.flavors), "laion"
 
     def _get_current_kl_beta(self) -> float:
-        """Get current KL beta with annealing."""
         if not self.config.use_kl_annealing:
             return self.config.beta_kl
-
         if self.epoch >= self.config.kl_anneal_epochs:
             return self.config.beta_kl
-
-        # Linear annealing
         progress = self.epoch / self.config.kl_anneal_epochs
-        current_beta = self.config.kl_start_beta + \
-                       (self.config.beta_kl - self.config.kl_start_beta) * progress
-
-        return current_beta
+        return self.config.kl_start_beta + (self.config.beta_kl - self.config.kl_start_beta) * progress
 
     def prepare_data(self, num_samples: Optional[int] = None) -> DataLoader:
-        """
-        Prepare dataset with CLIP-L, CLIP-G, and decoupled T5-XL encoders.
-
-        Args:
-            num_samples: Number of training samples (default: from config)
-        """
+        """Prepare dataset with Illustrious CLIP + T5-XL encoders."""
         num_samples = num_samples or self.config.num_samples
 
-        print(f"\n🎼 Generating {num_samples:,} training prompts...")
+        print(f"\n🎼 Generating {num_samples:,} prompts...")
 
-        # Generate prompts
-        texts = []
-        sources = []
-        for _ in tqdm(range(num_samples), desc="Generating prompts"):
+        texts, sources = [], []
+        for _ in tqdm(range(num_samples), desc="Generating"):
             prompt, source = self._generate_prompt()
             texts.append(prompt)
             sources.append(source)
 
-        # Store for logging
         self.used_prompts = texts
         self.prompt_sources = sources
 
-        # Count sources
         source_counts = Counter(sources)
-        print(f"\nPrompt distribution:")
-        for source, count in source_counts.items():
-            print(f"  {source}: {count:,} ({count / num_samples * 100:.1f}%)")
+        print(f"\nDistribution: {dict(source_counts)}")
+        print(f"Samples: {texts[:3]}")
 
-        # Show samples
-        print(f"\nSample prompts:")
-        for i in range(min(5, len(texts))):
-            print(f"  [{sources[i]}] {texts[i]}")
+        # Download custom CLIP weights
+        if self.config.use_illustrious_clips:
+            clip_l_path, clip_g_path = download_illustrious_clips(
+                repo_id=self.config.illustrious_repo,
+                clip_l_filename=self.config.clip_l_filename,
+                clip_g_filename=self.config.clip_g_filename
+            )
 
-        # Load text encoders
-        print("\nLoading CLIP-L, CLIP-G, and T5-XL...")
-        print("  [1/3] CLIP-L (openai/clip-vit-large-patch14)...")
-        clip_l_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
-        clip_l_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+            print("\n🔧 Loading Illustrious CLIP encoders...")
+            print("  [1/3] CLIP-L (Illustrious)...")
+            clip_l_model, clip_l_tokenizer = load_illustrious_clip_l(
+                clip_l_path, self.device
+            )
 
-        print("  [2/3] CLIP-G (laion/CLIP-ViT-bigG-14-laion2B-39B-b160k)...")
-        clip_g_tokenizer = CLIPTokenizer.from_pretrained(
-            "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
-        )
-        clip_g_model = CLIPTextModelWithProjection.from_pretrained(
-            "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
-        )
+            print("  [2/3] CLIP-G (Illustrious)...")
+            clip_g_model, clip_g_tokenizer = load_illustrious_clip_g(
+                clip_g_path, self.device
+            )
+        else:
+            # Fallback to standard CLIP
+            print("\n🔧 Loading standard CLIP encoders...")
+            print("  [1/3] CLIP-L (openai)...")
+            clip_l_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
+            clip_l_model = CLIPTextModel.from_pretrained("openai/clip-vit-large-patch14")
+            clip_l_model.to(self.device).eval()
 
-        print("  [3/3] FLAN-T5-XL (google/flan-t5-xl)...")
+            print("  [2/3] CLIP-G (laion)...")
+            clip_g_tokenizer = CLIPTokenizer.from_pretrained("laion/CLIP-ViT-bigG-14-laion2B-39B-b160k")
+            clip_g_model = CLIPTextModelWithProjection.from_pretrained("laion/CLIP-ViT-bigG-14-laion2B-39B-b160k")
+            clip_g_model.to(self.device).eval()
+
+        print("  [3/3] T5-XL (google/flan-t5-xl)...")
         t5_tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-xl")
         t5_model = T5EncoderModel.from_pretrained("google/flan-t5-xl")
 
         print(f"✓ All encoders loaded")
-        print(f"Dataset size: {len(texts)} samples")
 
-        # Create dataset with longer T5 sequences
         dataset = TextEmbeddingDataset(
             texts=texts,
             clip_l_tokenizer=clip_l_tokenizer,
@@ -853,10 +837,8 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
             pin_memory=True
         )
 
-        # Initialize OneCycle scheduler if needed
         if self.config.scheduler_type == 'onecycle' and self.scheduler is None:
-            steps_per_epoch = len(dataloader)
-            total_steps = steps_per_epoch * self.config.num_epochs
+            total_steps = len(dataloader) * self.config.num_epochs
             self.scheduler = OneCycleLR(
                 self.optimizer,
                 max_lr=self.config.learning_rate,
@@ -867,7 +849,6 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
         return dataloader
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Single training step with four modalities."""
         modality_inputs = {
             'clip_l': batch['clip_l'].to(self.device),
             'clip_g': batch['clip_g'].to(self.device),
@@ -875,22 +856,15 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
             't5_xl_g': batch['t5_xl_g'].to(self.device)
         }
 
-        # Update KL beta with annealing
         current_kl_beta = self._get_current_kl_beta()
         self.loss_fn.beta_kl = current_kl_beta
 
         if self.scaler is not None:
             with torch.amp.autocast('cuda'):
-                # Forward pass
                 reconstructions, mu, logvar, per_mod_mus = self.model(modality_inputs)
-
-                # Get fusion parameters for alpha regularization
                 fusion_params = self.model.get_fusion_params()
                 alphas = fusion_params.get('alphas', None)
-
-                # Project to common space for cross-modal loss
                 projected_recons = self.model.project_for_cross_modal(reconstructions)
-
                 loss, components = self.loss_fn(
                     inputs=modality_inputs,
                     reconstructions=reconstructions,
@@ -904,14 +878,9 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
 
             self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
-
             if self.config.gradient_clip > 0:
                 self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.gradient_clip
-                )
-
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
             self.scaler.step(self.optimizer)
             self.scaler.update()
         else:
@@ -919,7 +888,6 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
             fusion_params = self.model.get_fusion_params()
             alphas = fusion_params.get('alphas', None)
             projected_recons = self.model.project_for_cross_modal(reconstructions)
-
             loss, components = self.loss_fn(
                 inputs=modality_inputs,
                 reconstructions=reconstructions,
@@ -930,16 +898,10 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
                 projected_recons=projected_recons,
                 return_components=True
             )
-
             self.optimizer.zero_grad()
             loss.backward()
-
             if self.config.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(),
-                    self.config.gradient_clip
-                )
-
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip)
             self.optimizer.step()
 
         if self.scheduler is not None and self.config.scheduler_type == 'onecycle':
@@ -948,7 +910,6 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
         metrics = {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in components.items()}
         metrics['kl_beta'] = current_kl_beta
 
-        # Add beta parameters to metrics
         betas = fusion_params.get('betas', {})
         for name, beta in betas.items():
             metrics[f'beta_{name}'] = torch.sigmoid(beta).item()
@@ -956,7 +917,6 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
         return metrics
 
     def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
-        """Train for one epoch."""
         self.model.train()
         epoch_metrics = {}
 
@@ -973,93 +933,50 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
             pbar.set_postfix({
                 'loss': f"{metrics['total']:.4f}",
                 'r_l': f"{metrics.get('recon_clip_l', 0):.4f}",
-                'r_g': f"{metrics.get('recon_clip_g', 0):.4f}",
-                'kl': f"{metrics['kl']:.4f}",
-                'α_l': f"{metrics.get('alpha_clip_l', 0):.3f}",
-                'β': f"{metrics['kl_beta']:.3f}"
+                'kl': f"{metrics['kl']:.4f}"
             })
 
             if self.config.use_wandb and self.global_step % self.config.log_every == 0:
                 wandb.log({
                     **{f'train/{k}': v for k, v in metrics.items()},
-                    'train/lr': self.optimizer.param_groups[0]['lr'],
-                    'train/epoch': self.epoch,
                     'train/step': self.global_step
                 })
 
-            # Push to Hub at intervals
             if self.global_step % self.config.push_every == 0:
                 self._push_to_hub()
 
-            # Save checkpoint at intervals
             if self.global_step % self.config.save_every == 0:
                 self.save_checkpoint()
 
-        avg_metrics = {k: sum(v) / len(v) for k, v in epoch_metrics.items()}
-        return avg_metrics
+        return {k: sum(v) / len(v) for k, v in epoch_metrics.items()}
 
     def train(self, dataloader: DataLoader):
-        """Full training loop."""
-        print(f"\n{'=' * 70}")
-        print(f"🎵 Starting VAE Lyra Adaptive Cantor training for {self.config.num_epochs} epochs...")
-        print(f"{'=' * 70}")
-        print(f"Device: {self.device}")
-        print(f"Batch size: {self.config.batch_size}")
-        print(f"Total steps per epoch: {len(dataloader)}")
-        print(f"Total training samples: {len(self.used_prompts):,}")
-        print(f"Fusion strategy: {self.config.fusion_strategy}")
-        print(f"KL annealing: {self.config.use_kl_annealing}")
-        print(f"Push to HF every: {self.config.push_every} steps")
-        print(f"Alpha init: {self.config.alpha_init}, Beta init: {self.config.beta_init}")
+        print(f"\n{'=' * 60}")
+        print(f"🎵 Training VAE Lyra (Illustrious) for {self.config.num_epochs} epochs")
+        print(f"{'=' * 60}")
 
         for epoch in range(self.epoch, self.config.num_epochs):
             self.epoch = epoch
             metrics = self.train_epoch(dataloader)
 
-            # Update scheduler (for Cosine)
             if self.scheduler is not None and self.config.scheduler_type == 'cosine':
                 self.scheduler.step()
 
-            print(f"\n{'=' * 70}")
-            print(f"Epoch {epoch} Summary:")
-            print(f"  Total Loss: {metrics['total']:.4f}")
-            print(f"  Reconstruction (CLIP-L): {metrics.get('recon_clip_l', 0):.4f}")
-            print(f"  Reconstruction (CLIP-G): {metrics.get('recon_clip_g', 0):.4f}")
-            print(f"  Reconstruction (T5-XL-L): {metrics.get('recon_t5_xl_l', 0):.4f}")
-            print(f"  Reconstruction (T5-XL-G): {metrics.get('recon_t5_xl_g', 0):.4f}")
-            print(f"  KL Divergence: {metrics['kl']:.4f}")
-            print(f"  Cross-Modal: {metrics.get('cross_modal', 0):.4f}")
-            print(f"  Alpha Regularization: {metrics.get('alpha_reg', 0):.4f}")
-
-            # Print learned alpha values
-            alpha_str = ", ".join([f"{k.split('_')[1]}: {v:.3f}"
-                                   for k, v in metrics.items() if k.startswith('alpha_') and k != 'alpha_reg'])
-            if alpha_str:
-                print(f"  Learned Alphas: {alpha_str}")
-
-            # Print learned beta values
-            beta_str = ", ".join([f"{k.replace('beta_', '')}: {v:.3f}"
-                                  for k, v in metrics.items() if k.startswith('beta_') and '_' in k[5:]])
-            if beta_str:
-                print(f"  Learned Betas: {beta_str}")
-
-            print(f"  KL Beta (schedule): {metrics['kl_beta']:.3f}")
-            print(f"{'=' * 70}")
+            print(f"\nEpoch {epoch}: loss={metrics['total']:.4f}")
 
             if metrics['total'] < self.best_loss:
                 self.best_loss = metrics['total']
                 self.save_checkpoint(best=True)
                 self._push_to_hub(is_best=True)
-                print(f"  ✨ New best model saved and pushed! Loss: {self.best_loss:.4f}")
+                print(f"  ✨ New best: {self.best_loss:.4f}")
 
-        print("\n✨ Training complete!")
-        print(f"📤 Final model at: https://huggingface.co/{self.config.hf_repo}")
+        print(f"\n✨ Training complete!")
+        print(f"📤 Model: https://huggingface.co/{self.config.hf_repo}")
 
         if self.config.use_wandb:
             wandb.finish()
 
     def save_checkpoint(self, best: bool = False):
-        """Save model checkpoint with prompt history."""
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
@@ -1070,61 +987,27 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
             'used_prompts': self.used_prompts,
             'prompt_sources': self.prompt_sources
         }
-
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
         if best:
             path = Path(self.config.checkpoint_dir) / 'best_model.pt'
         else:
-            path = Path(self.config.checkpoint_dir) / f'checkpoint_step_{self.global_step}.pt'
+            path = Path(self.config.checkpoint_dir) / f'checkpoint_{self.global_step}.pt'
 
         torch.save(checkpoint, path)
-
-        # Save prompts as text file
-        if best:
-            prompts_path = Path(self.config.checkpoint_dir) / 'training_prompts.txt'
-            with open(prompts_path, 'w') as f:
-                for prompt, source in zip(self.used_prompts, self.prompt_sources):
-                    f.write(f"[{source}] {prompt}\n")
-
         if not best:
             self._cleanup_checkpoints()
 
     def _cleanup_checkpoints(self):
-        """Keep only last N checkpoints."""
         checkpoint_dir = Path(self.config.checkpoint_dir)
         checkpoints = sorted(
-            [f for f in checkpoint_dir.glob('checkpoint_step_*.pt')],
+            [f for f in checkpoint_dir.glob('checkpoint_*.pt')],
             key=lambda x: int(x.stem.split('_')[-1])
         )
-
         if len(checkpoints) > self.config.keep_last_n:
             for ckpt in checkpoints[:-self.config.keep_last_n]:
                 ckpt.unlink()
-
-    def load_checkpoint(self, path: str):
-        """Load model from checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
-
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-        if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-        self.epoch = checkpoint['epoch']
-        self.global_step = checkpoint['global_step']
-        self.best_loss = checkpoint['best_loss']
-
-        if 'used_prompts' in checkpoint:
-            self.used_prompts = checkpoint['used_prompts']
-            self.prompt_sources = checkpoint.get('prompt_sources', [])
-
-        print(f"✓ Loaded checkpoint from step {self.global_step}")
-        print(f"✓ Best loss: {self.best_loss:.4f}")
-        if self.used_prompts:
-            print(f"✓ Training prompts: {len(self.used_prompts):,}")
 
 
 # ============================================================================
@@ -1132,45 +1015,19 @@ recons, mu, logvar, per_mod_mus = model(inputs, target_modalities=["clip_l", "cl
 # ============================================================================
 
 def create_lyra_trainer(
-        fusion_strategy: str = "adaptive_cantor",
         num_samples: int = 10000,
         batch_size: int = 8,
         num_epochs: int = 100,
-        learning_rate: float = 1e-4,
-        beta_kl: float = 0.1,
-        alpha_init: float = 1.0,
-        beta_init: float = 0.3,
-        use_kl_annealing: bool = True,
         push_to_hub: bool = True,
-        push_every: int = 2000,
-        hf_repo: str = "AbstractPhil/vae-lyra-adaptive-cantor",
+        hf_repo: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
         **kwargs
 ) -> VAELyraTrainer:
-    """
-    Convenience function to create VAE Lyra Adaptive Cantor trainer.
-
-    Example:
-        >>> trainer = create_lyra_trainer(
-        ...     fusion_strategy="adaptive_cantor",
-        ...     num_samples=10000,
-        ...     batch_size=8,
-        ...     alpha_init=1.0,
-        ...     beta_init=0.3,
-        ...     push_to_hub=True
-        ... )
-    """
+    """Create VAE Lyra trainer with Illustrious CLIP."""
     config = VAELyraTrainerConfig(
-        fusion_strategy=fusion_strategy,
         num_samples=num_samples,
         batch_size=batch_size,
         num_epochs=num_epochs,
-        learning_rate=learning_rate,
-        beta_kl=beta_kl,
-        alpha_init=alpha_init,
-        beta_init=beta_init,
-        use_kl_annealing=use_kl_annealing,
         push_to_hub=push_to_hub,
-        push_every=push_every,
         hf_repo=hf_repo,
         **kwargs
     )
@@ -1178,88 +1035,30 @@ def create_lyra_trainer(
 
 
 def load_lyra_from_hub(
-        repo_id: str = "AbstractPhil/vae-lyra-adaptive-cantor",
+        repo_id: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
         device: str = "cuda"
 ) -> MultiModalVAE:
-    """
-    Load VAE Lyra Adaptive Cantor directly from HuggingFace Hub.
+    """Load VAE Lyra from HuggingFace Hub."""
+    model_path = hf_hub_download(repo_id=repo_id, filename="model.pt", repo_type="model")
+    config_path = hf_hub_download(repo_id=repo_id, filename="config.json", repo_type="model")
 
-    Example:
-        >>> model = load_lyra_from_hub()
-        >>> model.eval()
-    """
-    from huggingface_hub import hf_hub_download
-
-    # Download model
-    model_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="model.pt",
-        repo_type="model"
-    )
-
-    # Download config
-    config_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="config.json",
-        repo_type="model"
-    )
-
-    # Load config
     with open(config_path) as f:
         config_dict = json.load(f)
 
-    # Create VAE config
     vae_config = MultiModalVAEConfig(
         modality_dims=config_dict.get('modality_dims'),
         modality_seq_lens=config_dict.get('modality_seq_lens'),
         binding_config=config_dict.get('binding_config'),
         latent_dim=config_dict.get('latent_dim', 2048),
-        seq_len=config_dict.get('seq_len', 77),
-        encoder_layers=config_dict.get('encoder_layers', 3),
-        decoder_layers=config_dict.get('decoder_layers', 3),
-        hidden_dim=config_dict.get('hidden_dim', 1024),
-        dropout=config_dict.get('dropout', 0.1),
         fusion_strategy=config_dict.get('fusion_strategy', 'adaptive_cantor'),
-        fusion_heads=config_dict.get('fusion_heads', 8),
-        fusion_dropout=config_dict.get('fusion_dropout', 0.1),
         cantor_depth=config_dict.get('cantor_depth', 8),
-        cantor_local_window=config_dict.get('cantor_local_window', 3),
-        alpha_init=config_dict.get('alpha_init', 1.0),
-        beta_init=config_dict.get('beta_init', 0.3)
+        cantor_local_window=config_dict.get('cantor_local_window', 3)
     )
 
-    # Load model
     checkpoint = torch.load(model_path, map_location=device)
     model = MultiModalVAE(vae_config)
     model.load_state_dict(checkpoint['model_state_dict'])
     model.to(device)
 
-    print(f"✓ Loaded VAE Lyra Adaptive Cantor from {repo_id}")
-    print(f"✓ Training step: {checkpoint.get('global_step', 'unknown')}")
-    print(f"✓ Best loss: {checkpoint.get('best_loss', 'unknown'):.4f}")
-
+    print(f"✓ Loaded from {repo_id} @ step {checkpoint.get('global_step', '?')}")
     return model
-
-
-# ============================================================================
-# EXAMPLE USAGE
-# ============================================================================
-
-if __name__ == "__main__":
-    # Create trainer with adaptive Cantor fusion
-    trainer = create_lyra_trainer(
-        fusion_strategy="adaptive_cantor",
-        num_samples=10000,
-        batch_size=8,
-        num_epochs=100,
-        alpha_init=1.0,
-        beta_init=0.3,
-        push_to_hub=True,
-        hf_repo="AbstractPhil/vae-lyra-adaptive-cantor"
-    )
-
-    # Prepare data
-    dataloader = trainer.prepare_data()
-
-    # Train
-    trainer.train(dataloader)

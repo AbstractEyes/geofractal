@@ -54,6 +54,7 @@ if __name__ == "__main__":
     loss_output = loss_fn.forward(preds, targets)
     print(loss_output)
     print(f"Loss Name: {loss_fn.name}, UID: {loss_fn.uid}")
+
 #     print(f"Config: {FormulaConfig()}")
 #     print(f"Config as dict: {json.dumps(FormulaConfig().to_dict(),
 #                                   indent=2)}")
