@@ -760,6 +760,7 @@ class VAELyraTrainer:
 
         self.summarizer = CaptionFactory(summarizer_config)
         print(f"  ✓ Summarizer ready: {self.config.summarizer_model}")
+        print(f"    Batch size: {self.config.summarizer_batch_size}")
         print(f"    Separator token: '{self.config.summary_separator}' (pilcrow)")
         print(f"    Shuffle tags: {self.config.shuffle_tags_before_summary}")
 
@@ -1633,6 +1634,7 @@ def create_lyra_trainer(
         # Summarizer options
         use_summarizer: bool = True,
         summarizer_model: str = "qwen2.5-1.5b",
+        summarizer_batch_size: int = 16,
         summary_separator: str = "¶",
         shuffle_tags_before_summary: bool = True,
         # Cache options
@@ -1661,6 +1663,7 @@ def create_lyra_trainer(
         auto_discover_clips=auto_discover_clips,
         use_summarizer=use_summarizer,
         summarizer_model=summarizer_model,
+        summarizer_batch_size=summarizer_batch_size,
         summary_separator=summary_separator,
         shuffle_tags_before_summary=shuffle_tags_before_summary,
         prompt_cache_dir=prompt_cache_dir,
@@ -1679,6 +1682,7 @@ def generate_prompt_cache(
         num_samples: int = 10000,
         prompt_source: str = "booru",
         summarizer_model: str = "qwen2.5-1.5b",
+        summarizer_batch_size: int = 16,
         cache_dir: str = "./prompt_cache",
         cache_name: Optional[str] = None,
         danbooru_csv: Optional[str] = None,
@@ -1697,6 +1701,7 @@ def generate_prompt_cache(
         num_samples: Number of prompts to generate
         prompt_source: Source for prompts ("booru", "synthetic", "laion", "mixed")
         summarizer_model: Model to use for summarization
+        summarizer_batch_size: Batch size for summarization (higher = faster, more VRAM)
         cache_dir: Directory to save cache
         cache_name: Custom name for cache file (auto-generated if None)
         *_csv: Paths to booru tag CSVs
@@ -1710,6 +1715,7 @@ def generate_prompt_cache(
         prompt_source=prompt_source,
         use_summarizer=True,
         summarizer_model=summarizer_model,
+        summarizer_batch_size=summarizer_batch_size,
         prompt_cache_dir=cache_dir,
         prompt_cache_name=cache_name,
         use_prompt_cache=False,  # Force regeneration
@@ -1791,6 +1797,7 @@ if __name__ == "__main__":
         # Summarization (T5 sees tags + summary, CLIP sees tags only)
         use_summarizer=True,
         summarizer_model="qwen2.5-1.5b",
+        summarizer_batch_size=32,  # Higher = faster, more VRAM
         summary_separator="¶",  # Pilcrow for mode switching
         shuffle_tags_before_summary=True,
         summarizer_max_new_tokens=64,
