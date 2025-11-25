@@ -57,6 +57,16 @@ from geofractal.model.vae.vae_lyra_v2 import (
 )
 from geovocab2.data.prompt.symbolic_tree import SynthesisSystem
 from geovocab2.data.prompt.booru_synthesizer import BooruSynthesizer, BooruConfig
+from geovocab2.factories.summary_factory import CaptionFactory, CaptionFactoryConfig
+
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+# Pilcrow separator for T5 mode-switching
+# This rare token signals the transition from tags to natural language summary
+# CLIP encoders won't see this - only T5 receives the summary portion
+SUMMARY_SEPARATOR = "¶"
 
 
 # ============================================================================
@@ -209,19 +219,115 @@ def load_illustrious_clip_g(
     return model, tokenizer
 
 
+def list_clip_files(repo_id: str = "AbstractPhil/clips") -> Dict[str, List[str]]:
+    """
+    List available CLIP files in a HuggingFace repo.
+
+    Returns:
+        Dict with 'clip_l', 'clip_g', 't5' keys mapping to available filenames
+    """
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+
+    result = {'clip_l': [], 'clip_g': [], 't5': [], 'other': []}
+
+    for f in files:
+        f_lower = f.lower()
+        if f.endswith('.safetensors') or f.endswith('.bin'):
+            if 'clip_l' in f_lower or 'clipl' in f_lower or 'clip-l' in f_lower:
+                result['clip_l'].append(f)
+            elif 'clip_g' in f_lower or 'clipg' in f_lower or 'clip-g' in f_lower:
+                result['clip_g'].append(f)
+            elif 't5' in f_lower:
+                result['t5'].append(f)
+            else:
+                result['other'].append(f)
+
+    return result
+
+
 def download_illustrious_clips(
         repo_id: str = "AbstractPhil/clips",
-        clip_l_filename: str = "IllustriousXL20_v20_clip_l.safetensors",
-        clip_g_filename: str = "IllustriousXL20_v20_clip_g.safetensors"
+        clip_l_filename: Optional[str] = None,
+        clip_g_filename: Optional[str] = None,
+        auto_discover: bool = True
 ) -> Tuple[str, str]:
     """
     Download Illustrious CLIP weights from HuggingFace.
 
+    Args:
+        repo_id: HuggingFace repo ID
+        clip_l_filename: Specific filename for CLIP-L (or None to auto-discover)
+        clip_g_filename: Specific filename for CLIP-G (or None to auto-discover)
+        auto_discover: If True and filenames not provided, discover from repo
+
     Returns:
         Tuple of (clip_l_path, clip_g_path)
     """
-    print(f"\n📥 Downloading Illustrious CLIP weights from {repo_id}...")
+    from huggingface_hub import HfApi
 
+    print(f"\n📥 Downloading CLIP weights from {repo_id}...")
+
+    api = HfApi()
+
+    # Auto-discover files if not specified
+    if auto_discover and (clip_l_filename is None or clip_g_filename is None):
+        print("  🔍 Discovering available files...")
+        files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+
+        # Print available safetensors files
+        safetensor_files = [f for f in files if f.endswith('.safetensors')]
+        print(f"  📁 Found {len(safetensor_files)} safetensors files:")
+        for f in safetensor_files[:10]:  # Show first 10
+            print(f"      - {f}")
+        if len(safetensor_files) > 10:
+            print(f"      ... and {len(safetensor_files) - 10} more")
+
+        # Try to find CLIP-L and CLIP-G
+        if clip_l_filename is None:
+            for f in files:
+                f_lower = f.lower()
+                if ('clip_l' in f_lower or 'clipl' in f_lower or 'clip-l' in f_lower) and f.endswith('.safetensors'):
+                    clip_l_filename = f
+                    break
+            # Fallback patterns
+            if clip_l_filename is None:
+                for f in files:
+                    if 'illustrious' in f.lower() and 'clip_l' in f.lower():
+                        clip_l_filename = f
+                        break
+
+        if clip_g_filename is None:
+            for f in files:
+                f_lower = f.lower()
+                if ('clip_g' in f_lower or 'clipg' in f_lower or 'clip-g' in f_lower) and f.endswith('.safetensors'):
+                    clip_g_filename = f
+                    break
+            # Fallback patterns
+            if clip_g_filename is None:
+                for f in files:
+                    if 'illustrious' in f.lower() and 'clip_g' in f.lower():
+                        clip_g_filename = f
+                        break
+
+    # Validate we have filenames
+    if clip_l_filename is None:
+        raise ValueError(
+            f"Could not find CLIP-L file in {repo_id}. "
+            f"Please specify clip_l_filename explicitly. "
+            f"Available files: {[f for f in files if f.endswith('.safetensors')]}"
+        )
+
+    if clip_g_filename is None:
+        raise ValueError(
+            f"Could not find CLIP-G file in {repo_id}. "
+            f"Please specify clip_g_filename explicitly. "
+            f"Available files: {[f for f in files if f.endswith('.safetensors')]}"
+        )
+
+    print(f"  📥 Downloading CLIP-L: {clip_l_filename}")
     clip_l_path = hf_hub_download(
         repo_id=repo_id,
         filename=clip_l_filename,
@@ -229,6 +335,7 @@ def download_illustrious_clips(
     )
     print(f"  ✓ CLIP-L: {clip_l_path}")
 
+    print(f"  📥 Downloading CLIP-G: {clip_g_filename}")
     clip_g_path = hf_hub_download(
         repo_id=repo_id,
         filename=clip_g_filename,
@@ -250,8 +357,9 @@ class VAELyraTrainerConfig:
     # Custom CLIP configuration
     use_illustrious_clips: bool = True
     illustrious_repo: str = "AbstractPhil/clips"
-    clip_l_filename: str = "IllustriousXL20_v20_clip_l.safetensors"
-    clip_g_filename: str = "IllustriousXL20_v20_clip_g.safetensors"
+    clip_l_filename: Optional[str] = None  # Auto-discover if None
+    clip_g_filename: Optional[str] = None  # Auto-discover if None
+    auto_discover_clips: bool = True  # Auto-discover CLIP files in repo
 
     # CLIP skip (1 = last layer, 2 = penultimate layer)
     clip_skip: int = 2
@@ -324,6 +432,16 @@ class VAELyraTrainerConfig:
     e621_csv: Optional[str] = None
     rule34x_csv: Optional[str] = None
 
+    # Summarization configuration (T5 receives tags + summary, CLIP only sees tags)
+    use_summarizer: bool = True
+    summarizer_model: str = "qwen2.5-1.5b"  # Model from CaptionFactory registry
+    summarizer_batch_size: int = 16
+    summary_separator: str = "¶"  # Pilcrow - rare token for mode switching
+    shuffle_tags_before_summary: bool = True  # Shuffle tag order for robustness
+    summarizer_max_new_tokens: int = 64
+    summarizer_temperature: float = 0.7
+    use_summarizer_int8: bool = False  # Quantize summarizer for memory
+
     # Checkpointing
     checkpoint_dir: str = './checkpoints_lyra_illustrious'
     save_every: int = 1000
@@ -393,15 +511,22 @@ class VAELyraTrainerConfig:
 
 
 # ============================================================================
-# DATASET WITH CLIP_SKIP SUPPORT
+# DATASET WITH CLIP_SKIP SUPPORT AND SEPARATE T5 INPUT
 # ============================================================================
 
 class TextEmbeddingDataset(Dataset):
-    """Dataset that generates CLIP-L, CLIP-G, and T5-XL embeddings on-the-fly."""
+    """
+    Dataset that generates CLIP-L, CLIP-G, and T5-XL embeddings on-the-fly.
+
+    Supports separate text inputs for CLIP vs T5:
+    - CLIP sees: raw booru tags
+    - T5 sees: shuffled tags + separator + natural language summary
+    """
 
     def __init__(
             self,
-            texts: List[str],
+            clip_texts: List[str],
+            t5_texts: List[str],
             clip_l_tokenizer: CLIPTokenizer,
             clip_l_model: CLIPTextModel,
             clip_g_tokenizer: CLIPTokenizer,
@@ -413,7 +538,10 @@ class TextEmbeddingDataset(Dataset):
             t5_max_length: int = 512,
             clip_skip: int = 1
     ):
-        self.texts = texts
+        assert len(clip_texts) == len(t5_texts), "CLIP and T5 text lists must have same length"
+
+        self.clip_texts = clip_texts
+        self.t5_texts = t5_texts
         self.clip_l_tokenizer = clip_l_tokenizer
         self.clip_l_model = clip_l_model
         self.clip_g_tokenizer = clip_g_tokenizer
@@ -433,15 +561,16 @@ class TextEmbeddingDataset(Dataset):
             print(f"    Using clip_skip={clip_skip} (penultimate layer extraction)")
 
     def __len__(self):
-        return len(self.texts)
+        return len(self.clip_texts)
 
     @torch.no_grad()
     def __getitem__(self, idx):
-        text = self.texts[idx]
+        clip_text = self.clip_texts[idx]
+        t5_text = self.t5_texts[idx]
 
-        # CLIP-L embedding with clip_skip support
+        # CLIP-L embedding with clip_skip support (sees only tags)
         clip_l_tokens = self.clip_l_tokenizer(
-            text,
+            clip_text,
             max_length=self.clip_max_length,
             padding='max_length',
             truncation=True,
@@ -458,9 +587,9 @@ class TextEmbeddingDataset(Dataset):
             output_hidden_states=(self.clip_skip > 1)
         ).squeeze(0)
 
-        # CLIP-G embedding with clip_skip support
+        # CLIP-G embedding with clip_skip support (sees only tags)
         clip_g_tokens = self.clip_g_tokenizer(
-            text,
+            clip_text,
             max_length=self.clip_max_length,
             padding='max_length',
             truncation=True,
@@ -477,9 +606,9 @@ class TextEmbeddingDataset(Dataset):
             output_hidden_states=(self.clip_skip > 1)
         ).squeeze(0)
 
-        # T5-XL embeddings (no skip needed)
+        # T5-XL embeddings (sees tags + separator + summary)
         t5_tokens = self.t5_tokenizer(
-            text,
+            t5_text,
             max_length=self.t5_max_length,
             padding='max_length',
             truncation=True,
@@ -494,7 +623,8 @@ class TextEmbeddingDataset(Dataset):
             'clip_g': clip_g_embed.cpu(),
             't5_xl_l': t5_embed.cpu(),
             't5_xl_g': t5_embed.cpu(),
-            'text': text
+            'clip_text': clip_text,
+            't5_text': t5_text
         }
 
 
@@ -550,8 +680,14 @@ class VAELyraTrainer:
         # Initialize prompt generators
         self._init_prompt_generators()
 
+        # Initialize summarizer if enabled
+        self.summarizer = None
+        if config.use_summarizer:
+            self._init_summarizer()
+
         self.used_prompts = []
         self.prompt_sources = []
+        self.summaries = []
 
         if config.use_wandb:
             wandb.init(
@@ -590,6 +726,99 @@ class VAELyraTrainer:
             self.flavors = self._load_flavors()
         else:
             self.flavors = []
+
+    def _init_summarizer(self):
+        """Initialize the CaptionFactory summarizer for T5 inputs."""
+        print(f"\n🔤 Initializing summarizer ({self.config.summarizer_model})...")
+
+        summarizer_config = CaptionFactoryConfig(
+            model_name=self.config.summarizer_model,
+            use_int8=self.config.use_summarizer_int8,
+            max_new_tokens=self.config.summarizer_max_new_tokens,
+            temperature=self.config.summarizer_temperature,
+            device=self.config.device,
+            batch_size=self.config.summarizer_batch_size,
+            keep_model_loaded=False,  # We'll load/unload as needed
+        )
+
+        self.summarizer = CaptionFactory(summarizer_config)
+        print(f"  ✓ Summarizer ready: {self.config.summarizer_model}")
+        print(f"    Separator token: '{self.config.summary_separator}' (pilcrow)")
+        print(f"    Shuffle tags: {self.config.shuffle_tags_before_summary}")
+
+    def _shuffle_tags(self, tags_str: str) -> str:
+        """Shuffle comma-separated tags while preserving quality tags at front."""
+        tags = [t.strip() for t in tags_str.split(',') if t.strip()]
+
+        if not tags:
+            return tags_str
+
+        # Separate quality/meta tags from content tags
+        quality_tags = []
+        content_tags = []
+
+        quality_keywords = {'masterpiece', 'best quality', 'high quality', 'absurdres',
+                            'highres', 'very aesthetic', 'aesthetic', 'newest', 'recent'}
+
+        for tag in tags:
+            tag_lower = tag.lower().strip()
+            if tag_lower in quality_keywords:
+                quality_tags.append(tag)
+            else:
+                content_tags.append(tag)
+
+        # Shuffle only the content tags
+        random.shuffle(content_tags)
+
+        # Recombine: quality first, then shuffled content
+        shuffled = quality_tags + content_tags
+        return ', '.join(shuffled)
+
+    def _generate_summaries(self, tags_list: List[str]) -> List[str]:
+        """Generate natural language summaries for a batch of tag strings."""
+        if self.summarizer is None:
+            # If no summarizer, return empty summaries
+            return [""] * len(tags_list)
+
+        print(f"\n📝 Generating summaries for {len(tags_list):,} prompts...")
+
+        # Load summarizer
+        self.summarizer.load()
+
+        try:
+            # Process in batches
+            summaries = self.summarizer.summarize_batch(tags_list)
+
+            # Clean up summaries
+            cleaned = []
+            for s in summaries:
+                # Remove any accidental separators in the summary
+                s = s.replace(self.config.summary_separator, ' ')
+                # Trim excessive whitespace
+                s = ' '.join(s.split())
+                cleaned.append(s)
+
+            print(f"  ✓ Generated {len(cleaned):,} summaries")
+            return cleaned
+
+        finally:
+            # Unload to free VRAM for CLIP/T5
+            self.summarizer.unload()
+            print(f"  ✓ Unloaded summarizer to free VRAM")
+
+    def _build_t5_text(self, tags: str, summary: str) -> str:
+        """
+        Build the T5 input text with tags, separator, and summary.
+
+        Format: "{shuffled_tags} ¶ {summary}"
+        """
+        if self.config.shuffle_tags_before_summary:
+            tags = self._shuffle_tags(tags)
+
+        if summary:
+            return f"{tags} {self.config.summary_separator} {summary}"
+        else:
+            return tags
 
     def _load_flavors(self) -> List[str]:
         """Load LAION flavors from remote source."""
@@ -763,13 +992,13 @@ license: mit
 
 # VAE Lyra 🎵 - Illustrious Edition
 
-Multi-modal VAE trained with **Illustrious XL 2.0 CLIP weights**.
+Multi-modal VAE trained with **custom CLIP weights**.
 
 ## CLIP Encoders
 
-Uses custom fine-tuned CLIP weights from `AbstractPhil/clips`:
-- `IllustriousXL20_v20_clip_l.safetensors` (768d)
-- `IllustriousXL20_v20_clip_g.safetensors` (1280d)
+Uses CLIP weights from `{self.config.illustrious_repo}`:
+- CLIP-L: `{self.config.clip_l_filename or 'auto-discovered'}`
+- CLIP-G: `{self.config.clip_g_filename or 'auto-discovered'}`
 
 **CLIP Skip**: {self.config.clip_skip} ({"penultimate layer" if self.config.clip_skip == 2 else "last layer"})
 
@@ -780,6 +1009,22 @@ Uses custom fine-tuned CLIP weights from `AbstractPhil/clips`:
 - **Training Steps**: {self.global_step:,}
 - **Best Loss**: {self.best_loss:.4f}
 {prompt_info}
+
+## T5 Input Format
+
+T5 receives a different input than CLIP to enable richer semantic understanding:
+
+```
+CLIP sees:  "masterpiece, 1girl, blue hair, school uniform, smile"
+T5 sees:    "masterpiece, 1girl, blue hair, school uniform, smile ¶ A cheerful schoolgirl with blue hair smiling warmly"
+```
+
+The pilcrow (`¶`) separator acts as a mode-switch token, allowing T5 to learn:
+- **Before ¶**: Structured booru tags (shuffled for robustness)  
+- **After ¶**: Natural language description from Qwen summarizer
+
+This enables deviant T5 usage during inference without affecting CLIP behavior.
+
 {fusion_params_str}
 
 ## Usage
@@ -912,29 +1157,57 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
 
         print(f"\n🎼 Generating {num_samples:,} prompts (source: {self.config.prompt_source})...")
 
-        texts, sources = [], []
-        for _ in tqdm(range(num_samples), desc="Generating"):
+        # Phase 1: Generate raw tags
+        tags_list, sources = [], []
+        for _ in tqdm(range(num_samples), desc="Generating tags"):
             prompt, source = self._generate_prompt()
-            texts.append(prompt)
+            tags_list.append(prompt)
             sources.append(source)
 
-        self.used_prompts = texts
+        self.used_prompts = tags_list
         self.prompt_sources = sources
 
         source_counts = Counter(sources)
         print(f"\nDistribution: {dict(source_counts)}")
-        print(f"Samples:")
+        print(f"Sample tags:")
         for src in set(sources):
-            sample = next((t for t, s in zip(texts, sources) if s == src), None)
+            sample = next((t for t, s in zip(tags_list, sources) if s == src), None)
             if sample:
                 print(f"  [{src}] {sample[:80]}...")
+
+        # Phase 2: Generate summaries (if enabled)
+        if self.config.use_summarizer:
+            summaries = self._generate_summaries(tags_list)
+            self.summaries = summaries
+        else:
+            summaries = [""] * len(tags_list)
+            self.summaries = summaries
+
+        # Phase 3: Build separate CLIP and T5 texts
+        # CLIP sees: raw tags
+        # T5 sees: shuffled tags + separator + summary
+        clip_texts = tags_list  # Raw tags for CLIP
+        t5_texts = []
+
+        for tags, summary in zip(tags_list, summaries):
+            t5_text = self._build_t5_text(tags, summary)
+            t5_texts.append(t5_text)
+
+        # Show examples of the T5 format
+        print(f"\nT5 input format examples:")
+        for i in range(min(3, len(t5_texts))):
+            t5_sample = t5_texts[i]
+            if len(t5_sample) > 120:
+                t5_sample = t5_sample[:120] + "..."
+            print(f"  {t5_sample}")
 
         # Download custom CLIP weights
         if self.config.use_illustrious_clips:
             clip_l_path, clip_g_path = download_illustrious_clips(
                 repo_id=self.config.illustrious_repo,
                 clip_l_filename=self.config.clip_l_filename,
-                clip_g_filename=self.config.clip_g_filename
+                clip_g_filename=self.config.clip_g_filename,
+                auto_discover=self.config.auto_discover_clips
             )
 
             print("\n🔧 Loading Illustrious CLIP encoders...")
@@ -965,9 +1238,13 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         t5_model = T5EncoderModel.from_pretrained("google/flan-t5-xl")
 
         print(f"✓ All encoders loaded (clip_skip={self.config.clip_skip})")
+        if self.config.use_summarizer:
+            print(f"  T5 receives: tags {self.config.summary_separator} summary")
+            print(f"  CLIP receives: tags only")
 
         dataset = TextEmbeddingDataset(
-            texts=texts,
+            clip_texts=clip_texts,
+            t5_texts=t5_texts,
             clip_l_tokenizer=clip_l_tokenizer,
             clip_l_model=clip_l_model,
             clip_g_tokenizer=clip_g_tokenizer,
@@ -1138,7 +1415,8 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
             'config': asdict(self.config),
             'best_loss': self.best_loss,
             'used_prompts': self.used_prompts,
-            'prompt_sources': self.prompt_sources
+            'prompt_sources': self.prompt_sources,
+            'summaries': self.summaries,
         }
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
@@ -1175,13 +1453,23 @@ def create_lyra_trainer(
         hf_repo: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
         prompt_source: str = "booru",
         clip_skip: int = 2,
+        illustrious_repo: str = "AbstractPhil/clips",
+        clip_l_filename: Optional[str] = None,
+        clip_g_filename: Optional[str] = None,
+        auto_discover_clips: bool = True,
+        # Summarizer options
+        use_summarizer: bool = True,
+        summarizer_model: str = "qwen2.5-1.5b",
+        summary_separator: str = "¶",
+        shuffle_tags_before_summary: bool = True,
+        # CSV paths
         danbooru_csv: Optional[str] = None,
         gelbooru_csv: Optional[str] = None,
         e621_csv: Optional[str] = None,
         rule34x_csv: Optional[str] = None,
         **kwargs
 ) -> VAELyraTrainer:
-    """Create VAE Lyra trainer with Illustrious CLIP and configurable prompt source."""
+    """Create VAE Lyra trainer with Illustrious CLIP, summarizer, and configurable prompt source."""
     config = VAELyraTrainerConfig(
         num_samples=num_samples,
         batch_size=batch_size,
@@ -1190,6 +1478,14 @@ def create_lyra_trainer(
         hf_repo=hf_repo,
         prompt_source=prompt_source,
         clip_skip=clip_skip,
+        illustrious_repo=illustrious_repo,
+        clip_l_filename=clip_l_filename,
+        clip_g_filename=clip_g_filename,
+        auto_discover_clips=auto_discover_clips,
+        use_summarizer=use_summarizer,
+        summarizer_model=summarizer_model,
+        summary_separator=summary_separator,
+        shuffle_tags_before_summary=shuffle_tags_before_summary,
         danbooru_csv=danbooru_csv,
         gelbooru_csv=gelbooru_csv,
         e621_csv=e621_csv,
@@ -1251,12 +1547,23 @@ if __name__ == "__main__":
         e621_csv=None,
         rule34x_csv=None,
 
+        # Summarization (T5 sees tags + summary, CLIP sees tags only)
+        use_summarizer=True,
+        summarizer_model="qwen2.5-1.5b",
+        summary_separator="¶",  # Pilcrow for mode switching
+        shuffle_tags_before_summary=True,
+        summarizer_max_new_tokens=64,
+
         # CLIP configuration
         use_illustrious_clips=True,
+        illustrious_repo="AbstractPhil/clips",
+        clip_l_filename=None,  # Auto-discover, or specify e.g. "clip_l.safetensors"
+        clip_g_filename=None,  # Auto-discover, or specify e.g. "clip_g.safetensors"
+        auto_discover_clips=True,
         clip_skip=2,  # Use penultimate layer
 
         # Training
-        num_samples=10_000,
+        num_samples=10000,
         batch_size=8,
         num_epochs=100,
         learning_rate=1e-4,
