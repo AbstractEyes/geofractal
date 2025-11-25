@@ -1,8 +1,14 @@
-# geofractal/trainers/vae_lyra/lyra_xl_multimodal_illustrious.py
+# geofractal/trainers/vae_lyra/lyra_xl_multimodal.py
 
 """
 Trainer for VAE Lyra - Multi-Modal Variational Autoencoder
 Using Custom Illustrious CLIP-L + CLIP-G + T5-XL for SDXL Compatibility
+
+Supports:
+- BooruSynthesizer for anime/illustration style prompts
+- SynthesisSystem for symbolic prompts
+- LAION flavors fallback
+- clip_skip for penultimate layer extraction
 
 Downloads custom CLIP weights from AbstractPhil/clips:
 - IllustriousXL20_v20_clip_l.safetensors
@@ -13,9 +19,7 @@ Install via:
     !pip install safetensors
 
 Usage:
-    from lyra_xl_multimodal_illustrious import (
-        VAELyraTrainer, VAELyraTrainerConfig
-    )
+    from lyra_xl_multimodal import VAELyraTrainer, VAELyraTrainerConfig
 """
 
 import torch
@@ -38,8 +42,9 @@ import wandb
 import os
 import json
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass, asdict
+from typing import Optional, Dict, List, Tuple, Union
+from dataclasses import dataclass, field, asdict
+from enum import Enum
 import requests
 import random
 from collections import Counter
@@ -51,11 +56,52 @@ from geofractal.model.vae.vae_lyra_v2 import (
     FusionStrategy
 )
 from geovocab2.data.prompt.symbolic_tree import SynthesisSystem
+from geovocab2.data.prompt.booru_synthesizer import BooruSynthesizer, BooruConfig
 
 
 # ============================================================================
-# CUSTOM CLIP LOADING FROM SAFETENSORS
+# PROMPT SOURCE ENUM
 # ============================================================================
+
+class PromptSource(Enum):
+    """Available prompt generation sources."""
+    BOORU = "booru"
+    SYNTHETIC = "synthetic"
+    LAION = "laion"
+    MIXED = "mixed"
+
+
+# ============================================================================
+# CUSTOM CLIP LOADING WITH CLIP_SKIP SUPPORT
+# ============================================================================
+
+def get_clip_hidden_state(
+        model_output,
+        clip_skip: int = 1,
+        output_hidden_states: bool = True
+) -> torch.Tensor:
+    """
+    Extract hidden state with clip_skip support.
+
+    Args:
+        model_output: Output from CLIP model
+        clip_skip: Number of layers to skip from the end (1 = last layer, 2 = penultimate)
+        output_hidden_states: Whether hidden_states are available
+
+    Returns:
+        Hidden state tensor [batch, seq_len, hidden_dim]
+    """
+    if clip_skip == 1 or not output_hidden_states:
+        return model_output.last_hidden_state
+
+    # hidden_states is tuple of (embedding, layer1, layer2, ..., layerN)
+    # For clip_skip=2, we want hidden_states[-2]
+    if hasattr(model_output, 'hidden_states') and model_output.hidden_states is not None:
+        return model_output.hidden_states[-clip_skip]
+
+    # Fallback to last_hidden_state
+    return model_output.last_hidden_state
+
 
 def load_illustrious_clip_l(
         safetensors_path: str,
@@ -75,21 +121,15 @@ def load_illustrious_clip_l(
     """
     print(f"    Loading CLIP-L architecture from {base_model}...")
 
-    # Get tokenizer from base model
     tokenizer = CLIPTokenizer.from_pretrained(base_model)
-
-    # Initialize model architecture
     model = CLIPTextModel.from_pretrained(base_model)
 
-    # Load custom weights
     print(f"    Loading Illustrious weights from {Path(safetensors_path).name}...")
     state_dict = load_safetensors(safetensors_path)
 
-    # Debug: show some keys to understand structure
     sample_keys = list(state_dict.keys())[:5]
     print(f"    Sample keys: {sample_keys}")
 
-    # Try to load - may need key remapping
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
     if missing:
@@ -97,10 +137,8 @@ def load_illustrious_clip_l(
     if unexpected:
         print(f"    ⚠️  Unexpected keys: {len(unexpected)}")
 
-        # If keys have different prefix, try remapping
         if unexpected and not missing:
             print("    Attempting key remapping...")
-            # Common pattern: 'text_model.' prefix
             remapped = {}
             for k, v in state_dict.items():
                 if k.startswith('text_model.'):
@@ -136,21 +174,15 @@ def load_illustrious_clip_g(
     """
     print(f"    Loading CLIP-G architecture from {base_model}...")
 
-    # Get tokenizer from base model
     tokenizer = CLIPTokenizer.from_pretrained(base_model)
-
-    # Initialize model architecture
     model = CLIPTextModelWithProjection.from_pretrained(base_model)
 
-    # Load custom weights
     print(f"    Loading Illustrious weights from {Path(safetensors_path).name}...")
     state_dict = load_safetensors(safetensors_path)
 
-    # Debug: show some keys
     sample_keys = list(state_dict.keys())[:5]
     print(f"    Sample keys: {sample_keys}")
 
-    # Try to load
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
 
     if missing:
@@ -158,7 +190,6 @@ def load_illustrious_clip_g(
     if unexpected:
         print(f"    ⚠️  Unexpected keys: {len(unexpected)}")
 
-        # Try remapping if needed
         if unexpected and not missing:
             print("    Attempting key remapping...")
             remapped = {}
@@ -222,6 +253,9 @@ class VAELyraTrainerConfig:
     clip_l_filename: str = "IllustriousXL20_v20_clip_l.safetensors"
     clip_g_filename: str = "IllustriousXL20_v20_clip_g.safetensors"
 
+    # CLIP skip (1 = last layer, 2 = penultimate layer)
+    clip_skip: int = 2
+
     # Model architecture - SDXL with decoupled T5
     modality_dims: Dict[str, int] = None
     modality_seq_lens: Dict[str, int] = None
@@ -273,9 +307,22 @@ class VAELyraTrainerConfig:
     use_scheduler: bool = True
     scheduler_type: str = 'cosine'
 
-    # Data
+    # Data generation
     num_samples: int = 10000
+
+    # Prompt source configuration
+    prompt_source: str = "booru"  # "booru", "synthetic", "laion", "mixed"
+
+    # Ratios for mixed mode (must sum to 1.0)
+    booru_ratio: float = 0.7
     synthetic_ratio: float = 0.15
+    laion_ratio: float = 0.15
+
+    # BooruSynthesizer CSV paths
+    danbooru_csv: Optional[str] = None
+    gelbooru_csv: Optional[str] = None
+    e621_csv: Optional[str] = None
+    rule34x_csv: Optional[str] = None
 
     # Checkpointing
     checkpoint_dir: str = './checkpoints_lyra_illustrious'
@@ -335,9 +382,18 @@ class VAELyraTrainerConfig:
                 "t5_xl_g": 0.3
             }
 
+        # Validate ratios in mixed mode
+        if self.prompt_source == "mixed":
+            total = self.booru_ratio + self.synthetic_ratio + self.laion_ratio
+            if abs(total - 1.0) > 0.01:
+                print(f"⚠️  Prompt ratios sum to {total}, normalizing...")
+                self.booru_ratio /= total
+                self.synthetic_ratio /= total
+                self.laion_ratio /= total
+
 
 # ============================================================================
-# DATASET
+# DATASET WITH CLIP_SKIP SUPPORT
 # ============================================================================
 
 class TextEmbeddingDataset(Dataset):
@@ -354,7 +410,8 @@ class TextEmbeddingDataset(Dataset):
             t5_model: T5EncoderModel,
             device: str = 'cuda',
             clip_max_length: int = 77,
-            t5_max_length: int = 512
+            t5_max_length: int = 512,
+            clip_skip: int = 1
     ):
         self.texts = texts
         self.clip_l_tokenizer = clip_l_tokenizer
@@ -366,10 +423,14 @@ class TextEmbeddingDataset(Dataset):
         self.device = device
         self.clip_max_length = clip_max_length
         self.t5_max_length = t5_max_length
+        self.clip_skip = clip_skip
 
         self.clip_l_model.to(device).eval()
         self.clip_g_model.to(device).eval()
         self.t5_model.to(device).eval()
+
+        if clip_skip > 1:
+            print(f"    Using clip_skip={clip_skip} (penultimate layer extraction)")
 
     def __len__(self):
         return len(self.texts)
@@ -378,7 +439,7 @@ class TextEmbeddingDataset(Dataset):
     def __getitem__(self, idx):
         text = self.texts[idx]
 
-        # CLIP-L embedding
+        # CLIP-L embedding with clip_skip support
         clip_l_tokens = self.clip_l_tokenizer(
             text,
             max_length=self.clip_max_length,
@@ -387,10 +448,17 @@ class TextEmbeddingDataset(Dataset):
             return_tensors='pt'
         ).to(self.device)
 
-        clip_l_output = self.clip_l_model(**clip_l_tokens)
-        clip_l_embed = clip_l_output.last_hidden_state.squeeze(0)
+        clip_l_output = self.clip_l_model(
+            **clip_l_tokens,
+            output_hidden_states=(self.clip_skip > 1)
+        )
+        clip_l_embed = get_clip_hidden_state(
+            clip_l_output,
+            clip_skip=self.clip_skip,
+            output_hidden_states=(self.clip_skip > 1)
+        ).squeeze(0)
 
-        # CLIP-G embedding
+        # CLIP-G embedding with clip_skip support
         clip_g_tokens = self.clip_g_tokenizer(
             text,
             max_length=self.clip_max_length,
@@ -399,10 +467,17 @@ class TextEmbeddingDataset(Dataset):
             return_tensors='pt'
         ).to(self.device)
 
-        clip_g_output = self.clip_g_model(**clip_g_tokens)
-        clip_g_embed = clip_g_output.last_hidden_state.squeeze(0)
+        clip_g_output = self.clip_g_model(
+            **clip_g_tokens,
+            output_hidden_states=(self.clip_skip > 1)
+        )
+        clip_g_embed = get_clip_hidden_state(
+            clip_g_output,
+            clip_skip=self.clip_skip,
+            output_hidden_states=(self.clip_skip > 1)
+        ).squeeze(0)
 
-        # T5-XL embeddings
+        # T5-XL embeddings (no skip needed)
         t5_tokens = self.t5_tokenizer(
             text,
             max_length=self.t5_max_length,
@@ -428,7 +503,7 @@ class TextEmbeddingDataset(Dataset):
 # ============================================================================
 
 class VAELyraTrainer:
-    """Trainer for VAE Lyra with Illustrious CLIP weights."""
+    """Trainer for VAE Lyra with Illustrious CLIP weights and multi-source prompts."""
 
     def __init__(self, config: VAELyraTrainerConfig):
         self.config = config
@@ -443,7 +518,9 @@ class VAELyraTrainer:
 
         print("🎵 Initializing VAE Lyra (Illustrious Edition)...")
         print(f"   CLIP weights: {config.illustrious_repo}")
+        print(f"   CLIP skip: {config.clip_skip}")
         print(f"   Fusion: {config.fusion_strategy}")
+        print(f"   Prompt source: {config.prompt_source}")
 
         if config.auto_load_from_hub:
             loaded = self._try_load_from_hub()
@@ -470,9 +547,9 @@ class VAELyraTrainer:
 
         Path(config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
-        print("Initializing prompt generation...")
-        self.prompt_gen = SynthesisSystem(seed=config.seed)
-        self.flavors = self._load_flavors()
+        # Initialize prompt generators
+        self._init_prompt_generators()
+
         self.used_prompts = []
         self.prompt_sources = []
 
@@ -481,9 +558,88 @@ class VAELyraTrainer:
                 project=config.wandb_project,
                 entity=config.wandb_entity,
                 config=asdict(config),
-                name=f"lyra_illustrious_{config.fusion_strategy}",
+                name=f"lyra_illustrious_{config.fusion_strategy}_{config.prompt_source}",
                 resume="allow"
             )
+
+    def _init_prompt_generators(self):
+        """Initialize all prompt generation systems."""
+        print("\nInitializing prompt generators...")
+
+        # Always init synthetic system
+        self.prompt_gen = SynthesisSystem(seed=self.config.seed)
+        print("  ✓ SynthesisSystem ready")
+
+        # Init booru if needed
+        if self.config.prompt_source in ["booru", "mixed"]:
+            booru_config = BooruConfig(
+                danbooru_csv=self.config.danbooru_csv,
+                gelbooru_csv=self.config.gelbooru_csv,
+                e621_csv=self.config.e621_csv,
+                rule34x_csv=self.config.rule34x_csv,
+                seed=self.config.seed
+            )
+            self.booru_gen = BooruSynthesizer(booru_config)
+            stats = self.booru_gen.stats()
+            print(f"  ✓ BooruSynthesizer ready: {stats['total_tags']:,} tags, {stats['templates']} templates")
+        else:
+            self.booru_gen = None
+
+        # Load LAION flavors if needed
+        if self.config.prompt_source in ["laion", "mixed"]:
+            self.flavors = self._load_flavors()
+        else:
+            self.flavors = []
+
+    def _load_flavors(self) -> List[str]:
+        """Load LAION flavors from remote source."""
+        print("  Loading LAION flavors...")
+        try:
+            r = requests.get(
+                "https://raw.githubusercontent.com/pharmapsychotic/clip-interrogator/main/clip_interrogator/data/flavors.txt",
+                timeout=30
+            )
+            flavors = [line.strip() for line in r.text.split('\n') if line.strip()]
+            print(f"  ✓ Loaded {len(flavors):,} flavors")
+            return flavors
+        except Exception as e:
+            print(f"  ⚠️  Fallback flavors: {e}")
+            return ["a beautiful landscape", "abstract art", "detailed portrait"]
+
+    def _generate_prompt(self) -> Tuple[str, str]:
+        """
+        Generate a single prompt based on configured source.
+
+        Returns:
+            Tuple of (prompt_text, source_name)
+        """
+        source = self.config.prompt_source
+
+        if source == "booru":
+            return self.booru_gen.generate(), "booru"
+
+        elif source == "synthetic":
+            complexity = random.choice([2, 3, 4, 5])
+            prompt = self.prompt_gen.synthesize(complexity=complexity)['text']
+            return prompt, "synthetic"
+
+        elif source == "laion":
+            return random.choice(self.flavors), "laion"
+
+        elif source == "mixed":
+            # Weighted random selection
+            r = random.random()
+            if r < self.config.booru_ratio:
+                return self.booru_gen.generate(), "booru"
+            elif r < self.config.booru_ratio + self.config.synthetic_ratio:
+                complexity = random.choice([2, 3, 4, 5])
+                prompt = self.prompt_gen.synthesize(complexity=complexity)['text']
+                return prompt, "synthetic"
+            else:
+                return random.choice(self.flavors), "laion"
+
+        else:
+            raise ValueError(f"Unknown prompt_source: {source}")
 
     def _init_hf_repo(self):
         if not self.config.push_to_hub:
@@ -585,6 +741,13 @@ class VAELyraTrainer:
                     for name, beta in params['betas'].items():
                         fusion_params_str += f"- {name}: {torch.sigmoid(beta).item():.4f}\n"
 
+        # Describe prompt sources
+        prompt_info = f"- **Prompt Source**: {self.config.prompt_source}\n"
+        if self.config.prompt_source == "mixed":
+            prompt_info += f"  - Booru: {self.config.booru_ratio * 100:.0f}%\n"
+            prompt_info += f"  - Synthetic: {self.config.synthetic_ratio * 100:.0f}%\n"
+            prompt_info += f"  - LAION: {self.config.laion_ratio * 100:.0f}%\n"
+
         model_card = f"""---
 tags:
 - vae
@@ -594,6 +757,7 @@ tags:
 - sdxl
 - illustrious
 - adaptive-cantor
+- booru
 license: mit
 ---
 
@@ -607,23 +771,26 @@ Uses custom fine-tuned CLIP weights from `AbstractPhil/clips`:
 - `IllustriousXL20_v20_clip_l.safetensors` (768d)
 - `IllustriousXL20_v20_clip_g.safetensors` (1280d)
 
+**CLIP Skip**: {self.config.clip_skip} ({"penultimate layer" if self.config.clip_skip == 2 else "last layer"})
+
 ## Model Details
 
 - **Fusion Strategy**: {self.config.fusion_strategy}
 - **Latent Dimension**: {self.config.latent_dim}
 - **Training Steps**: {self.global_step:,}
 - **Best Loss**: {self.best_loss:.4f}
+{prompt_info}
 {fusion_params_str}
 
 ## Usage
 
 ```python
-from lyra_xl_multimodal_illustrious import load_lyra_from_hub
+from lyra_xl_multimodal import load_lyra_from_hub
 
 model = load_lyra_from_hub("{self.config.hf_repo}")
 model.eval()
 
-# Inputs (use Illustrious CLIP encoders for best results)
+# Inputs (use Illustrious CLIP encoders with clip_skip={self.config.clip_skip} for best results)
 inputs = {{
     "clip_l": clip_l_embeddings,     # [batch, 77, 768]
     "clip_g": clip_g_embeddings,     # [batch, 77, 1280]
@@ -731,27 +898,6 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
             )
         return None
 
-    def _load_flavors(self):
-        print("Loading LAION flavors...")
-        try:
-            r = requests.get(
-                "https://raw.githubusercontent.com/pharmapsychotic/clip-interrogator/main/clip_interrogator/data/flavors.txt",
-                timeout=30
-            )
-            flavors = [line.strip() for line in r.text.split('\n') if line.strip()]
-            print(f"✓ Loaded {len(flavors):,} flavors")
-            return flavors
-        except Exception as e:
-            print(f"⚠️  Fallback flavors: {e}")
-            return ["a beautiful landscape", "abstract art", "detailed portrait"]
-
-    def _generate_prompt(self):
-        if random.random() < self.config.synthetic_ratio:
-            complexity = random.choice([2, 3, 4, 5])
-            prompt = self.prompt_gen.synthesize(complexity=complexity)['text']
-            return prompt, "synthetic"
-        return random.choice(self.flavors), "laion"
-
     def _get_current_kl_beta(self) -> float:
         if not self.config.use_kl_annealing:
             return self.config.beta_kl
@@ -764,7 +910,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         """Prepare dataset with Illustrious CLIP + T5-XL encoders."""
         num_samples = num_samples or self.config.num_samples
 
-        print(f"\n🎼 Generating {num_samples:,} prompts...")
+        print(f"\n🎼 Generating {num_samples:,} prompts (source: {self.config.prompt_source})...")
 
         texts, sources = [], []
         for _ in tqdm(range(num_samples), desc="Generating"):
@@ -777,7 +923,11 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
 
         source_counts = Counter(sources)
         print(f"\nDistribution: {dict(source_counts)}")
-        print(f"Samples: {texts[:3]}")
+        print(f"Samples:")
+        for src in set(sources):
+            sample = next((t for t, s in zip(texts, sources) if s == src), None)
+            if sample:
+                print(f"  [{src}] {sample[:80]}...")
 
         # Download custom CLIP weights
         if self.config.use_illustrious_clips:
@@ -814,7 +964,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         t5_tokenizer = T5Tokenizer.from_pretrained("google/flan-t5-xl")
         t5_model = T5EncoderModel.from_pretrained("google/flan-t5-xl")
 
-        print(f"✓ All encoders loaded")
+        print(f"✓ All encoders loaded (clip_skip={self.config.clip_skip})")
 
         dataset = TextEmbeddingDataset(
             texts=texts,
@@ -826,7 +976,8 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
             t5_model=t5_model,
             device=self.device,
             clip_max_length=self.config.modality_seq_lens['clip_l'],
-            t5_max_length=self.config.modality_seq_lens['t5_xl_l']
+            t5_max_length=self.config.modality_seq_lens['t5_xl_l'],
+            clip_skip=self.config.clip_skip
         )
 
         dataloader = DataLoader(
@@ -953,6 +1104,8 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
     def train(self, dataloader: DataLoader):
         print(f"\n{'=' * 60}")
         print(f"🎵 Training VAE Lyra (Illustrious) for {self.config.num_epochs} epochs")
+        print(f"   Prompt source: {self.config.prompt_source}")
+        print(f"   CLIP skip: {self.config.clip_skip}")
         print(f"{'=' * 60}")
 
         for epoch in range(self.epoch, self.config.num_epochs):
@@ -1020,15 +1173,27 @@ def create_lyra_trainer(
         num_epochs: int = 100,
         push_to_hub: bool = True,
         hf_repo: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+        prompt_source: str = "booru",
+        clip_skip: int = 2,
+        danbooru_csv: Optional[str] = None,
+        gelbooru_csv: Optional[str] = None,
+        e621_csv: Optional[str] = None,
+        rule34x_csv: Optional[str] = None,
         **kwargs
 ) -> VAELyraTrainer:
-    """Create VAE Lyra trainer with Illustrious CLIP."""
+    """Create VAE Lyra trainer with Illustrious CLIP and configurable prompt source."""
     config = VAELyraTrainerConfig(
         num_samples=num_samples,
         batch_size=batch_size,
         num_epochs=num_epochs,
         push_to_hub=push_to_hub,
         hf_repo=hf_repo,
+        prompt_source=prompt_source,
+        clip_skip=clip_skip,
+        danbooru_csv=danbooru_csv,
+        gelbooru_csv=gelbooru_csv,
+        e621_csv=e621_csv,
+        rule34x_csv=rule34x_csv,
         **kwargs
     )
     return VAELyraTrainer(config)
@@ -1062,3 +1227,52 @@ def load_lyra_from_hub(
 
     print(f"✓ Loaded from {repo_id} @ step {checkpoint.get('global_step', '?')}")
     return model
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == "__main__":
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # EDIT CONFIG HERE
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    config = VAELyraTrainerConfig(
+        # Prompt generation
+        prompt_source="booru",  # "booru", "synthetic", "laion", "mixed"
+        booru_ratio=0.7,
+        synthetic_ratio=0.15,
+        laion_ratio=0.15,
+
+        # Booru CSV paths
+        danbooru_csv=None,  # "/content/danbooru_tags.csv"
+        gelbooru_csv=None,
+        e621_csv=None,
+        rule34x_csv=None,
+
+        # CLIP configuration
+        use_illustrious_clips=True,
+        clip_skip=2,  # Use penultimate layer
+
+        # Training
+        num_samples=10_000,
+        batch_size=8,
+        num_epochs=100,
+        learning_rate=1e-4,
+
+        # Hub
+        push_to_hub=True,
+        hf_repo="AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+
+        # Logging
+        use_wandb=False
+    )
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # TRAIN
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    trainer = VAELyraTrainer(config)
+    dataloader = trainer.prepare_data()
+    trainer.train(dataloader)
