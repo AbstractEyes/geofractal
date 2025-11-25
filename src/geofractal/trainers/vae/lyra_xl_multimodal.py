@@ -44,7 +44,7 @@ import requests
 import random
 from collections import Counter
 
-from geofractal.model.vae.vae_lyra import (
+from geofractal.model.vae.vae_lyra_v2 import (
     MultiModalVAE,
     MultiModalVAEConfig,
     MultiModalVAELoss,
