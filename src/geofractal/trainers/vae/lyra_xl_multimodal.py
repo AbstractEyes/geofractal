@@ -57,7 +57,7 @@ from geofractal.model.vae.vae_lyra_v2 import (
 )
 from geovocab2.data.prompt.symbolic_tree import SynthesisSystem
 from geovocab2.data.prompt.booru_synthesizer import BooruSynthesizer, BooruConfig
-from geovocab2.factories.summary_factory import CaptionFactory, CaptionFactoryConfig
+from geovocab2.shapes.factory.summary_factory import CaptionFactory, CaptionFactoryConfig
 
 # ============================================================================
 # CONSTANTS
