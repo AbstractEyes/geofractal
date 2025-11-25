@@ -9,6 +9,8 @@ Supports:
 - SynthesisSystem for symbolic prompts
 - LAION flavors fallback
 - clip_skip for penultimate layer extraction
+- Qwen summarizer for T5 natural language input
+- Prompt caching (save/load generated prompts + summaries)
 
 Downloads custom CLIP weights from AbstractPhil/clips:
 - IllustriousXL20_v20_clip_l.safetensors
@@ -20,6 +22,15 @@ Install via:
 
 Usage:
     from lyra_xl_multimodal import VAELyraTrainer, VAELyraTrainerConfig
+
+    # Train with caching (auto-loads if cache exists)
+    trainer = create_lyra_trainer(num_samples=10000)
+    dataloader = trainer.prepare_data()
+    trainer.train(dataloader)
+
+    # Pre-generate prompts only (for separate machines/sessions)
+    from lyra_xl_multimodal import generate_prompt_cache
+    cache_path = generate_prompt_cache(num_samples=50000)
 """
 
 import torch
@@ -442,6 +453,12 @@ class VAELyraTrainerConfig:
     summarizer_temperature: float = 0.7
     use_summarizer_int8: bool = False  # Quantize summarizer for memory
 
+    # Prompt caching (save/load generated prompts + summaries)
+    prompt_cache_dir: str = "./prompt_cache"
+    prompt_cache_name: Optional[str] = None  # Auto-generated if None
+    use_prompt_cache: bool = True  # Load from cache if available
+    save_prompt_cache: bool = True  # Save after generation
+
     # Checkpointing
     checkpoint_dir: str = './checkpoints_lyra_illustrious'
     save_every: int = 1000
@@ -837,6 +854,166 @@ class VAELyraTrainer:
         else:
             return tags
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Prompt Cache
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def _get_cache_path(self) -> Path:
+        """Get the path for the prompt cache file."""
+        cache_dir = Path(self.config.prompt_cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.config.prompt_cache_name:
+            name = self.config.prompt_cache_name
+        else:
+            # Auto-generate name based on config
+            name = f"prompts_{self.config.prompt_source}_{self.config.num_samples}"
+            if self.config.use_summarizer:
+                name += f"_{self.config.summarizer_model.replace('/', '_')}"
+
+        return cache_dir / f"{name}.json"
+
+    def _save_prompt_cache(
+            self,
+            tags_list: List[str],
+            summaries: List[str],
+            sources: List[str]
+    ) -> None:
+        """Save generated prompts and summaries to cache."""
+        if not self.config.save_prompt_cache:
+            return
+
+        cache_path = self._get_cache_path()
+
+        cache_data = {
+            "version": "1.0",
+            "config": {
+                "prompt_source": self.config.prompt_source,
+                "num_samples": len(tags_list),
+                "summarizer_model": self.config.summarizer_model if self.config.use_summarizer else None,
+                "summary_separator": self.config.summary_separator,
+            },
+            "data": [
+                {
+                    "tags": tags,
+                    "summary": summary,
+                    "source": source
+                }
+                for tags, summary, source in zip(tags_list, summaries, sources)
+            ]
+        }
+
+        print(f"\n💾 Saving prompt cache to {cache_path}...")
+        with open(cache_path, 'w', encoding='utf-8') as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+
+        # Also save as JSONL for streaming access
+        jsonl_path = cache_path.with_suffix('.jsonl')
+        with open(jsonl_path, 'w', encoding='utf-8') as f:
+            for item in cache_data["data"]:
+                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+
+        size_mb = cache_path.stat().st_size / (1024 * 1024)
+        print(f"  ✓ Saved {len(tags_list):,} prompts ({size_mb:.1f} MB)")
+        print(f"  ✓ Also saved as JSONL: {jsonl_path}")
+
+    def _load_prompt_cache(self) -> Optional[Tuple[List[str], List[str], List[str]]]:
+        """
+        Load prompts and summaries from cache if available.
+
+        Returns:
+            Tuple of (tags_list, summaries, sources) or None if cache not found/invalid
+        """
+        if not self.config.use_prompt_cache:
+            return None
+
+        cache_path = self._get_cache_path()
+
+        if not cache_path.exists():
+            print(f"  📂 No cache found at {cache_path}")
+            return None
+
+        print(f"\n📂 Loading prompt cache from {cache_path}...")
+
+        try:
+            with open(cache_path, 'r', encoding='utf-8') as f:
+                cache_data = json.load(f)
+
+            # Validate
+            if cache_data.get("version") != "1.0":
+                print(f"  ⚠️  Cache version mismatch, regenerating...")
+                return None
+
+            cached_config = cache_data.get("config", {})
+
+            # Check if config matches
+            if cached_config.get("num_samples") != self.config.num_samples:
+                print(
+                    f"  ⚠️  Sample count mismatch ({cached_config.get('num_samples')} vs {self.config.num_samples}), regenerating...")
+                return None
+
+            if cached_config.get("prompt_source") != self.config.prompt_source:
+                print(f"  ⚠️  Prompt source mismatch, regenerating...")
+                return None
+
+            # Extract data
+            data = cache_data["data"]
+            tags_list = [item["tags"] for item in data]
+            summaries = [item.get("summary", "") for item in data]
+            sources = [item.get("source", "unknown") for item in data]
+
+            print(f"  ✓ Loaded {len(tags_list):,} cached prompts")
+
+            # Show distribution
+            source_counts = Counter(sources)
+            print(f"  Distribution: {dict(source_counts)}")
+
+            return tags_list, summaries, sources
+
+        except Exception as e:
+            print(f"  ⚠️  Failed to load cache: {e}")
+            return None
+
+    def _load_or_generate_prompts(self, num_samples: int) -> Tuple[List[str], List[str], List[str]]:
+        """
+        Load prompts from cache or generate new ones.
+
+        Returns:
+            Tuple of (tags_list, summaries, sources)
+        """
+        # Try loading from cache first
+        cached = self._load_prompt_cache()
+        if cached is not None:
+            return cached
+
+        # Generate new prompts
+        print(f"\n🎼 Generating {num_samples:,} prompts (source: {self.config.prompt_source})...")
+
+        tags_list, sources = [], []
+        for _ in tqdm(range(num_samples), desc="Generating tags"):
+            prompt, source = self._generate_prompt()
+            tags_list.append(prompt)
+            sources.append(source)
+
+        source_counts = Counter(sources)
+        print(f"\nDistribution: {dict(source_counts)}")
+        print(f"Sample tags:")
+        for src in set(sources):
+            sample = next((t for t, s in zip(tags_list, sources) if s == src), None)
+            if sample:
+                print(f"  [{src}] {sample[:80]}...")
+
+        # Generate summaries if enabled
+        if self.config.use_summarizer:
+            summaries = self._generate_summaries(tags_list)
+        else:
+            summaries = [""] * len(tags_list)
+
+        # Save to cache
+        self._save_prompt_cache(tags_list, summaries, sources)
+
+        return tags_list, summaries, sources
+
     def _load_flavors(self) -> List[str]:
         """Load LAION flavors from remote source."""
         print("  Loading LAION flavors...")
@@ -1172,33 +1349,12 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         """Prepare dataset with Illustrious CLIP + T5-XL encoders."""
         num_samples = num_samples or self.config.num_samples
 
-        print(f"\n🎼 Generating {num_samples:,} prompts (source: {self.config.prompt_source})...")
-
-        # Phase 1: Generate raw tags
-        tags_list, sources = [], []
-        for _ in tqdm(range(num_samples), desc="Generating tags"):
-            prompt, source = self._generate_prompt()
-            tags_list.append(prompt)
-            sources.append(source)
+        # Load from cache or generate new prompts + summaries
+        tags_list, summaries, sources = self._load_or_generate_prompts(num_samples)
 
         self.used_prompts = tags_list
         self.prompt_sources = sources
-
-        source_counts = Counter(sources)
-        print(f"\nDistribution: {dict(source_counts)}")
-        print(f"Sample tags:")
-        for src in set(sources):
-            sample = next((t for t, s in zip(tags_list, sources) if s == src), None)
-            if sample:
-                print(f"  [{src}] {sample[:80]}...")
-
-        # Phase 2: Generate summaries (if enabled)
-        if self.config.use_summarizer:
-            summaries = self._generate_summaries(tags_list)
-            self.summaries = summaries
-        else:
-            summaries = [""] * len(tags_list)
-            self.summaries = summaries
+        self.summaries = summaries
 
         # Phase 3: Build separate CLIP and T5 texts
         # CLIP sees: raw tags
@@ -1479,6 +1635,10 @@ def create_lyra_trainer(
         summarizer_model: str = "qwen2.5-1.5b",
         summary_separator: str = "¶",
         shuffle_tags_before_summary: bool = True,
+        # Cache options
+        prompt_cache_dir: str = "./prompt_cache",
+        use_prompt_cache: bool = True,
+        save_prompt_cache: bool = True,
         # CSV paths
         danbooru_csv: Optional[str] = None,
         gelbooru_csv: Optional[str] = None,
@@ -1503,6 +1663,9 @@ def create_lyra_trainer(
         summarizer_model=summarizer_model,
         summary_separator=summary_separator,
         shuffle_tags_before_summary=shuffle_tags_before_summary,
+        prompt_cache_dir=prompt_cache_dir,
+        use_prompt_cache=use_prompt_cache,
+        save_prompt_cache=save_prompt_cache,
         danbooru_csv=danbooru_csv,
         gelbooru_csv=gelbooru_csv,
         e621_csv=e621_csv,
@@ -1510,6 +1673,67 @@ def create_lyra_trainer(
         **kwargs
     )
     return VAELyraTrainer(config)
+
+
+def generate_prompt_cache(
+        num_samples: int = 10000,
+        prompt_source: str = "booru",
+        summarizer_model: str = "qwen2.5-1.5b",
+        cache_dir: str = "./prompt_cache",
+        cache_name: Optional[str] = None,
+        danbooru_csv: Optional[str] = None,
+        gelbooru_csv: Optional[str] = None,
+        e621_csv: Optional[str] = None,
+        rule34x_csv: Optional[str] = None,
+        device: str = "cuda",
+        **kwargs
+) -> Path:
+    """
+    Generate and cache prompts + summaries without training.
+
+    Useful for pre-generating training data on a different machine or session.
+
+    Args:
+        num_samples: Number of prompts to generate
+        prompt_source: Source for prompts ("booru", "synthetic", "laion", "mixed")
+        summarizer_model: Model to use for summarization
+        cache_dir: Directory to save cache
+        cache_name: Custom name for cache file (auto-generated if None)
+        *_csv: Paths to booru tag CSVs
+        device: Device for summarizer
+
+    Returns:
+        Path to the generated cache file
+    """
+    config = VAELyraTrainerConfig(
+        num_samples=num_samples,
+        prompt_source=prompt_source,
+        use_summarizer=True,
+        summarizer_model=summarizer_model,
+        prompt_cache_dir=cache_dir,
+        prompt_cache_name=cache_name,
+        use_prompt_cache=False,  # Force regeneration
+        save_prompt_cache=True,
+        danbooru_csv=danbooru_csv,
+        gelbooru_csv=gelbooru_csv,
+        e621_csv=e621_csv,
+        rule34x_csv=rule34x_csv,
+        device=device,
+        push_to_hub=False,
+        auto_load_from_hub=False,
+        **kwargs
+    )
+
+    # Create trainer just for prompt generation
+    trainer = VAELyraTrainer(config)
+
+    # Generate prompts + summaries (will save to cache)
+    tags_list, summaries, sources = trainer._load_or_generate_prompts(num_samples)
+
+    cache_path = trainer._get_cache_path()
+    print(f"\n✓ Cache saved to: {cache_path}")
+
+    return cache_path
 
 
 def load_lyra_from_hub(
@@ -1570,6 +1794,11 @@ if __name__ == "__main__":
         summary_separator="¶",  # Pilcrow for mode switching
         shuffle_tags_before_summary=True,
         summarizer_max_new_tokens=64,
+
+        # Prompt caching (saves hours on re-runs)
+        prompt_cache_dir="./prompt_cache",
+        use_prompt_cache=True,
+        save_prompt_cache=True,
 
         # CLIP configuration
         use_illustrious_clips=True,
