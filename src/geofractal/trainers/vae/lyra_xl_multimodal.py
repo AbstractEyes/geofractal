@@ -458,12 +458,14 @@ class VAELyraTrainerConfig:
     checkpoint_dir: str = './checkpoints_lyra_illustrious'
     save_every: int = 1000
     keep_last_n: int = 3
+    model_name: str = "lyra"  # Used in checkpoint filenames
 
     # Resume behavior
     resume_optimizer: bool = True  # False = fresh optimizer (fine-tuning mode)
 
     # HuggingFace Hub
     hf_repo: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious"
+    hub_checkpoint_file: Optional[str] = None  # Which checkpoint to load from hub (None = model.pt)
     push_to_hub: bool = True
     push_every: int = 2000
     push_checkpoints: bool = True  # Push step checkpoints to hub
@@ -1043,17 +1045,21 @@ class VAELyraTrainer:
         """
         Try to load model from HuggingFace Hub.
 
+        Uses config.hub_checkpoint_file to determine which file to load.
+        If None, defaults to "model.pt".
+
         Respects config.resume_optimizer:
             True  = Load optimizer state (continue training)
             False = Skip optimizer (fine-tuning with fresh optimizer)
         """
         try:
-            print(f"🔍 Checking for existing model: {self.config.hf_repo}")
+            checkpoint_file = self.config.hub_checkpoint_file or "model.pt"
+            print(f"🔍 Loading from hub: {self.config.hf_repo}/{checkpoint_file}")
 
             try:
                 model_path = hf_hub_download(
                     repo_id=self.config.hf_repo,
-                    filename="model.pt",
+                    filename=checkpoint_file,
                     repo_type="model"
                 )
 
@@ -1061,35 +1067,54 @@ class VAELyraTrainer:
 
                 # Build model
                 self.model = self._build_model()
-                self.model.load_state_dict(checkpoint['model_state_dict'])
+
+                # Handle different checkpoint formats
+                if isinstance(checkpoint, dict):
+                    if 'model_state_dict' in checkpoint:
+                        self.model.load_state_dict(checkpoint['model_state_dict'])
+                    elif 'state_dict' in checkpoint:
+                        self.model.load_state_dict(checkpoint['state_dict'])
+                    else:
+                        # Assume the dict IS the state dict
+                        self.model.load_state_dict(checkpoint)
+                else:
+                    self.model.load_state_dict(checkpoint)
 
                 # Build optimizer
                 self.optimizer = self._build_optimizer()
 
                 # Optionally load optimizer state
-                if self.config.resume_optimizer and 'optimizer_state_dict' in checkpoint:
-                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                    print(f"  ✓ Loaded optimizer state (resume_optimizer=True)")
+                if isinstance(checkpoint, dict):
+                    if self.config.resume_optimizer and 'optimizer_state_dict' in checkpoint:
+                        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                        print(f"  ✓ Loaded optimizer state (resume_optimizer=True)")
+                    else:
+                        print(f"  ⚠️  Fresh optimizer (resume_optimizer=False)")
+
+                    # Load training state
+                    self.global_step = checkpoint.get('global_step', 0)
+                    self.epoch = checkpoint.get('epoch', 0)
+                    self.best_loss = checkpoint.get('best_loss', float('inf'))
+                    self.start_epoch = self.epoch
+
+                    # Optionally load scheduler
+                    if self.config.use_scheduler:
+                        self.scheduler = self._build_scheduler()
+                        if self.config.resume_optimizer and 'scheduler_state_dict' in checkpoint:
+                            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
                 else:
-                    print(f"  ⚠️  Fresh optimizer (resume_optimizer=False)")
-
-                # Load training state
-                self.global_step = checkpoint.get('global_step', 0)
-                self.epoch = checkpoint.get('epoch', 0)
-                self.best_loss = checkpoint.get('best_loss', float('inf'))
-                self.start_epoch = self.epoch
-
-                # Optionally load scheduler
-                if self.config.use_scheduler:
-                    self.scheduler = self._build_scheduler()
-                    if self.config.resume_optimizer and 'scheduler_state_dict' in checkpoint:
-                        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    # Raw state dict - no training state
+                    self.global_step = 0
+                    self.epoch = 0
+                    self.best_loss = float('inf')
+                    self.start_epoch = 0
+                    print(f"  ⚠️  Loaded raw state dict (no training state)")
 
                 print(f"✓ Resumed from step {self.global_step}, epoch {self.epoch}, best_loss={self.best_loss:.4f}")
                 return True
 
             except Exception as e:
-                print(f"   No existing model found: {e}")
+                print(f"   Could not load {checkpoint_file}: {e}")
                 return False
 
         except Exception as e:
@@ -1099,6 +1124,7 @@ class VAELyraTrainer:
     def load_checkpoint(
             self,
             checkpoint_path: str,
+            repo_id: Optional[str] = None,
             resume_optimizer: Optional[bool] = None,
             strict: bool = False
     ) -> Dict[str, Any]:
@@ -1106,34 +1132,50 @@ class VAELyraTrainer:
         Load a checkpoint from local path or HF Hub.
 
         Args:
-            checkpoint_path: Local path or HF Hub path (repo_id/filename)
+            checkpoint_path: Local path OR filename on HF Hub (e.g., "checkpoint_3000.pt")
+            repo_id: HF repo to download from (defaults to config.hf_repo)
             resume_optimizer: Override config.resume_optimizer if provided
             strict: If True, require exact state dict match
 
         Returns:
             Dict with loading info: loaded_keys, skipped_keys, new_keys
+
+        Examples:
+            # Load from local file
+            trainer.load_checkpoint("./checkpoints/checkpoint_3000.pt")
+
+            # Load from default HF repo
+            trainer.load_checkpoint("checkpoint_3000.pt")
+
+            # Load from specific HF repo
+            trainer.load_checkpoint("checkpoint_3000.pt", repo_id="user/other-repo")
         """
         resume_opt = resume_optimizer if resume_optimizer is not None else self.config.resume_optimizer
+        repo_id = repo_id or self.config.hf_repo
 
-        # Download from HF if needed
-        if '/' in checkpoint_path and not os.path.exists(checkpoint_path):
-            parts = checkpoint_path.split('/')
-            if len(parts) >= 3:
-                repo_id = '/'.join(parts[:-1])
-                filename = parts[-1]
-            else:
-                repo_id = self.config.hf_repo
-                filename = checkpoint_path
+        # Determine if this is a local file or needs to be downloaded
+        local_path = checkpoint_path
 
-            print(f"📥 Downloading {filename} from {repo_id}...")
-            checkpoint_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename,
-                local_dir="./hf_cache"
-            )
+        if not os.path.exists(checkpoint_path):
+            # Not a local file - try to download from HF Hub
+            print(f"📥 Downloading {checkpoint_path} from {repo_id}...")
+            try:
+                local_path = hf_hub_download(
+                    repo_id=repo_id,
+                    filename=checkpoint_path,
+                    repo_type="model",
+                    local_dir="./hf_cache"
+                )
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"Could not find checkpoint. Tried:\n"
+                    f"  - Local: {checkpoint_path}\n"
+                    f"  - HF Hub: {repo_id}/{checkpoint_path}\n"
+                    f"Error: {e}"
+                )
 
-        print(f"🔄 Loading checkpoint: {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        print(f"🔄 Loading checkpoint: {local_path}")
+        checkpoint = torch.load(local_path, map_location=self.device, weights_only=False)
 
         # Extract state dict
         if isinstance(checkpoint, dict):
@@ -1220,9 +1262,15 @@ class VAELyraTrainer:
         """
         Save checkpoint with optional safetensors export.
 
+        Filenames use config.model_name:
+            - Best: model.pt, {model_name}_best.safetensors
+            - Step: checkpoint_{model_name}_{step}.pt, {model_name}_step_{step}.safetensors
+
         Returns:
             Path to the saved checkpoint
         """
+        model_name = self.config.model_name
+
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
@@ -1230,17 +1278,18 @@ class VAELyraTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'config': asdict(self.config),
             'best_loss': self.best_loss,
+            'model_name': model_name,
         }
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
 
         # Determine filename
         if best:
-            pt_filename = 'best_model.pt'
-            st_filename = 'best_model.safetensors'
+            pt_filename = 'model.pt'  # Keep model.pt for best (compatibility)
+            st_filename = f'{model_name}_best.safetensors'
         else:
-            pt_filename = f'checkpoint_{self.global_step}.pt'
-            st_filename = f'step_{self.global_step}.safetensors'
+            pt_filename = f'checkpoint_{model_name}_{self.global_step}.pt'
+            st_filename = f'{model_name}_step_{self.global_step}.safetensors'
 
         pt_path = Path(self.config.checkpoint_dir) / pt_filename
         torch.save(checkpoint, pt_path)
@@ -1265,9 +1314,13 @@ class VAELyraTrainer:
     def _push_checkpoint_to_hub(self, checkpoint_path: Path, is_best: bool = False):
         """
         Push a specific checkpoint to HF Hub with safetensors in weights/ subdirectory.
+
+        Uses config.model_name for consistent naming.
         """
         if not self.config.push_to_hub:
             return
+
+        model_name = self.config.model_name
 
         try:
             step = self.global_step
@@ -1276,11 +1329,11 @@ class VAELyraTrainer:
             # Determine filenames
             if is_best:
                 pt_repo_path = "model.pt"
-                st_repo_path = f"{self.config.weights_subdir}/best_model.safetensors"
+                st_repo_path = f"{self.config.weights_subdir}/{model_name}_best.safetensors"
                 commit_msg = f"Best model @ step {step} (loss={loss_str})"
             else:
-                pt_repo_path = f"checkpoint_{step}.pt"
-                st_repo_path = f"{self.config.weights_subdir}/step_{step}.safetensors"
+                pt_repo_path = f"checkpoint_{model_name}_{step}.pt"
+                st_repo_path = f"{self.config.weights_subdir}/{model_name}_step_{step}.safetensors"
                 commit_msg = f"Checkpoint @ step {step} (loss={loss_str})"
 
             print(f"\n📤 Pushing to HF Hub: {pt_repo_path}", end=" ", flush=True)
@@ -1300,9 +1353,9 @@ class VAELyraTrainer:
                 weights_dir = Path(self.config.checkpoint_dir) / "weights"
 
                 if is_best:
-                    st_local = weights_dir / "best_model.safetensors"
+                    st_local = weights_dir / f"{model_name}_best.safetensors"
                 else:
-                    st_local = weights_dir / f"step_{step}.safetensors"
+                    st_local = weights_dir / f"{model_name}_step_{step}.safetensors"
 
                 if st_local.exists():
                     print(f"  📤 Pushing: {st_repo_path}", end=" ", flush=True)
@@ -1340,6 +1393,8 @@ class VAELyraTrainer:
         if not self.config.push_to_hub:
             return
 
+        model_name = self.config.model_name
+
         # Save temp checkpoint for upload
         temp_path = Path(self.config.checkpoint_dir) / "temp_upload.pt"
         checkpoint = {
@@ -1348,7 +1403,8 @@ class VAELyraTrainer:
             'global_step': self.global_step,
             'epoch': self.epoch,
             'best_loss': self.best_loss,
-            'config': asdict(self.config)
+            'config': asdict(self.config),
+            'model_name': model_name,
         }
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
@@ -1361,9 +1417,9 @@ class VAELyraTrainer:
             weights_dir.mkdir(parents=True, exist_ok=True)
 
             if is_best:
-                st_path = weights_dir / "best_model.safetensors"
+                st_path = weights_dir / f"{model_name}_best.safetensors"
             else:
-                st_path = weights_dir / f"step_{self.global_step}.safetensors"
+                st_path = weights_dir / f"{model_name}_step_{self.global_step}.safetensors"
 
             state_dict = {k: v.contiguous().cpu() for k, v in self.model.state_dict().items()}
             save_safetensors(state_dict, st_path)
@@ -1373,21 +1429,24 @@ class VAELyraTrainer:
 
     def _cleanup_checkpoints(self):
         """Remove old checkpoints, keeping only the most recent."""
+        model_name = self.config.model_name
         checkpoint_dir = Path(self.config.checkpoint_dir)
+
+        # Clean up .pt checkpoints (pattern: checkpoint_{model_name}_{step}.pt)
         checkpoints = sorted(
-            [f for f in checkpoint_dir.glob('checkpoint_*.pt')],
+            [f for f in checkpoint_dir.glob(f'checkpoint_{model_name}_*.pt')],
             key=lambda x: int(x.stem.split('_')[-1])
         )
         if len(checkpoints) > self.config.keep_last_n:
             for ckpt in checkpoints[:-self.config.keep_last_n]:
                 ckpt.unlink()
 
-        # Also clean up safetensors
+        # Also clean up safetensors (pattern: {model_name}_step_{step}.safetensors)
         if self.config.export_safetensors:
             weights_dir = checkpoint_dir / "weights"
             if weights_dir.exists():
                 st_files = sorted(
-                    [f for f in weights_dir.glob('step_*.safetensors')],
+                    [f for f in weights_dir.glob(f'{model_name}_step_*.safetensors')],
                     key=lambda x: int(x.stem.split('_')[-1])
                 )
                 if len(st_files) > self.config.keep_last_n:
@@ -1455,10 +1514,10 @@ Uses CLIP weights from `{self.config.illustrious_repo}`:
 from safetensors.torch import load_file
 
 # Load just the weights (fast)
-state_dict = load_file("weights/best_model.safetensors")
+state_dict = load_file("weights/{self.config.model_name}_best.safetensors")
 
 # Or specific step
-state_dict = load_file("weights/step_5000.safetensors")
+state_dict = load_file("weights/{self.config.model_name}_step_5000.safetensors")
 ```
 
 ## T5 Input Format
@@ -1495,9 +1554,10 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
 ## Files
 
 - `model.pt` - Full checkpoint (model + optimizer + scheduler)
+- `checkpoint_{self.config.model_name}_XXXX.pt` - Step checkpoints
 - `config.json` - Training configuration
-- `weights/best_model.safetensors` - Best model weights only
-- `weights/step_XXXX.safetensors` - Step checkpoints (weights only)
+- `weights/{self.config.model_name}_best.safetensors` - Best model weights only
+- `weights/{self.config.model_name}_step_XXXX.safetensors` - Step checkpoints (weights only)
 """
         try:
             card_path = Path(self.config.checkpoint_dir) / "README.md"
@@ -1860,6 +1920,8 @@ def create_lyra_trainer(
         num_epochs: int = 100,
         push_to_hub: bool = True,
         hf_repo: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+        hub_checkpoint_file: Optional[str] = None,
+        model_name: str = "lyra",
         prompt_source: str = "booru",
         clip_skip: int = 2,
         illustrious_repo: str = "AbstractPhil/clips",
@@ -1890,6 +1952,8 @@ def create_lyra_trainer(
         num_epochs=num_epochs,
         push_to_hub=push_to_hub,
         hf_repo=hf_repo,
+        hub_checkpoint_file=hub_checkpoint_file,
+        model_name=model_name,
         prompt_source=prompt_source,
         clip_skip=clip_skip,
         illustrious_repo=illustrious_repo,
@@ -1963,13 +2027,28 @@ def generate_prompt_cache(
 def load_lyra_from_hub(
         repo_id: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
         device: str = "cuda",
-        use_safetensors: bool = True
+        use_safetensors: bool = True,
+        checkpoint_file: Optional[str] = None,
+        model_name: Optional[str] = None
 ) -> MultiModalVAE:
-    """Load VAE Lyra from HuggingFace Hub."""
+    """
+    Load VAE Lyra from HuggingFace Hub.
+
+    Args:
+        repo_id: HuggingFace repo ID
+        device: Target device
+        use_safetensors: Try to load safetensors first (faster)
+        checkpoint_file: Specific checkpoint file to load (e.g., "checkpoint_lyra_5000.pt")
+        model_name: Model name for safetensors lookup (reads from config.json if not provided)
+    """
     config_path = hf_hub_download(repo_id=repo_id, filename="config.json", repo_type="model")
 
     with open(config_path) as f:
         config_dict = json.load(f)
+
+    # Get model_name from config if not provided
+    if model_name is None:
+        model_name = config_dict.get('model_name', 'lyra')
 
     vae_config = MultiModalVAEConfig(
         modality_dims=config_dict.get('modality_dims'),
@@ -1983,35 +2062,63 @@ def load_lyra_from_hub(
 
     model = MultiModalVAE(vae_config)
 
+    # If specific checkpoint requested, load that
+    if checkpoint_file:
+        model_path = hf_hub_download(repo_id=repo_id, filename=checkpoint_file, repo_type="model")
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+
+        if isinstance(checkpoint, dict):
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+            elif 'state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['state_dict'])
+            else:
+                model.load_state_dict(checkpoint)
+            step = checkpoint.get('global_step', '?')
+        else:
+            model.load_state_dict(checkpoint)
+            step = '?'
+
+        print(f"✓ Loaded {checkpoint_file} from {repo_id} @ step {step}")
+        model.to(device)
+        return model
+
+    # Try safetensors first
     if use_safetensors:
         try:
             weights_path = hf_hub_download(
                 repo_id=repo_id,
-                filename="weights/best_model.safetensors",
+                filename=f"weights/{model_name}_best.safetensors",
                 repo_type="model"
             )
             state_dict = load_safetensors(weights_path)
             model.load_state_dict(state_dict)
-            print(f"✓ Loaded from {repo_id} (safetensors)")
+            print(f"✓ Loaded from {repo_id} (safetensors: {model_name}_best)")
+            model.to(device)
+            return model
         except Exception:
-            use_safetensors = False
+            pass  # Fall back to .pt
 
-    if not use_safetensors:
-        model_path = hf_hub_download(repo_id=repo_id, filename="model.pt", repo_type="model")
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✓ Loaded from {repo_id} @ step {checkpoint.get('global_step', '?')}")
+    # Fall back to model.pt
+    model_path = hf_hub_download(repo_id=repo_id, filename="model.pt", repo_type="model")
+    checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"✓ Loaded from {repo_id} @ step {checkpoint.get('global_step', '?')}")
 
     model.to(device)
     return model
 
 
-# ============================================================================
-# MAIN
-# ============================================================================
-
+## ============================================================================
+## MAIN
+## ============================================================================
+#
 #if __name__ == "__main__":
 #    config = VAELyraTrainerConfig(
+#        # Model naming
+#        model_name="lyra_illustrious",
+#
+#        # Prompt source
 #        prompt_source="booru",
 #        booru_ratio=0.7,
 #        synthetic_ratio=0.15,
@@ -2020,30 +2127,44 @@ def load_lyra_from_hub(
 #        gelbooru_csv=None,
 #        e621_csv=None,
 #        rule34x_csv=None,
+#
+#        # Summarization
 #        use_summarizer=True,
 #        summarizer_model="qwen2.5-1.5b",
 #        summarizer_batch_size=32,
 #        summary_separator="¶",
 #        shuffle_tags_before_summary=True,
 #        summarizer_max_new_tokens=64,
+#
+#        # Prompt caching
 #        prompt_cache_dir="./prompt_cache",
 #        use_prompt_cache=True,
 #        save_prompt_cache=True,
+#
+#        # CLIP configuration
 #        use_illustrious_clips=True,
 #        illustrious_repo="AbstractPhil/clips",
 #        clip_l_filename=None,
 #        clip_g_filename=None,
 #        auto_discover_clips=True,
 #        clip_skip=2,
+#
+#        # Training
 #        num_samples=10000,
 #        batch_size=8,
 #        num_epochs=100,
 #        learning_rate=1e-4,
+#
+#        # Resume behavior
 #        resume_optimizer=True,
+#        hub_checkpoint_file=None,  # None = model.pt, or specify e.g. "checkpoint_lyra_illustrious_3000.pt"
+#
+#        # Hub settings
 #        push_to_hub=True,
 #        push_checkpoints=True,
 #        export_safetensors=True,
 #        hf_repo="AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+#
 #        use_wandb=False
 #    )
 #
