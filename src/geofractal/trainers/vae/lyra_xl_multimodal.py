@@ -11,6 +11,8 @@ Supports:
 - clip_skip for penultimate layer extraction
 - Qwen summarizer for T5 natural language input
 - Prompt caching (save/load generated prompts + summaries)
+- Checkpoint pushing to HF Hub with safetensors export
+- Proper resume with optimizer state control
 
 Downloads custom CLIP weights from AbstractPhil/clips:
 - IllustriousXL20_v20_clip_l.safetensors
@@ -47,13 +49,14 @@ from transformers import (
     T5Tokenizer
 )
 from safetensors.torch import load_file as load_safetensors
+from safetensors.torch import save_file as save_safetensors
 from huggingface_hub import HfApi, hf_hub_download, create_repo
 from tqdm.auto import tqdm
 import wandb
 import os
 import json
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Union
+from typing import Optional, Dict, List, Tuple, Union, Any
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 import requests
@@ -237,8 +240,6 @@ def list_clip_files(repo_id: str = "AbstractPhil/clips") -> Dict[str, List[str]]
     Returns:
         Dict with 'clip_l', 'clip_g', 't5' keys mapping to available filenames
     """
-    from huggingface_hub import HfApi
-
     api = HfApi()
     files = api.list_repo_files(repo_id=repo_id, repo_type="model")
 
@@ -277,8 +278,6 @@ def download_illustrious_clips(
     Returns:
         Tuple of (clip_l_path, clip_g_path)
     """
-    from huggingface_hub import HfApi
-
     print(f"\n📥 Downloading CLIP weights from {repo_id}...")
 
     api = HfApi()
@@ -291,7 +290,7 @@ def download_illustrious_clips(
         # Print available safetensors files
         safetensor_files = [f for f in files if f.endswith('.safetensors')]
         print(f"  📁 Found {len(safetensor_files)} safetensors files:")
-        for f in safetensor_files[:10]:  # Show first 10
+        for f in safetensor_files[:10]:
             print(f"      - {f}")
         if len(safetensor_files) > 10:
             print(f"      ... and {len(safetensor_files) - 10} more")
@@ -303,7 +302,6 @@ def download_illustrious_clips(
                 if ('clip_l' in f_lower or 'clipl' in f_lower or 'clip-l' in f_lower) and f.endswith('.safetensors'):
                     clip_l_filename = f
                     break
-            # Fallback patterns
             if clip_l_filename is None:
                 for f in files:
                     if 'illustrious' in f.lower() and 'clip_l' in f.lower():
@@ -316,7 +314,6 @@ def download_illustrious_clips(
                 if ('clip_g' in f_lower or 'clipg' in f_lower or 'clip-g' in f_lower) and f.endswith('.safetensors'):
                     clip_g_filename = f
                     break
-            # Fallback patterns
             if clip_g_filename is None:
                 for f in files:
                     if 'illustrious' in f.lower() and 'clip_g' in f.lower():
@@ -327,15 +324,13 @@ def download_illustrious_clips(
     if clip_l_filename is None:
         raise ValueError(
             f"Could not find CLIP-L file in {repo_id}. "
-            f"Please specify clip_l_filename explicitly. "
-            f"Available files: {[f for f in files if f.endswith('.safetensors')]}"
+            f"Please specify clip_l_filename explicitly."
         )
 
     if clip_g_filename is None:
         raise ValueError(
             f"Could not find CLIP-G file in {repo_id}. "
-            f"Please specify clip_g_filename explicitly. "
-            f"Available files: {[f for f in files if f.endswith('.safetensors')]}"
+            f"Please specify clip_g_filename explicitly."
         )
 
     print(f"  📥 Downloading CLIP-L: {clip_l_filename}")
@@ -368,9 +363,9 @@ class VAELyraTrainerConfig:
     # Custom CLIP configuration
     use_illustrious_clips: bool = True
     illustrious_repo: str = "AbstractPhil/clips"
-    clip_l_filename: Optional[str] = None  # Auto-discover if None
-    clip_g_filename: Optional[str] = None  # Auto-discover if None
-    auto_discover_clips: bool = True  # Auto-discover CLIP files in repo
+    clip_l_filename: Optional[str] = None
+    clip_g_filename: Optional[str] = None
+    auto_discover_clips: bool = True
 
     # CLIP skip (1 = last layer, 2 = penultimate layer)
     clip_skip: int = 2
@@ -430,7 +425,7 @@ class VAELyraTrainerConfig:
     num_samples: int = 10000
 
     # Prompt source configuration
-    prompt_source: str = "booru"  # "booru", "synthetic", "laion", "mixed"
+    prompt_source: str = "booru"
 
     # Ratios for mixed mode (must sum to 1.0)
     booru_ratio: float = 0.7
@@ -443,32 +438,40 @@ class VAELyraTrainerConfig:
     e621_csv: Optional[str] = None
     rule34x_csv: Optional[str] = None
 
-    # Summarization configuration (T5 receives tags + summary, CLIP only sees tags)
+    # Summarization configuration
     use_summarizer: bool = True
-    summarizer_model: str = "qwen2.5-1.5b"  # Model from CaptionFactory registry
+    summarizer_model: str = "qwen2.5-1.5b"
     summarizer_batch_size: int = 16
-    summary_separator: str = "¶"  # Pilcrow - rare token for mode switching
-    shuffle_tags_before_summary: bool = True  # Shuffle tag order for robustness
+    summary_separator: str = "¶"
+    shuffle_tags_before_summary: bool = True
     summarizer_max_new_tokens: int = 64
     summarizer_temperature: float = 0.7
-    use_summarizer_int8: bool = False  # Quantize summarizer for memory
+    use_summarizer_int8: bool = False
 
-    # Prompt caching (save/load generated prompts + summaries)
+    # Prompt caching
     prompt_cache_dir: str = "./prompt_cache"
-    prompt_cache_name: Optional[str] = None  # Auto-generated if None
-    use_prompt_cache: bool = True  # Load from cache if available
-    save_prompt_cache: bool = True  # Save after generation
+    prompt_cache_name: Optional[str] = None
+    use_prompt_cache: bool = True
+    save_prompt_cache: bool = True
 
     # Checkpointing
     checkpoint_dir: str = './checkpoints_lyra_illustrious'
     save_every: int = 1000
     keep_last_n: int = 3
 
+    # Resume behavior
+    resume_optimizer: bool = True  # False = fresh optimizer (fine-tuning mode)
+
     # HuggingFace Hub
     hf_repo: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious"
     push_to_hub: bool = True
     push_every: int = 2000
+    push_checkpoints: bool = True  # Push step checkpoints to hub
     auto_load_from_hub: bool = True
+
+    # Safetensors export
+    export_safetensors: bool = True
+    weights_subdir: str = "weights"
 
     # Logging
     use_wandb: bool = False
@@ -585,7 +588,7 @@ class TextEmbeddingDataset(Dataset):
         clip_text = self.clip_texts[idx]
         t5_text = self.t5_texts[idx]
 
-        # CLIP-L embedding with clip_skip support (sees only tags)
+        # CLIP-L embedding with clip_skip support
         clip_l_tokens = self.clip_l_tokenizer(
             clip_text,
             max_length=self.clip_max_length,
@@ -604,7 +607,7 @@ class TextEmbeddingDataset(Dataset):
             output_hidden_states=(self.clip_skip > 1)
         ).squeeze(0)
 
-        # CLIP-G embedding with clip_skip support (sees only tags)
+        # CLIP-G embedding with clip_skip support
         clip_g_tokens = self.clip_g_tokenizer(
             clip_text,
             max_length=self.clip_max_length,
@@ -623,7 +626,7 @@ class TextEmbeddingDataset(Dataset):
             output_hidden_states=(self.clip_skip > 1)
         ).squeeze(0)
 
-        # T5-XL embeddings (sees tags + separator + summary)
+        # T5-XL embeddings
         t5_tokens = self.t5_tokenizer(
             t5_text,
             max_length=self.t5_max_length,
@@ -668,6 +671,11 @@ class VAELyraTrainer:
         print(f"   CLIP skip: {config.clip_skip}")
         print(f"   Fusion: {config.fusion_strategy}")
         print(f"   Prompt source: {config.prompt_source}")
+        print(f"   Resume optimizer: {config.resume_optimizer}")
+
+        # Track last loss for checkpoint messages
+        self._last_loss = float('inf')
+        self.start_epoch = 0
 
         if config.auto_load_from_hub:
             loaded = self._try_load_from_hub()
@@ -719,11 +727,9 @@ class VAELyraTrainer:
         """Initialize all prompt generation systems."""
         print("\nInitializing prompt generators...")
 
-        # Always init synthetic system
         self.prompt_gen = SynthesisSystem(seed=self.config.seed)
         print("  ✓ SynthesisSystem ready")
 
-        # Init booru if needed
         if self.config.prompt_source in ["booru", "mixed"]:
             booru_config = BooruConfig(
                 danbooru_csv=self.config.danbooru_csv,
@@ -738,7 +744,6 @@ class VAELyraTrainer:
         else:
             self.booru_gen = None
 
-        # Load LAION flavors if needed
         if self.config.prompt_source in ["laion", "mixed"]:
             self.flavors = self._load_flavors()
         else:
@@ -755,14 +760,13 @@ class VAELyraTrainer:
             temperature=self.config.summarizer_temperature,
             device=self.config.device,
             batch_size=self.config.summarizer_batch_size,
-            keep_model_loaded=True,  # We control unload explicitly
+            keep_model_loaded=True,
         )
 
         self.summarizer = CaptionFactory(summarizer_config)
         print(f"  ✓ Summarizer ready: {self.config.summarizer_model}")
         print(f"    Batch size: {self.config.summarizer_batch_size}")
         print(f"    Separator token: '{self.config.summary_separator}' (pilcrow)")
-        print(f"    Shuffle tags: {self.config.shuffle_tags_before_summary}")
 
     def _shuffle_tags(self, tags_str: str) -> str:
         """Shuffle comma-separated tags while preserving quality tags at front."""
@@ -771,7 +775,6 @@ class VAELyraTrainer:
         if not tags:
             return tags_str
 
-        # Separate quality/meta tags from content tags
         quality_tags = []
         content_tags = []
 
@@ -785,24 +788,19 @@ class VAELyraTrainer:
             else:
                 content_tags.append(tag)
 
-        # Shuffle only the content tags
         random.shuffle(content_tags)
-
-        # Recombine: quality first, then shuffled content
         shuffled = quality_tags + content_tags
         return ', '.join(shuffled)
 
     def _generate_summaries(self, tags_list: List[str]) -> List[str]:
         """Generate natural language summaries for a batch of tag strings."""
         if self.summarizer is None:
-            # If no summarizer, return empty summaries
             return [""] * len(tags_list)
 
         print(f"\n📝 Generating summaries for {len(tags_list):,} prompts...")
 
         try:
-            # Process in chunks with progress bar
-            chunk_size = self.config.summarizer_batch_size * 10  # Process 10 batches at a time for progress updates
+            chunk_size = self.config.summarizer_batch_size * 10
             all_summaries = []
 
             pbar = tqdm(range(0, len(tags_list), chunk_size), desc="Summarizing")
@@ -810,24 +808,19 @@ class VAELyraTrainer:
                 end_idx = min(start_idx + chunk_size, len(tags_list))
                 chunk = tags_list[start_idx:end_idx]
 
-                # CaptionFactory uses lazy loading - just call summarize_batch
                 chunk_summaries = self.summarizer.summarize_batch(chunk)
                 all_summaries.extend(chunk_summaries)
 
                 pbar.set_postfix({"done": len(all_summaries)})
 
-            # Clean up summaries
             cleaned = []
             for s in all_summaries:
-                # Remove any accidental separators in the summary
                 s = s.replace(self.config.summary_separator, ' ')
-                # Trim excessive whitespace
                 s = ' '.join(s.split())
                 cleaned.append(s)
 
             print(f"  ✓ Generated {len(cleaned):,} summaries")
 
-            # Show a few examples
             print(f"\n  Sample summaries:")
             for i in range(min(3, len(cleaned))):
                 sample = cleaned[i][:80] + "..." if len(cleaned[i]) > 80 else cleaned[i]
@@ -836,17 +829,12 @@ class VAELyraTrainer:
             return cleaned
 
         finally:
-            # Unload to free VRAM for CLIP/T5
             if hasattr(self.summarizer, 'unload_model'):
                 self.summarizer.unload_model()
                 print(f"  ✓ Unloaded summarizer to free VRAM")
 
     def _build_t5_text(self, tags: str, summary: str) -> str:
-        """
-        Build the T5 input text with tags, separator, and summary.
-
-        Format: "{shuffled_tags} ¶ {summary}"
-        """
+        """Build the T5 input text with tags, separator, and summary."""
         if self.config.shuffle_tags_before_summary:
             tags = self._shuffle_tags(tags)
 
@@ -867,7 +855,6 @@ class VAELyraTrainer:
         if self.config.prompt_cache_name:
             name = self.config.prompt_cache_name
         else:
-            # Auto-generate name based on config
             name = f"prompts_{self.config.prompt_source}_{self.config.num_samples}"
             if self.config.use_summarizer:
                 name += f"_{self.config.summarizer_model.replace('/', '_')}"
@@ -908,7 +895,6 @@ class VAELyraTrainer:
         with open(cache_path, 'w', encoding='utf-8') as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
 
-        # Also save as JSONL for streaming access
         jsonl_path = cache_path.with_suffix('.jsonl')
         with open(jsonl_path, 'w', encoding='utf-8') as f:
             for item in cache_data["data"]:
@@ -916,15 +902,9 @@ class VAELyraTrainer:
 
         size_mb = cache_path.stat().st_size / (1024 * 1024)
         print(f"  ✓ Saved {len(tags_list):,} prompts ({size_mb:.1f} MB)")
-        print(f"  ✓ Also saved as JSONL: {jsonl_path}")
 
     def _load_prompt_cache(self) -> Optional[Tuple[List[str], List[str], List[str]]]:
-        """
-        Load prompts and summaries from cache if available.
-
-        Returns:
-            Tuple of (tags_list, summaries, sources) or None if cache not found/invalid
-        """
+        """Load prompts and summaries from cache if available."""
         if not self.config.use_prompt_cache:
             return None
 
@@ -940,24 +920,20 @@ class VAELyraTrainer:
             with open(cache_path, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
 
-            # Validate
             if cache_data.get("version") != "1.0":
                 print(f"  ⚠️  Cache version mismatch, regenerating...")
                 return None
 
             cached_config = cache_data.get("config", {})
 
-            # Check if config matches
             if cached_config.get("num_samples") != self.config.num_samples:
-                print(
-                    f"  ⚠️  Sample count mismatch ({cached_config.get('num_samples')} vs {self.config.num_samples}), regenerating...")
+                print(f"  ⚠️  Sample count mismatch, regenerating...")
                 return None
 
             if cached_config.get("prompt_source") != self.config.prompt_source:
                 print(f"  ⚠️  Prompt source mismatch, regenerating...")
                 return None
 
-            # Extract data
             data = cache_data["data"]
             tags_list = [item["tags"] for item in data]
             summaries = [item.get("summary", "") for item in data]
@@ -965,7 +941,6 @@ class VAELyraTrainer:
 
             print(f"  ✓ Loaded {len(tags_list):,} cached prompts")
 
-            # Show distribution
             source_counts = Counter(sources)
             print(f"  Distribution: {dict(source_counts)}")
 
@@ -976,18 +951,11 @@ class VAELyraTrainer:
             return None
 
     def _load_or_generate_prompts(self, num_samples: int) -> Tuple[List[str], List[str], List[str]]:
-        """
-        Load prompts from cache or generate new ones.
-
-        Returns:
-            Tuple of (tags_list, summaries, sources)
-        """
-        # Try loading from cache first
+        """Load prompts from cache or generate new ones."""
         cached = self._load_prompt_cache()
         if cached is not None:
             return cached
 
-        # Generate new prompts
         print(f"\n🎼 Generating {num_samples:,} prompts (source: {self.config.prompt_source})...")
 
         tags_list, sources = [], []
@@ -998,19 +966,12 @@ class VAELyraTrainer:
 
         source_counts = Counter(sources)
         print(f"\nDistribution: {dict(source_counts)}")
-        print(f"Sample tags:")
-        for src in set(sources):
-            sample = next((t for t, s in zip(tags_list, sources) if s == src), None)
-            if sample:
-                print(f"  [{src}] {sample[:80]}...")
 
-        # Generate summaries if enabled
         if self.config.use_summarizer:
             summaries = self._generate_summaries(tags_list)
         else:
             summaries = [""] * len(tags_list)
 
-        # Save to cache
         self._save_prompt_cache(tags_list, summaries, sources)
 
         return tags_list, summaries, sources
@@ -1031,12 +992,7 @@ class VAELyraTrainer:
             return ["a beautiful landscape", "abstract art", "detailed portrait"]
 
     def _generate_prompt(self) -> Tuple[str, str]:
-        """
-        Generate a single prompt based on configured source.
-
-        Returns:
-            Tuple of (prompt_text, source_name)
-        """
+        """Generate a single prompt based on configured source."""
         source = self.config.prompt_source
 
         if source == "booru":
@@ -1051,7 +1007,6 @@ class VAELyraTrainer:
             return random.choice(self.flavors), "laion"
 
         elif source == "mixed":
-            # Weighted random selection
             r = random.random()
             if r < self.config.booru_ratio:
                 return self.booru_gen.generate(), "booru"
@@ -1065,7 +1020,12 @@ class VAELyraTrainer:
         else:
             raise ValueError(f"Unknown prompt_source: {source}")
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # HuggingFace Hub
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     def _init_hf_repo(self):
+        """Initialize HuggingFace repo."""
         if not self.config.push_to_hub:
             return
         try:
@@ -1080,77 +1040,362 @@ class VAELyraTrainer:
             print(f"⚠️  Could not create HF repo: {e}")
 
     def _try_load_from_hub(self) -> bool:
+        """
+        Try to load model from HuggingFace Hub.
+
+        Respects config.resume_optimizer:
+            True  = Load optimizer state (continue training)
+            False = Skip optimizer (fine-tuning with fresh optimizer)
+        """
         try:
             print(f"🔍 Checking for existing model: {self.config.hf_repo}")
+
             try:
                 model_path = hf_hub_download(
                     repo_id=self.config.hf_repo,
                     filename="model.pt",
                     repo_type="model"
                 )
-                checkpoint = torch.load(model_path, map_location=self.device)
+
+                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+
+                # Build model
                 self.model = self._build_model()
                 self.model.load_state_dict(checkpoint['model_state_dict'])
+
+                # Build optimizer
                 self.optimizer = self._build_optimizer()
-                if 'optimizer_state_dict' in checkpoint:
+
+                # Optionally load optimizer state
+                if self.config.resume_optimizer and 'optimizer_state_dict' in checkpoint:
                     self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print(f"  ✓ Loaded optimizer state (resume_optimizer=True)")
+                else:
+                    print(f"  ⚠️  Fresh optimizer (resume_optimizer=False)")
+
+                # Load training state
                 self.global_step = checkpoint.get('global_step', 0)
                 self.epoch = checkpoint.get('epoch', 0)
                 self.best_loss = checkpoint.get('best_loss', float('inf'))
-                if 'scheduler_state_dict' in checkpoint and self.config.use_scheduler:
+                self.start_epoch = self.epoch
+
+                # Optionally load scheduler
+                if self.config.use_scheduler:
                     self.scheduler = self._build_scheduler()
-                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                print(f"✓ Resumed from step {self.global_step}, epoch {self.epoch}")
+                    if self.config.resume_optimizer and 'scheduler_state_dict' in checkpoint:
+                        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+                print(f"✓ Resumed from step {self.global_step}, epoch {self.epoch}, best_loss={self.best_loss:.4f}")
                 return True
+
             except Exception as e:
                 print(f"   No existing model found: {e}")
                 return False
+
         except Exception as e:
             print(f"⚠️  Could not access HF Hub: {e}")
             return False
 
-    def _push_to_hub(self, is_best: bool = False):
+    def load_checkpoint(
+            self,
+            checkpoint_path: str,
+            resume_optimizer: Optional[bool] = None,
+            strict: bool = False
+    ) -> Dict[str, Any]:
+        """
+        Load a checkpoint from local path or HF Hub.
+
+        Args:
+            checkpoint_path: Local path or HF Hub path (repo_id/filename)
+            resume_optimizer: Override config.resume_optimizer if provided
+            strict: If True, require exact state dict match
+
+        Returns:
+            Dict with loading info: loaded_keys, skipped_keys, new_keys
+        """
+        resume_opt = resume_optimizer if resume_optimizer is not None else self.config.resume_optimizer
+
+        # Download from HF if needed
+        if '/' in checkpoint_path and not os.path.exists(checkpoint_path):
+            parts = checkpoint_path.split('/')
+            if len(parts) >= 3:
+                repo_id = '/'.join(parts[:-1])
+                filename = parts[-1]
+            else:
+                repo_id = self.config.hf_repo
+                filename = checkpoint_path
+
+            print(f"📥 Downloading {filename} from {repo_id}...")
+            checkpoint_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=filename,
+                local_dir="./hf_cache"
+            )
+
+        print(f"🔄 Loading checkpoint: {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
+        # Extract state dict
+        if isinstance(checkpoint, dict):
+            if 'model_state_dict' in checkpoint:
+                old_state = checkpoint['model_state_dict']
+            elif 'state_dict' in checkpoint:
+                old_state = checkpoint['state_dict']
+            else:
+                old_state = checkpoint
+        else:
+            old_state = checkpoint
+
+        # Load model weights
+        current_state = self.model.state_dict()
+
+        loaded_keys = []
+        skipped_keys = []
+        new_keys = []
+
+        for key in old_state:
+            if key in current_state:
+                if old_state[key].shape == current_state[key].shape:
+                    current_state[key] = old_state[key]
+                    loaded_keys.append(key)
+                else:
+                    skipped_keys.append(f"{key} (shape: {old_state[key].shape} vs {current_state[key].shape})")
+            else:
+                skipped_keys.append(f"{key} (not in model)")
+
+        for key in current_state:
+            if key not in old_state:
+                new_keys.append(key)
+
+        if strict and (skipped_keys or new_keys):
+            raise ValueError(f"Strict loading failed: {len(skipped_keys)} skipped, {len(new_keys)} new")
+
+        self.model.load_state_dict(current_state)
+
+        # Load training state
+        if isinstance(checkpoint, dict):
+            self.global_step = checkpoint.get('global_step', 0)
+            self.epoch = checkpoint.get('epoch', 0)
+            self.best_loss = checkpoint.get('best_loss', float('inf'))
+            self.start_epoch = self.epoch
+
+            # Optimizer
+            if resume_opt and 'optimizer_state_dict' in checkpoint:
+                try:
+                    self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                    print(f"  ✓ Loaded optimizer state")
+                except Exception as e:
+                    print(f"  ⚠️  Could not load optimizer: {e}")
+            else:
+                print(f"  ⚠️  Fresh optimizer (resume_optimizer={resume_opt})")
+
+            # Scheduler
+            if resume_opt and self.scheduler and 'scheduler_state_dict' in checkpoint:
+                try:
+                    self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    print(f"  ✓ Loaded scheduler state")
+                except Exception as e:
+                    print(f"  ⚠️  Could not load scheduler: {e}")
+
+        print(f"\n✅ Checkpoint loaded:")
+        print(f"   Loaded:  {len(loaded_keys)} parameters")
+        print(f"   Skipped: {len(skipped_keys)} parameters")
+        print(f"   New:     {len(new_keys)} parameters")
+        print(f"   Step:    {self.global_step}, Epoch: {self.epoch}")
+
+        return {
+            'loaded_keys': loaded_keys,
+            'skipped_keys': skipped_keys,
+            'new_keys': new_keys,
+            'global_step': self.global_step,
+            'epoch': self.epoch,
+            'best_loss': self.best_loss
+        }
+
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Checkpointing
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+    def save_checkpoint(self, best: bool = False) -> Path:
+        """
+        Save checkpoint with optional safetensors export.
+
+        Returns:
+            Path to the saved checkpoint
+        """
+        checkpoint = {
+            'epoch': self.epoch,
+            'global_step': self.global_step,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'config': asdict(self.config),
+            'best_loss': self.best_loss,
+        }
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+
+        # Determine filename
+        if best:
+            pt_filename = 'best_model.pt'
+            st_filename = 'best_model.safetensors'
+        else:
+            pt_filename = f'checkpoint_{self.global_step}.pt'
+            st_filename = f'step_{self.global_step}.safetensors'
+
+        pt_path = Path(self.config.checkpoint_dir) / pt_filename
+        torch.save(checkpoint, pt_path)
+        print(f"  💾 Saved: {pt_path.name}")
+
+        # Export safetensors (model weights only, no optimizer)
+        if self.config.export_safetensors:
+            weights_dir = Path(self.config.checkpoint_dir) / "weights"
+            weights_dir.mkdir(parents=True, exist_ok=True)
+            st_path = weights_dir / st_filename
+
+            # Convert state dict for safetensors (must be contiguous, on CPU)
+            state_dict = {k: v.contiguous().cpu() for k, v in self.model.state_dict().items()}
+            save_safetensors(state_dict, st_path)
+            print(f"  💾 Saved: weights/{st_filename}")
+
+        if not best:
+            self._cleanup_checkpoints()
+
+        return pt_path
+
+    def _push_checkpoint_to_hub(self, checkpoint_path: Path, is_best: bool = False):
+        """
+        Push a specific checkpoint to HF Hub with safetensors in weights/ subdirectory.
+        """
         if not self.config.push_to_hub:
             return
+
         try:
-            print(f"\n📤 Pushing to HF Hub...", end=" ", flush=True)
-            temp_path = Path(self.config.checkpoint_dir) / "temp_upload.pt"
-            checkpoint = {
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'global_step': self.global_step,
-                'epoch': self.epoch,
-                'best_loss': self.best_loss,
-                'config': asdict(self.config)
-            }
-            if self.scheduler is not None:
-                checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-            torch.save(checkpoint, temp_path)
+            step = self.global_step
+            loss_str = f"{self.best_loss:.4f}" if is_best else f"{self._last_loss:.4f}"
+
+            # Determine filenames
+            if is_best:
+                pt_repo_path = "model.pt"
+                st_repo_path = f"{self.config.weights_subdir}/best_model.safetensors"
+                commit_msg = f"Best model @ step {step} (loss={loss_str})"
+            else:
+                pt_repo_path = f"checkpoint_{step}.pt"
+                st_repo_path = f"{self.config.weights_subdir}/step_{step}.safetensors"
+                commit_msg = f"Checkpoint @ step {step} (loss={loss_str})"
+
+            print(f"\n📤 Pushing to HF Hub: {pt_repo_path}", end=" ", flush=True)
+
+            # Upload .pt checkpoint
             self.hf_api.upload_file(
-                path_or_fileobj=str(temp_path),
-                path_in_repo="model.pt",
+                path_or_fileobj=str(checkpoint_path),
+                path_in_repo=pt_repo_path,
                 repo_id=self.config.hf_repo,
                 repo_type="model",
-                commit_message=f"Step {self.global_step}: loss={self.best_loss:.4f}" if is_best else f"Step {self.global_step}"
+                commit_message=commit_msg
             )
+            print("✓")
+
+            # Upload safetensors to weights/ subdirectory
+            if self.config.export_safetensors:
+                weights_dir = Path(self.config.checkpoint_dir) / "weights"
+
+                if is_best:
+                    st_local = weights_dir / "best_model.safetensors"
+                else:
+                    st_local = weights_dir / f"step_{step}.safetensors"
+
+                if st_local.exists():
+                    print(f"  📤 Pushing: {st_repo_path}", end=" ", flush=True)
+                    self.hf_api.upload_file(
+                        path_or_fileobj=str(st_local),
+                        path_in_repo=st_repo_path,
+                        repo_id=self.config.hf_repo,
+                        repo_type="model",
+                        commit_message=f"Weights {st_repo_path}"
+                    )
+                    print("✓")
+
+            # Update config.json
             config_path = Path(self.config.checkpoint_dir) / "config.json"
             with open(config_path, 'w') as f:
                 json.dump(asdict(self.config), f, indent=2)
+
             self.hf_api.upload_file(
                 path_or_fileobj=str(config_path),
                 path_in_repo="config.json",
                 repo_id=self.config.hf_repo,
                 repo_type="model",
-                commit_message=f"Config @ step {self.global_step}"
+                commit_message=f"Config @ step {step}"
             )
+
+            # Update model card on best
             if is_best:
                 self._create_model_card()
-            temp_path.unlink()
-            print(f"✓")
+
         except Exception as e:
-            print(f"✗ {e}")
+            print(f"✗ Push failed: {e}")
+
+    def _push_to_hub(self, is_best: bool = False):
+        """Push current state to hub (wrapper for backward compatibility)."""
+        if not self.config.push_to_hub:
+            return
+
+        # Save temp checkpoint for upload
+        temp_path = Path(self.config.checkpoint_dir) / "temp_upload.pt"
+        checkpoint = {
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'global_step': self.global_step,
+            'epoch': self.epoch,
+            'best_loss': self.best_loss,
+            'config': asdict(self.config)
+        }
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+
+        torch.save(checkpoint, temp_path)
+
+        # Also save safetensors
+        if self.config.export_safetensors:
+            weights_dir = Path(self.config.checkpoint_dir) / "weights"
+            weights_dir.mkdir(parents=True, exist_ok=True)
+
+            if is_best:
+                st_path = weights_dir / "best_model.safetensors"
+            else:
+                st_path = weights_dir / f"step_{self.global_step}.safetensors"
+
+            state_dict = {k: v.contiguous().cpu() for k, v in self.model.state_dict().items()}
+            save_safetensors(state_dict, st_path)
+
+        self._push_checkpoint_to_hub(temp_path, is_best=is_best)
+        temp_path.unlink(missing_ok=True)
+
+    def _cleanup_checkpoints(self):
+        """Remove old checkpoints, keeping only the most recent."""
+        checkpoint_dir = Path(self.config.checkpoint_dir)
+        checkpoints = sorted(
+            [f for f in checkpoint_dir.glob('checkpoint_*.pt')],
+            key=lambda x: int(x.stem.split('_')[-1])
+        )
+        if len(checkpoints) > self.config.keep_last_n:
+            for ckpt in checkpoints[:-self.config.keep_last_n]:
+                ckpt.unlink()
+
+        # Also clean up safetensors
+        if self.config.export_safetensors:
+            weights_dir = checkpoint_dir / "weights"
+            if weights_dir.exists():
+                st_files = sorted(
+                    [f for f in weights_dir.glob('step_*.safetensors')],
+                    key=lambda x: int(x.stem.split('_')[-1])
+                )
+                if len(st_files) > self.config.keep_last_n:
+                    for st in st_files[:-self.config.keep_last_n]:
+                        st.unlink()
 
     def _create_model_card(self):
+        """Create and upload model card."""
         fusion_params_str = ""
         if hasattr(self.model, 'get_fusion_params'):
             params = self.model.get_fusion_params()
@@ -1165,7 +1410,6 @@ class VAELyraTrainer:
                     for name, beta in params['betas'].items():
                         fusion_params_str += f"- {name}: {torch.sigmoid(beta).item():.4f}\n"
 
-        # Describe prompt sources
         prompt_info = f"- **Prompt Source**: {self.config.prompt_source}\n"
         if self.config.prompt_source == "mixed":
             prompt_info += f"  - Booru: {self.config.booru_ratio * 100:.0f}%\n"
@@ -1205,6 +1449,18 @@ Uses CLIP weights from `{self.config.illustrious_repo}`:
 - **Best Loss**: {self.best_loss:.4f}
 {prompt_info}
 
+## Quick Load (Safetensors)
+
+```python
+from safetensors.torch import load_file
+
+# Load just the weights (fast)
+state_dict = load_file("weights/best_model.safetensors")
+
+# Or specific step
+state_dict = load_file("weights/step_5000.safetensors")
+```
+
 ## T5 Input Format
 
 T5 receives a different input than CLIP to enable richer semantic understanding:
@@ -1214,11 +1470,7 @@ CLIP sees:  "masterpiece, 1girl, blue hair, school uniform, smile"
 T5 sees:    "masterpiece, 1girl, blue hair, school uniform, smile ¶ A cheerful schoolgirl with blue hair smiling warmly"
 ```
 
-The pilcrow (`¶`) separator acts as a mode-switch token, allowing T5 to learn:
-- **Before ¶**: Structured booru tags (shuffled for robustness)  
-- **After ¶**: Natural language description from Qwen summarizer
-
-This enables deviant T5 usage during inference without affecting CLIP behavior.
+The pilcrow (`¶`) separator acts as a mode-switch token.
 
 {fusion_params_str}
 
@@ -1230,7 +1482,6 @@ from lyra_xl_multimodal import load_lyra_from_hub
 model = load_lyra_from_hub("{self.config.hf_repo}")
 model.eval()
 
-# Inputs (use Illustrious CLIP encoders with clip_skip={self.config.clip_skip} for best results)
 inputs = {{
     "clip_l": clip_l_embeddings,     # [batch, 77, 768]
     "clip_g": clip_g_embeddings,     # [batch, 77, 1280]
@@ -1240,6 +1491,13 @@ inputs = {{
 
 recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
 ```
+
+## Files
+
+- `model.pt` - Full checkpoint (model + optimizer + scheduler)
+- `config.json` - Training configuration
+- `weights/best_model.safetensors` - Best model weights only
+- `weights/step_XXXX.safetensors` - Step checkpoints (weights only)
 """
         try:
             card_path = Path(self.config.checkpoint_dir) / "README.md"
@@ -1255,7 +1513,12 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         except Exception as e:
             print(f"⚠️  Model card update failed: {e}")
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Model Building
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     def _build_model(self) -> nn.Module:
+        """Build the VAE model."""
         vae_config = MultiModalVAEConfig(
             modality_dims=self.config.modality_dims,
             modality_seq_lens=self.config.modality_seq_lens,
@@ -1285,6 +1548,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         return model
 
     def _build_optimizer(self):
+        """Build optimizer with separate param groups for alpha/beta."""
         param_groups = []
         regular_params = []
         alpha_params = []
@@ -1320,6 +1584,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         return AdamW(param_groups)
 
     def _build_loss_fn(self):
+        """Build the loss function."""
         return MultiModalVAELoss(
             beta_kl=self.config.beta_kl,
             beta_reconstruction=self.config.beta_reconstruction,
@@ -1330,6 +1595,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         )
 
     def _build_scheduler(self):
+        """Build learning rate scheduler."""
         if self.config.scheduler_type == 'cosine':
             return CosineAnnealingLR(
                 self.optimizer,
@@ -1339,6 +1605,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         return None
 
     def _get_current_kl_beta(self) -> float:
+        """Get current KL beta with annealing."""
         if not self.config.use_kl_annealing:
             return self.config.beta_kl
         if self.epoch >= self.config.kl_anneal_epochs:
@@ -1346,28 +1613,27 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         progress = self.epoch / self.config.kl_anneal_epochs
         return self.config.kl_start_beta + (self.config.beta_kl - self.config.kl_start_beta) * progress
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # Training
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
     def prepare_data(self, num_samples: Optional[int] = None) -> DataLoader:
         """Prepare dataset with Illustrious CLIP + T5-XL encoders."""
         num_samples = num_samples or self.config.num_samples
 
-        # Load from cache or generate new prompts + summaries
         tags_list, summaries, sources = self._load_or_generate_prompts(num_samples)
 
         self.used_prompts = tags_list
         self.prompt_sources = sources
         self.summaries = summaries
 
-        # Phase 3: Build separate CLIP and T5 texts
-        # CLIP sees: raw tags
-        # T5 sees: shuffled tags + separator + summary
-        clip_texts = tags_list  # Raw tags for CLIP
+        clip_texts = tags_list
         t5_texts = []
 
         for tags, summary in zip(tags_list, summaries):
             t5_text = self._build_t5_text(tags, summary)
             t5_texts.append(t5_text)
 
-        # Show examples of the T5 format
         print(f"\nT5 input format examples:")
         for i in range(min(3, len(t5_texts))):
             t5_sample = t5_texts[i]
@@ -1395,7 +1661,6 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
                 clip_g_path, self.device
             )
         else:
-            # Fallback to standard CLIP
             print("\n🔧 Loading standard CLIP encoders...")
             print("  [1/3] CLIP-L (openai)...")
             clip_l_tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-large-patch14")
@@ -1412,9 +1677,6 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         t5_model = T5EncoderModel.from_pretrained("google/flan-t5-xl")
 
         print(f"✓ All encoders loaded (clip_skip={self.config.clip_skip})")
-        if self.config.use_summarizer:
-            print(f"  T5 receives: tags {self.config.summary_separator} summary")
-            print(f"  CLIP receives: tags only")
 
         dataset = TextEmbeddingDataset(
             clip_texts=clip_texts,
@@ -1451,6 +1713,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         return dataloader
 
     def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+        """Execute a single training step."""
         modality_inputs = {
             'clip_l': batch['clip_l'].to(self.device),
             'clip_g': batch['clip_g'].to(self.device),
@@ -1519,6 +1782,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         return metrics
 
     def train_epoch(self, dataloader: DataLoader) -> Dict[str, float]:
+        """Train for one epoch with checkpoint pushing."""
         self.model.train()
         epoch_metrics = {}
 
@@ -1526,6 +1790,7 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         for batch in pbar:
             metrics = self.train_step(batch)
             self.global_step += 1
+            self._last_loss = metrics['total']
 
             for k, v in metrics.items():
                 if k not in epoch_metrics:
@@ -1544,22 +1809,26 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
                     'train/step': self.global_step
                 })
 
-            if self.global_step % self.config.push_every == 0:
-                self._push_to_hub()
-
+            # Save and push checkpoints at intervals
             if self.global_step % self.config.save_every == 0:
-                self.save_checkpoint()
+                ckpt_path = self.save_checkpoint(best=False)
+
+                if self.config.push_checkpoints:
+                    self._push_checkpoint_to_hub(ckpt_path, is_best=False)
 
         return {k: sum(v) / len(v) for k, v in epoch_metrics.items()}
 
     def train(self, dataloader: DataLoader):
+        """Main training loop."""
         print(f"\n{'=' * 60}")
         print(f"🎵 Training VAE Lyra (Illustrious) for {self.config.num_epochs} epochs")
+        print(f"   Starting from epoch {self.start_epoch}, step {self.global_step}")
         print(f"   Prompt source: {self.config.prompt_source}")
-        print(f"   CLIP skip: {self.config.clip_skip}")
+        print(f"   Resume optimizer: {self.config.resume_optimizer}")
+        print(f"   Push checkpoints: {self.config.push_checkpoints}")
         print(f"{'=' * 60}")
 
-        for epoch in range(self.epoch, self.config.num_epochs):
+        for epoch in range(self.start_epoch, self.config.num_epochs):
             self.epoch = epoch
             metrics = self.train_epoch(dataloader)
 
@@ -1570,8 +1839,8 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
 
             if metrics['total'] < self.best_loss:
                 self.best_loss = metrics['total']
-                self.save_checkpoint(best=True)
-                self._push_to_hub(is_best=True)
+                ckpt_path = self.save_checkpoint(best=True)
+                self._push_checkpoint_to_hub(ckpt_path, is_best=True)
                 print(f"  ✨ New best: {self.best_loss:.4f}")
 
         print(f"\n✨ Training complete!")
@@ -1579,40 +1848,6 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
 
         if self.config.use_wandb:
             wandb.finish()
-
-    def save_checkpoint(self, best: bool = False):
-        checkpoint = {
-            'epoch': self.epoch,
-            'global_step': self.global_step,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'config': asdict(self.config),
-            'best_loss': self.best_loss,
-            'used_prompts': self.used_prompts,
-            'prompt_sources': self.prompt_sources,
-            'summaries': self.summaries,
-        }
-        if self.scheduler is not None:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-
-        if best:
-            path = Path(self.config.checkpoint_dir) / 'best_model.pt'
-        else:
-            path = Path(self.config.checkpoint_dir) / f'checkpoint_{self.global_step}.pt'
-
-        torch.save(checkpoint, path)
-        if not best:
-            self._cleanup_checkpoints()
-
-    def _cleanup_checkpoints(self):
-        checkpoint_dir = Path(self.config.checkpoint_dir)
-        checkpoints = sorted(
-            [f for f in checkpoint_dir.glob('checkpoint_*.pt')],
-            key=lambda x: int(x.stem.split('_')[-1])
-        )
-        if len(checkpoints) > self.config.keep_last_n:
-            for ckpt in checkpoints[:-self.config.keep_last_n]:
-                ckpt.unlink()
 
 
 # ============================================================================
@@ -1631,24 +1866,24 @@ def create_lyra_trainer(
         clip_l_filename: Optional[str] = None,
         clip_g_filename: Optional[str] = None,
         auto_discover_clips: bool = True,
-        # Summarizer options
         use_summarizer: bool = True,
         summarizer_model: str = "qwen2.5-1.5b",
         summarizer_batch_size: int = 16,
         summary_separator: str = "¶",
         shuffle_tags_before_summary: bool = True,
-        # Cache options
         prompt_cache_dir: str = "./prompt_cache",
         use_prompt_cache: bool = True,
         save_prompt_cache: bool = True,
-        # CSV paths
+        resume_optimizer: bool = True,
+        push_checkpoints: bool = True,
+        export_safetensors: bool = True,
         danbooru_csv: Optional[str] = None,
         gelbooru_csv: Optional[str] = None,
         e621_csv: Optional[str] = None,
         rule34x_csv: Optional[str] = None,
         **kwargs
 ) -> VAELyraTrainer:
-    """Create VAE Lyra trainer with Illustrious CLIP, summarizer, and configurable prompt source."""
+    """Create VAE Lyra trainer with all options."""
     config = VAELyraTrainerConfig(
         num_samples=num_samples,
         batch_size=batch_size,
@@ -1669,6 +1904,9 @@ def create_lyra_trainer(
         prompt_cache_dir=prompt_cache_dir,
         use_prompt_cache=use_prompt_cache,
         save_prompt_cache=save_prompt_cache,
+        resume_optimizer=resume_optimizer,
+        push_checkpoints=push_checkpoints,
+        export_safetensors=export_safetensors,
         danbooru_csv=danbooru_csv,
         gelbooru_csv=gelbooru_csv,
         e621_csv=e621_csv,
@@ -1692,24 +1930,7 @@ def generate_prompt_cache(
         device: str = "cuda",
         **kwargs
 ) -> Path:
-    """
-    Generate and cache prompts + summaries without training.
-
-    Useful for pre-generating training data on a different machine or session.
-
-    Args:
-        num_samples: Number of prompts to generate
-        prompt_source: Source for prompts ("booru", "synthetic", "laion", "mixed")
-        summarizer_model: Model to use for summarization
-        summarizer_batch_size: Batch size for summarization (higher = faster, more VRAM)
-        cache_dir: Directory to save cache
-        cache_name: Custom name for cache file (auto-generated if None)
-        *_csv: Paths to booru tag CSVs
-        device: Device for summarizer
-
-    Returns:
-        Path to the generated cache file
-    """
+    """Generate and cache prompts + summaries without training."""
     config = VAELyraTrainerConfig(
         num_samples=num_samples,
         prompt_source=prompt_source,
@@ -1718,7 +1939,7 @@ def generate_prompt_cache(
         summarizer_batch_size=summarizer_batch_size,
         prompt_cache_dir=cache_dir,
         prompt_cache_name=cache_name,
-        use_prompt_cache=False,  # Force regeneration
+        use_prompt_cache=False,
         save_prompt_cache=True,
         danbooru_csv=danbooru_csv,
         gelbooru_csv=gelbooru_csv,
@@ -1730,10 +1951,7 @@ def generate_prompt_cache(
         **kwargs
     )
 
-    # Create trainer just for prompt generation
     trainer = VAELyraTrainer(config)
-
-    # Generate prompts + summaries (will save to cache)
     tags_list, summaries, sources = trainer._load_or_generate_prompts(num_samples)
 
     cache_path = trainer._get_cache_path()
@@ -1744,10 +1962,10 @@ def generate_prompt_cache(
 
 def load_lyra_from_hub(
         repo_id: str = "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
-        device: str = "cuda"
+        device: str = "cuda",
+        use_safetensors: bool = True
 ) -> MultiModalVAE:
     """Load VAE Lyra from HuggingFace Hub."""
-    model_path = hf_hub_download(repo_id=repo_id, filename="model.pt", repo_type="model")
     config_path = hf_hub_download(repo_id=repo_id, filename="config.json", repo_type="model")
 
     with open(config_path) as f:
@@ -1763,12 +1981,28 @@ def load_lyra_from_hub(
         cantor_local_window=config_dict.get('cantor_local_window', 3)
     )
 
-    checkpoint = torch.load(model_path, map_location=device)
     model = MultiModalVAE(vae_config)
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.to(device)
 
-    print(f"✓ Loaded from {repo_id} @ step {checkpoint.get('global_step', '?')}")
+    if use_safetensors:
+        try:
+            weights_path = hf_hub_download(
+                repo_id=repo_id,
+                filename="weights/best_model.safetensors",
+                repo_type="model"
+            )
+            state_dict = load_safetensors(weights_path)
+            model.load_state_dict(state_dict)
+            print(f"✓ Loaded from {repo_id} (safetensors)")
+        except Exception:
+            use_safetensors = False
+
+    if not use_safetensors:
+        model_path = hf_hub_download(repo_id=repo_id, filename="model.pt", repo_type="model")
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✓ Loaded from {repo_id} @ step {checkpoint.get('global_step', '?')}")
+
+    model.to(device)
     return model
 
 
@@ -1776,63 +2010,43 @@ def load_lyra_from_hub(
 # MAIN
 # ============================================================================
 
-if __name__ == "__main__":
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # EDIT CONFIG HERE
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    config = VAELyraTrainerConfig(
-        # Prompt generation
-        prompt_source="booru",  # "booru", "synthetic", "laion", "mixed"
-        booru_ratio=0.7,
-        synthetic_ratio=0.15,
-        laion_ratio=0.15,
-
-        # Booru CSV paths
-        danbooru_csv=None,  # "/content/danbooru_tags.csv"
-        gelbooru_csv=None,
-        e621_csv=None,
-        rule34x_csv=None,
-
-        # Summarization (T5 sees tags + summary, CLIP sees tags only)
-        use_summarizer=True,
-        summarizer_model="qwen2.5-1.5b",
-        summarizer_batch_size=32,  # Higher = faster, more VRAM
-        summary_separator="¶",  # Pilcrow for mode switching
-        shuffle_tags_before_summary=True,
-        summarizer_max_new_tokens=64,
-
-        # Prompt caching (saves hours on re-runs)
-        prompt_cache_dir="./prompt_cache",
-        use_prompt_cache=True,
-        save_prompt_cache=True,
-
-        # CLIP configuration
-        use_illustrious_clips=True,
-        illustrious_repo="AbstractPhil/clips",
-        clip_l_filename=None,  # Auto-discover, or specify e.g. "clip_l.safetensors"
-        clip_g_filename=None,  # Auto-discover, or specify e.g. "clip_g.safetensors"
-        auto_discover_clips=True,
-        clip_skip=2,  # Use penultimate layer
-
-        # Training
-        num_samples=10000,
-        batch_size=8,
-        num_epochs=100,
-        learning_rate=1e-4,
-
-        # Hub
-        push_to_hub=True,
-        hf_repo="AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
-
-        # Logging
-        use_wandb=False
-    )
-
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-    # TRAIN
-    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-    trainer = VAELyraTrainer(config)
-    dataloader = trainer.prepare_data()
-    trainer.train(dataloader)
+#if __name__ == "__main__":
+#    config = VAELyraTrainerConfig(
+#        prompt_source="booru",
+#        booru_ratio=0.7,
+#        synthetic_ratio=0.15,
+#        laion_ratio=0.15,
+#        danbooru_csv=None,
+#        gelbooru_csv=None,
+#        e621_csv=None,
+#        rule34x_csv=None,
+#        use_summarizer=True,
+#        summarizer_model="qwen2.5-1.5b",
+#        summarizer_batch_size=32,
+#        summary_separator="¶",
+#        shuffle_tags_before_summary=True,
+#        summarizer_max_new_tokens=64,
+#        prompt_cache_dir="./prompt_cache",
+#        use_prompt_cache=True,
+#        save_prompt_cache=True,
+#        use_illustrious_clips=True,
+#        illustrious_repo="AbstractPhil/clips",
+#        clip_l_filename=None,
+#        clip_g_filename=None,
+#        auto_discover_clips=True,
+#        clip_skip=2,
+#        num_samples=10000,
+#        batch_size=8,
+#        num_epochs=100,
+#        learning_rate=1e-4,
+#        resume_optimizer=True,
+#        push_to_hub=True,
+#        push_checkpoints=True,
+#        export_safetensors=True,
+#        hf_repo="AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+#        use_wandb=False
+#    )
+#
+#    trainer = VAELyraTrainer(config)
+#    dataloader = trainer.prepare_data()
+#    trainer.train(dataloader)
