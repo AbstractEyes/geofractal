@@ -70,7 +70,13 @@ from geofractal.model.vae.vae_lyra_v2 import (
     FusionStrategy
 )
 from geovocab2.data.prompt.symbolic_tree import SynthesisSystem
-from geovocab2.data.prompt.booru_synthesizer import BooruSynthesizer, BooruConfig
+from geovocab2.data.prompt.booru_synthesizer import (
+    BooruSynthesizer,
+    BooruConfig,
+    ConduitConfig,
+    sample_coherent_gender,
+    generate_people_count_prefix
+)
 from geovocab2.shapes.factory.summary_factory import CaptionFactory, CaptionFactoryConfig
 
 # ============================================================================
@@ -438,6 +444,23 @@ class VAELyraTrainerConfig:
     e621_csv: Optional[str] = None
     rule34x_csv: Optional[str] = None
 
+    # Coherent gender sampling (prevents 2girls + 3girls conflicts)
+    use_coherent_gender: bool = True
+
+    # T5 people count prefix ("3people", "there are three people", etc.)
+    generate_t5_prefix: bool = True
+
+    # Conduit system - injects random top-N tags for generalization
+    use_conduit: bool = True
+    conduit_top_n: int = 1000
+    conduit_sample_k: int = 10
+    conduit_sample_k_min: int = 5
+    conduit_sample_k_max: int = 15
+    conduit_position: str = "prepend"
+    conduit_exclude_categories: List[str] = field(default_factory=lambda: [
+        "artist", "copyright", "character", "metadata"
+    ])
+
     # Summarization configuration
     use_summarizer: bool = True
     summarizer_model: str = "qwen2.5-1.5b"
@@ -733,16 +756,37 @@ class VAELyraTrainer:
         print("  ✓ SynthesisSystem ready")
 
         if self.config.prompt_source in ["booru", "mixed"]:
+            # Build conduit config if enabled
+            conduit_config = None
+            if self.config.use_conduit:
+                conduit_config = ConduitConfig(
+                    enabled=True,
+                    top_n=self.config.conduit_top_n,
+                    sample_k=self.config.conduit_sample_k,
+                    sample_k_min=self.config.conduit_sample_k_min,
+                    sample_k_max=self.config.conduit_sample_k_max,
+                    position=self.config.conduit_position,
+                    exclude_categories=self.config.conduit_exclude_categories,
+                )
+
             booru_config = BooruConfig(
                 danbooru_csv=self.config.danbooru_csv,
                 gelbooru_csv=self.config.gelbooru_csv,
                 e621_csv=self.config.e621_csv,
                 rule34x_csv=self.config.rule34x_csv,
+                use_coherent_gender=self.config.use_coherent_gender,
+                generate_t5_prefix=self.config.generate_t5_prefix,
+                conduit=conduit_config,
                 seed=self.config.seed
             )
             self.booru_gen = BooruSynthesizer(booru_config)
             stats = self.booru_gen.stats()
             print(f"  ✓ BooruSynthesizer ready: {stats['total_tags']:,} tags, {stats['templates']} templates")
+            print(f"    Coherent gender: {self.config.use_coherent_gender}")
+            print(f"    T5 prefix: {self.config.generate_t5_prefix}")
+            if self.config.use_conduit:
+                conduit_stats = stats.get('conduit', {})
+                print(f"    Conduit: {conduit_stats.get('size', 0)} tags from top {self.config.conduit_top_n}")
         else:
             self.booru_gen = None
 
@@ -835,15 +879,34 @@ class VAELyraTrainer:
                 self.summarizer.unload_model()
                 print(f"  ✓ Unloaded summarizer to free VRAM")
 
-    def _build_t5_text(self, tags: str, summary: str) -> str:
-        """Build the T5 input text with tags, separator, and summary."""
+    def _build_t5_text(self, tags: str, summary: str, t5_prefix: Optional[str] = None) -> str:
+        """
+        Build the T5 input text with optional people count prefix, tags, separator, and summary.
+
+        Format: "{t5_prefix}, {tags} {separator} {summary}"
+        Example: "three people, 1girl, 2boys, uniform ¶ A group of students smiling"
+        """
         if self.config.shuffle_tags_before_summary:
             tags = self._shuffle_tags(tags)
 
+        # Build the full T5 input
+        parts = []
+
+        # Add people count prefix if provided
+        if t5_prefix:
+            parts.append(t5_prefix)
+
+        # Add tags
+        parts.append(tags)
+
+        # Join prefix and tags
+        t5_text = ", ".join(parts) if t5_prefix else tags
+
+        # Add summary after separator
         if summary:
-            return f"{tags} {self.config.summary_separator} {summary}"
-        else:
-            return tags
+            t5_text = f"{t5_text} {self.config.summary_separator} {summary}"
+
+        return t5_text
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Prompt Cache
@@ -867,7 +930,9 @@ class VAELyraTrainer:
             self,
             tags_list: List[str],
             summaries: List[str],
-            sources: List[str]
+            sources: List[str],
+            t5_prefixes: List[Optional[str]],
+            people_counts: List[int]
     ) -> None:
         """Save generated prompts and summaries to cache."""
         if not self.config.save_prompt_cache:
@@ -876,20 +941,27 @@ class VAELyraTrainer:
         cache_path = self._get_cache_path()
 
         cache_data = {
-            "version": "1.0",
+            "version": "1.1",  # Bumped version for new fields
             "config": {
                 "prompt_source": self.config.prompt_source,
                 "num_samples": len(tags_list),
                 "summarizer_model": self.config.summarizer_model if self.config.use_summarizer else None,
                 "summary_separator": self.config.summary_separator,
+                "use_coherent_gender": self.config.use_coherent_gender,
+                "generate_t5_prefix": self.config.generate_t5_prefix,
+                "use_conduit": self.config.use_conduit,
             },
             "data": [
                 {
                     "tags": tags,
                     "summary": summary,
-                    "source": source
+                    "source": source,
+                    "t5_prefix": t5_prefix,
+                    "people_count": count
                 }
-                for tags, summary, source in zip(tags_list, summaries, sources)
+                for tags, summary, source, t5_prefix, count in zip(
+                    tags_list, summaries, sources, t5_prefixes, people_counts
+                )
             ]
         }
 
@@ -905,8 +977,13 @@ class VAELyraTrainer:
         size_mb = cache_path.stat().st_size / (1024 * 1024)
         print(f"  ✓ Saved {len(tags_list):,} prompts ({size_mb:.1f} MB)")
 
-    def _load_prompt_cache(self) -> Optional[Tuple[List[str], List[str], List[str]]]:
-        """Load prompts and summaries from cache if available."""
+    def _load_prompt_cache(self) -> Optional[Tuple[List[str], List[str], List[str], List[Optional[str]], List[int]]]:
+        """
+        Load prompts and summaries from cache if available.
+
+        Returns:
+            Tuple of (tags_list, summaries, sources, t5_prefixes, people_counts) or None
+        """
         if not self.config.use_prompt_cache:
             return None
 
@@ -922,8 +999,11 @@ class VAELyraTrainer:
             with open(cache_path, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
 
-            if cache_data.get("version") != "1.0":
-                print(f"  ⚠️  Cache version mismatch, regenerating...")
+            version = cache_data.get("version", "1.0")
+
+            # Accept both 1.0 and 1.1 versions
+            if version not in ["1.0", "1.1"]:
+                print(f"  ⚠️  Cache version {version} not supported, regenerating...")
                 return None
 
             cached_config = cache_data.get("config", {})
@@ -941,42 +1021,63 @@ class VAELyraTrainer:
             summaries = [item.get("summary", "") for item in data]
             sources = [item.get("source", "unknown") for item in data]
 
-            print(f"  ✓ Loaded {len(tags_list):,} cached prompts")
+            # Handle both old (1.0) and new (1.1) cache formats
+            t5_prefixes = [item.get("t5_prefix", None) for item in data]
+            people_counts = [item.get("people_count", 0) for item in data]
+
+            print(f"  ✓ Loaded {len(tags_list):,} cached prompts (version {version})")
 
             source_counts = Counter(sources)
             print(f"  Distribution: {dict(source_counts)}")
 
-            return tags_list, summaries, sources
+            # Show people count distribution if available
+            if any(c > 0 for c in people_counts):
+                count_dist = Counter(people_counts)
+                print(f"  People counts: {dict(sorted(count_dist.items()))}")
+
+            return tags_list, summaries, sources, t5_prefixes, people_counts
 
         except Exception as e:
             print(f"  ⚠️  Failed to load cache: {e}")
             return None
 
-    def _load_or_generate_prompts(self, num_samples: int) -> Tuple[List[str], List[str], List[str]]:
-        """Load prompts from cache or generate new ones."""
+    def _load_or_generate_prompts(self, num_samples: int) -> Tuple[
+        List[str], List[str], List[str], List[Optional[str]], List[int]]:
+        """
+        Load prompts from cache or generate new ones.
+
+        Returns:
+            Tuple of (tags_list, summaries, sources, t5_prefixes, people_counts)
+        """
         cached = self._load_prompt_cache()
         if cached is not None:
             return cached
 
         print(f"\n🎼 Generating {num_samples:,} prompts (source: {self.config.prompt_source})...")
 
-        tags_list, sources = [], []
+        tags_list, sources, t5_prefixes, people_counts = [], [], [], []
         for _ in tqdm(range(num_samples), desc="Generating tags"):
-            prompt, source = self._generate_prompt()
-            tags_list.append(prompt)
+            tags, source, t5_prefix, count = self._generate_prompt()
+            tags_list.append(tags)
             sources.append(source)
+            t5_prefixes.append(t5_prefix)
+            people_counts.append(count)
 
         source_counts = Counter(sources)
         print(f"\nDistribution: {dict(source_counts)}")
+
+        # Show people count distribution
+        count_dist = Counter(people_counts)
+        print(f"People counts: {dict(sorted(count_dist.items()))}")
 
         if self.config.use_summarizer:
             summaries = self._generate_summaries(tags_list)
         else:
             summaries = [""] * len(tags_list)
 
-        self._save_prompt_cache(tags_list, summaries, sources)
+        self._save_prompt_cache(tags_list, summaries, sources, t5_prefixes, people_counts)
 
-        return tags_list, summaries, sources
+        return tags_list, summaries, sources, t5_prefixes, people_counts
 
     def _load_flavors(self) -> List[str]:
         """Load LAION flavors from remote source."""
@@ -993,31 +1094,53 @@ class VAELyraTrainer:
             print(f"  ⚠️  Fallback flavors: {e}")
             return ["a beautiful landscape", "abstract art", "detailed portrait"]
 
-    def _generate_prompt(self) -> Tuple[str, str]:
-        """Generate a single prompt based on configured source."""
+    def _generate_prompt(self) -> Tuple[str, str, Optional[str], int]:
+        """
+        Generate a single prompt based on configured source.
+
+        Returns:
+            Tuple of (tags, source, t5_prefix, people_count)
+        """
         source = self.config.prompt_source
 
         if source == "booru":
-            return self.booru_gen.generate(), "booru"
+            result = self.booru_gen.generate_with_t5()
+            return result['clip'], "booru", result['t5_prefix'], result['people_count']
 
         elif source == "synthetic":
             complexity = random.choice([2, 3, 4, 5])
             prompt = self.prompt_gen.synthesize(complexity=complexity)['text']
-            return prompt, "synthetic"
+            # For synthetic, generate coherent gender separately
+            if self.config.use_coherent_gender:
+                gender_tags, count = sample_coherent_gender()
+                t5_prefix = generate_people_count_prefix(count) if self.config.generate_t5_prefix else None
+                # Prepend gender tags to prompt
+                prompt = ", ".join(gender_tags) + ", " + prompt
+                return prompt, "synthetic", t5_prefix, count
+            return prompt, "synthetic", None, 0
 
         elif source == "laion":
-            return random.choice(self.flavors), "laion"
+            prompt = random.choice(self.flavors)
+            # LAION flavors don't have structured people counts
+            return prompt, "laion", None, 0
 
         elif source == "mixed":
             r = random.random()
             if r < self.config.booru_ratio:
-                return self.booru_gen.generate(), "booru"
+                result = self.booru_gen.generate_with_t5()
+                return result['clip'], "booru", result['t5_prefix'], result['people_count']
             elif r < self.config.booru_ratio + self.config.synthetic_ratio:
                 complexity = random.choice([2, 3, 4, 5])
                 prompt = self.prompt_gen.synthesize(complexity=complexity)['text']
-                return prompt, "synthetic"
+                if self.config.use_coherent_gender:
+                    gender_tags, count = sample_coherent_gender()
+                    t5_prefix = generate_people_count_prefix(count) if self.config.generate_t5_prefix else None
+                    prompt = ", ".join(gender_tags) + ", " + prompt
+                    return prompt, "synthetic", t5_prefix, count
+                return prompt, "synthetic", None, 0
             else:
-                return random.choice(self.flavors), "laion"
+                prompt = random.choice(self.flavors)
+                return prompt, "laion", None, 0
 
         else:
             raise ValueError(f"Unknown prompt_source: {source}")
@@ -1681,25 +1804,29 @@ recons, mu, logvar, _ = model(inputs, target_modalities=["clip_l", "clip_g"])
         """Prepare dataset with Illustrious CLIP + T5-XL encoders."""
         num_samples = num_samples or self.config.num_samples
 
-        tags_list, summaries, sources = self._load_or_generate_prompts(num_samples)
+        tags_list, summaries, sources, t5_prefixes, people_counts = self._load_or_generate_prompts(num_samples)
 
         self.used_prompts = tags_list
         self.prompt_sources = sources
         self.summaries = summaries
+        self.t5_prefixes = t5_prefixes
+        self.people_counts = people_counts
 
         clip_texts = tags_list
         t5_texts = []
 
-        for tags, summary in zip(tags_list, summaries):
-            t5_text = self._build_t5_text(tags, summary)
+        for tags, summary, t5_prefix in zip(tags_list, summaries, t5_prefixes):
+            t5_text = self._build_t5_text(tags, summary, t5_prefix)
             t5_texts.append(t5_text)
 
-        print(f"\nT5 input format examples:")
+        print(f"\n📝 Text format examples:")
         for i in range(min(3, len(t5_texts))):
-            t5_sample = t5_texts[i]
-            if len(t5_sample) > 120:
-                t5_sample = t5_sample[:120] + "..."
-            print(f"  {t5_sample}")
+            clip_sample = clip_texts[i][:80] + "..." if len(clip_texts[i]) > 80 else clip_texts[i]
+            t5_sample = t5_texts[i][:120] + "..." if len(t5_texts[i]) > 120 else t5_texts[i]
+            print(f"\n  [{i}] CLIP: {clip_sample}")
+            print(f"      T5:   {t5_sample}")
+            if t5_prefixes[i]:
+                print(f"      Count: {people_counts[i]} ({t5_prefixes[i]})")
 
         # Download custom CLIP weights
         if self.config.use_illustrious_clips:
@@ -1939,6 +2066,18 @@ def create_lyra_trainer(
         resume_optimizer: bool = True,
         push_checkpoints: bool = True,
         export_safetensors: bool = True,
+        # Coherent gender and T5 prefix
+        use_coherent_gender: bool = True,
+        generate_t5_prefix: bool = True,
+        # Conduit options
+        use_conduit: bool = True,
+        conduit_top_n: int = 1000,
+        conduit_sample_k: int = 10,
+        conduit_sample_k_min: int = 5,
+        conduit_sample_k_max: int = 15,
+        conduit_position: str = "prepend",
+        conduit_exclude_categories: Optional[List[str]] = None,
+        # CSV paths
         danbooru_csv: Optional[str] = None,
         gelbooru_csv: Optional[str] = None,
         e621_csv: Optional[str] = None,
@@ -1946,6 +2085,10 @@ def create_lyra_trainer(
         **kwargs
 ) -> VAELyraTrainer:
     """Create VAE Lyra trainer with all options."""
+
+    if conduit_exclude_categories is None:
+        conduit_exclude_categories = ["artist", "copyright", "character", "metadata"]
+
     config = VAELyraTrainerConfig(
         num_samples=num_samples,
         batch_size=batch_size,
@@ -1971,6 +2114,15 @@ def create_lyra_trainer(
         resume_optimizer=resume_optimizer,
         push_checkpoints=push_checkpoints,
         export_safetensors=export_safetensors,
+        use_coherent_gender=use_coherent_gender,
+        generate_t5_prefix=generate_t5_prefix,
+        use_conduit=use_conduit,
+        conduit_top_n=conduit_top_n,
+        conduit_sample_k=conduit_sample_k,
+        conduit_sample_k_min=conduit_sample_k_min,
+        conduit_sample_k_max=conduit_sample_k_max,
+        conduit_position=conduit_position,
+        conduit_exclude_categories=conduit_exclude_categories,
         danbooru_csv=danbooru_csv,
         gelbooru_csv=gelbooru_csv,
         e621_csv=e621_csv,
@@ -1987,6 +2139,14 @@ def generate_prompt_cache(
         summarizer_batch_size: int = 16,
         cache_dir: str = "./prompt_cache",
         cache_name: Optional[str] = None,
+        # Coherent gender and T5 prefix
+        use_coherent_gender: bool = True,
+        generate_t5_prefix: bool = True,
+        # Conduit options
+        use_conduit: bool = True,
+        conduit_top_n: int = 1000,
+        conduit_sample_k: int = 10,
+        # CSV paths
         danbooru_csv: Optional[str] = None,
         gelbooru_csv: Optional[str] = None,
         e621_csv: Optional[str] = None,
@@ -2005,6 +2165,11 @@ def generate_prompt_cache(
         prompt_cache_name=cache_name,
         use_prompt_cache=False,
         save_prompt_cache=True,
+        use_coherent_gender=use_coherent_gender,
+        generate_t5_prefix=generate_t5_prefix,
+        use_conduit=use_conduit,
+        conduit_top_n=conduit_top_n,
+        conduit_sample_k=conduit_sample_k,
         danbooru_csv=danbooru_csv,
         gelbooru_csv=gelbooru_csv,
         e621_csv=e621_csv,
@@ -2016,7 +2181,7 @@ def generate_prompt_cache(
     )
 
     trainer = VAELyraTrainer(config)
-    tags_list, summaries, sources = trainer._load_or_generate_prompts(num_samples)
+    tags_list, summaries, sources, t5_prefixes, people_counts = trainer._load_or_generate_prompts(num_samples)
 
     cache_path = trainer._get_cache_path()
     print(f"\n✓ Cache saved to: {cache_path}")
@@ -2109,10 +2274,10 @@ def load_lyra_from_hub(
     return model
 
 
-## ============================================================================
-## MAIN
-## ============================================================================
-#
+# ============================================================================
+# MAIN
+# ============================================================================
+
 #if __name__ == "__main__":
 #    config = VAELyraTrainerConfig(
 #        # Model naming
