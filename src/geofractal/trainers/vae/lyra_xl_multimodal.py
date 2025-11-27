@@ -1171,8 +1171,10 @@ class VAELyraTrainer:
         Uses config.hub_checkpoint_file to determine which file to load.
         If None, defaults to "model.pt".
 
+        Supports both .pt (torch) and .safetensors formats.
+
         Respects config.resume_optimizer:
-            True  = Load optimizer state (continue training)
+            True  = Load optimizer state (continue training) - only for .pt files
             False = Skip optimizer (fine-tuning with fresh optimizer)
         """
         try:
@@ -1186,52 +1188,83 @@ class VAELyraTrainer:
                     repo_type="model"
                 )
 
-                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-
-                # Build model
+                # Build model first
                 self.model = self._build_model()
 
-                # Handle different checkpoint formats
-                if isinstance(checkpoint, dict):
-                    if 'model_state_dict' in checkpoint:
-                        self.model.load_state_dict(checkpoint['model_state_dict'])
-                    elif 'state_dict' in checkpoint:
-                        self.model.load_state_dict(checkpoint['state_dict'])
+                # Detect file format and load accordingly
+                is_safetensors = checkpoint_file.endswith('.safetensors')
+
+                if is_safetensors:
+                    # Safetensors: weights only, no optimizer/training state
+                    state_dict = load_safetensors(model_path, device=str(self.device))
+                    self.model.load_state_dict(state_dict)
+
+                    # Fresh optimizer (safetensors has no optimizer state)
+                    self.optimizer = self._build_optimizer()
+                    print(f"  ✓ Loaded safetensors weights")
+                    print(f"  ⚠️  Fresh optimizer (safetensors has no optimizer state)")
+
+                    # No training state in safetensors - start fresh or use step from filename
+                    # Try to extract step from filename like "lyra_step_9000.safetensors"
+                    import re
+                    step_match = re.search(r'step[_-](\d+)', checkpoint_file)
+                    if step_match:
+                        self.global_step = int(step_match.group(1))
+                        print(f"  ✓ Extracted step {self.global_step} from filename")
                     else:
-                        # Assume the dict IS the state dict
-                        self.model.load_state_dict(checkpoint)
-                else:
-                    self.model.load_state_dict(checkpoint)
+                        self.global_step = 0
 
-                # Build optimizer
-                self.optimizer = self._build_optimizer()
-
-                # Optionally load optimizer state
-                if isinstance(checkpoint, dict):
-                    if self.config.resume_optimizer and 'optimizer_state_dict' in checkpoint:
-                        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-                        print(f"  ✓ Loaded optimizer state (resume_optimizer=True)")
-                    else:
-                        print(f"  ⚠️  Fresh optimizer (resume_optimizer=False)")
-
-                    # Load training state
-                    self.global_step = checkpoint.get('global_step', 0)
-                    self.epoch = checkpoint.get('epoch', 0)
-                    self.best_loss = checkpoint.get('best_loss', float('inf'))
-                    self.start_epoch = self.epoch
-
-                    # Optionally load scheduler
-                    if self.config.use_scheduler:
-                        self.scheduler = self._build_scheduler()
-                        if self.config.resume_optimizer and 'scheduler_state_dict' in checkpoint:
-                            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-                else:
-                    # Raw state dict - no training state
-                    self.global_step = 0
                     self.epoch = 0
                     self.best_loss = float('inf')
                     self.start_epoch = 0
-                    print(f"  ⚠️  Loaded raw state dict (no training state)")
+
+                    if self.config.use_scheduler:
+                        self.scheduler = self._build_scheduler()
+                else:
+                    # PyTorch checkpoint: may have optimizer/training state
+                    checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+
+                    # Handle different checkpoint formats
+                    if isinstance(checkpoint, dict):
+                        if 'model_state_dict' in checkpoint:
+                            self.model.load_state_dict(checkpoint['model_state_dict'])
+                        elif 'state_dict' in checkpoint:
+                            self.model.load_state_dict(checkpoint['state_dict'])
+                        else:
+                            # Assume the dict IS the state dict
+                            self.model.load_state_dict(checkpoint)
+                    else:
+                        self.model.load_state_dict(checkpoint)
+
+                    # Build optimizer
+                    self.optimizer = self._build_optimizer()
+
+                    # Optionally load optimizer state
+                    if isinstance(checkpoint, dict):
+                        if self.config.resume_optimizer and 'optimizer_state_dict' in checkpoint:
+                            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                            print(f"  ✓ Loaded optimizer state (resume_optimizer=True)")
+                        else:
+                            print(f"  ⚠️  Fresh optimizer (resume_optimizer=False)")
+
+                        # Load training state
+                        self.global_step = checkpoint.get('global_step', 0)
+                        self.epoch = checkpoint.get('epoch', 0)
+                        self.best_loss = checkpoint.get('best_loss', float('inf'))
+                        self.start_epoch = self.epoch
+
+                        # Optionally load scheduler
+                        if self.config.use_scheduler:
+                            self.scheduler = self._build_scheduler()
+                            if self.config.resume_optimizer and 'scheduler_state_dict' in checkpoint:
+                                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+                    else:
+                        # Raw state dict - no training state
+                        self.global_step = 0
+                        self.epoch = 0
+                        self.best_loss = float('inf')
+                        self.start_epoch = 0
+                        print(f"  ⚠️  Loaded raw state dict (no training state)")
 
                 print(f"✓ Resumed from step {self.global_step}, epoch {self.epoch}, best_loss={self.best_loss:.4f}")
                 return True
@@ -1298,18 +1331,33 @@ class VAELyraTrainer:
                 )
 
         print(f"🔄 Loading checkpoint: {local_path}")
-        checkpoint = torch.load(local_path, map_location=self.device, weights_only=False)
 
-        # Extract state dict
-        if isinstance(checkpoint, dict):
-            if 'model_state_dict' in checkpoint:
-                old_state = checkpoint['model_state_dict']
-            elif 'state_dict' in checkpoint:
-                old_state = checkpoint['state_dict']
+        # Detect file format
+        is_safetensors = local_path.endswith('.safetensors') or checkpoint_path.endswith('.safetensors')
+
+        if is_safetensors:
+            # Safetensors: weights only
+            old_state = load_safetensors(local_path, device=str(self.device))
+            checkpoint = None  # No training state in safetensors
+
+            # Try to extract step from filename
+            import re
+            step_match = re.search(r'step[_-](\d+)', checkpoint_path)
+            extracted_step = int(step_match.group(1)) if step_match else 0
+        else:
+            checkpoint = torch.load(local_path, map_location=self.device, weights_only=False)
+            extracted_step = None
+
+            # Extract state dict from checkpoint
+            if isinstance(checkpoint, dict):
+                if 'model_state_dict' in checkpoint:
+                    old_state = checkpoint['model_state_dict']
+                elif 'state_dict' in checkpoint:
+                    old_state = checkpoint['state_dict']
+                else:
+                    old_state = checkpoint
             else:
                 old_state = checkpoint
-        else:
-            old_state = checkpoint
 
         # Load model weights
         current_state = self.model.state_dict()
@@ -1338,7 +1386,16 @@ class VAELyraTrainer:
         self.model.load_state_dict(current_state)
 
         # Load training state
-        if isinstance(checkpoint, dict):
+        if is_safetensors:
+            # Safetensors has no training state
+            self.global_step = extracted_step
+            self.epoch = 0
+            self.best_loss = float('inf')
+            self.start_epoch = 0
+            print(f"  ⚠️  Fresh optimizer (safetensors has no optimizer state)")
+            if extracted_step:
+                print(f"  ✓ Extracted step {extracted_step} from filename")
+        elif isinstance(checkpoint, dict):
             self.global_step = checkpoint.get('global_step', 0)
             self.epoch = checkpoint.get('epoch', 0)
             self.best_loss = checkpoint.get('best_loss', float('inf'))
@@ -2230,19 +2287,29 @@ def load_lyra_from_hub(
     # If specific checkpoint requested, load that
     if checkpoint_file:
         model_path = hf_hub_download(repo_id=repo_id, filename=checkpoint_file, repo_type="model")
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
 
-        if isinstance(checkpoint, dict):
-            if 'model_state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['model_state_dict'])
-            elif 'state_dict' in checkpoint:
-                model.load_state_dict(checkpoint['state_dict'])
+        # Detect file format
+        if checkpoint_file.endswith('.safetensors'):
+            state_dict = load_safetensors(model_path, device=device)
+            model.load_state_dict(state_dict)
+            # Try to extract step from filename
+            import re
+            step_match = re.search(r'step[_-](\d+)', checkpoint_file)
+            step = int(step_match.group(1)) if step_match else '?'
+        else:
+            checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+
+            if isinstance(checkpoint, dict):
+                if 'model_state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['model_state_dict'])
+                elif 'state_dict' in checkpoint:
+                    model.load_state_dict(checkpoint['state_dict'])
+                else:
+                    model.load_state_dict(checkpoint)
+                step = checkpoint.get('global_step', '?')
             else:
                 model.load_state_dict(checkpoint)
-            step = checkpoint.get('global_step', '?')
-        else:
-            model.load_state_dict(checkpoint)
-            step = '?'
+                step = '?'
 
         print(f"✓ Loaded {checkpoint_file} from {repo_id} @ step {step}")
         model.to(device)
@@ -2278,61 +2345,61 @@ def load_lyra_from_hub(
 # MAIN
 # ============================================================================
 
-#if __name__ == "__main__":
-#    config = VAELyraTrainerConfig(
-#        # Model naming
-#        model_name="lyra_illustrious",
-#
-#        # Prompt source
-#        prompt_source="booru",
-#        booru_ratio=0.7,
-#        synthetic_ratio=0.15,
-#        laion_ratio=0.15,
-#        danbooru_csv=None,
-#        gelbooru_csv=None,
-#        e621_csv=None,
-#        rule34x_csv=None,
-#
-#        # Summarization
-#        use_summarizer=True,
-#        summarizer_model="qwen2.5-1.5b",
-#        summarizer_batch_size=32,
-#        summary_separator="¶",
-#        shuffle_tags_before_summary=True,
-#        summarizer_max_new_tokens=64,
-#
-#        # Prompt caching
-#        prompt_cache_dir="./prompt_cache",
-#        use_prompt_cache=True,
-#        save_prompt_cache=True,
-#
-#        # CLIP configuration
-#        use_illustrious_clips=True,
-#        illustrious_repo="AbstractPhil/clips",
-#        clip_l_filename=None,
-#        clip_g_filename=None,
-#        auto_discover_clips=True,
-#        clip_skip=2,
-#
-#        # Training
-#        num_samples=10000,
-#        batch_size=8,
-#        num_epochs=100,
-#        learning_rate=1e-4,
-#
-#        # Resume behavior
-#        resume_optimizer=True,
-#        hub_checkpoint_file=None,  # None = model.pt, or specify e.g. "checkpoint_lyra_illustrious_3000.pt"
-#
-#        # Hub settings
-#        push_to_hub=True,
-#        push_checkpoints=True,
-#        export_safetensors=True,
-#        hf_repo="AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
-#
-#        use_wandb=False
-#    )
-#
-#    trainer = VAELyraTrainer(config)
-#    dataloader = trainer.prepare_data()
-#    trainer.train(dataloader)
+if __name__ == "__main__":
+    config = VAELyraTrainerConfig(
+        # Model naming
+        model_name="lyra_illustrious",
+
+        # Prompt source
+        prompt_source="booru",
+        booru_ratio=0.7,
+        synthetic_ratio=0.15,
+        laion_ratio=0.15,
+        danbooru_csv=None,
+        gelbooru_csv=None,
+        e621_csv=None,
+        rule34x_csv=None,
+
+        # Summarization
+        use_summarizer=True,
+        summarizer_model="qwen2.5-1.5b",
+        summarizer_batch_size=32,
+        summary_separator="¶",
+        shuffle_tags_before_summary=True,
+        summarizer_max_new_tokens=64,
+
+        # Prompt caching
+        prompt_cache_dir="./prompt_cache",
+        use_prompt_cache=True,
+        save_prompt_cache=True,
+
+        # CLIP configuration
+        use_illustrious_clips=True,
+        illustrious_repo="AbstractPhil/clips",
+        clip_l_filename=None,
+        clip_g_filename=None,
+        auto_discover_clips=True,
+        clip_skip=2,
+
+        # Training
+        num_samples=10000,
+        batch_size=8,
+        num_epochs=100,
+        learning_rate=1e-4,
+
+        # Resume behavior
+        resume_optimizer=True,
+        hub_checkpoint_file=None,  # None = model.pt, or specify e.g. "checkpoint_lyra_illustrious_3000.pt"
+
+        # Hub settings
+        push_to_hub=True,
+        push_checkpoints=True,
+        export_safetensors=True,
+        hf_repo="AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+
+        use_wandb=False
+    )
+
+    trainer = VAELyraTrainer(config)
+    dataloader = trainer.prepare_data()
+    trainer.train(dataloader)
