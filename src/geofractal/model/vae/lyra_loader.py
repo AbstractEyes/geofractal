@@ -14,48 +14,73 @@ Supported Variants:
 
 - v2: Adaptive Cantor VAE with learned alpha/beta parameters, variable sequence
       lengths, decoupled T5 scales, and binding configuration
-      Examples: vae-lyra-xl-adaptive-cantor
+      Examples: vae-lyra-xl-adaptive-cantor, vae-lyra-xl-adaptive-cantor-illustrious
 
 Known Models:
 - AbstractPhil/vae-lyra: Original CLIP-L + T5-base (v1)
 - AbstractPhil/vae-lyra-sdxl-t5xl: SDXL with CLIP-L + CLIP-G + T5-XL (v1)
 - AbstractPhil/vae-lyra-xl-adaptive-cantor: Adaptive Cantor with decoupled T5 (v2)
+- AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious: Illustrious variant (v2)
 
 Usage:
     from geofractal.model.vae.loader import load_vae_lyra
 
-    # Auto-detect version
-    model = load_vae_lyra("AbstractPhil/vae-lyra-xl-adaptive-cantor")
+    # Auto-detect version and best checkpoint
+    model = load_vae_lyra("AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious")
+
+    # Load specific checkpoint from weights/ folder
+    model = load_vae_lyra(
+        "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+        checkpoint="lyra_illustrious_step_9000.safetensors"
+    )
 
     # List all known models
     from geofractal.model.vae.loader import list_known_models
     list_known_models()
-
-    # Get model info
-    info = get_model_info("AbstractPhil/vae-lyra-sdxl-t5xl")
-    print(f"Version: {info['version']}")
 
 Author: AbstractPhil
 """
 
 import torch
 import json
+import re
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List
-from huggingface_hub import hf_hub_download
+from typing import Optional, Dict, Any, Tuple, List, Union
 from dataclasses import asdict
+
+# Try importing safetensors
+try:
+    from safetensors.torch import load_file as load_safetensors
+
+    HAS_SAFETENSORS = True
+except ImportError:
+    HAS_SAFETENSORS = False
+    print("⚠️ safetensors not installed - .safetensors files will not be supported")
+
+# Try importing huggingface_hub
+try:
+    from huggingface_hub import hf_hub_download, list_repo_files
+
+    HAS_HF_HUB = True
+except ImportError:
+    HAS_HF_HUB = False
+    print("⚠️ huggingface_hub not installed - remote loading disabled")
 
 # ============================================================================
 # MODEL REGISTRY
 # ============================================================================
 
 KNOWN_MODELS = {
+    # ─────────────────────────────────────────────────────────────────────────
+    # V1 Models - Standard fusion strategies
+    # ─────────────────────────────────────────────────────────────────────────
     "AbstractPhil/vae-lyra": {
         "version": "v1",
         "description": "Original VAE Lyra with CLIP-L + T5-base",
         "modalities": ["clip", "t5"],
         "fusion": "cantor",
         "latent_dim": 768,
+        "checkpoint_format": "model.pt",
         "recommended_for": "General text embedding transformation"
     },
     "AbstractPhil/vae-lyra-sdxl-t5xl": {
@@ -64,19 +89,53 @@ KNOWN_MODELS = {
         "modalities": ["clip_l", "clip_g", "t5_xl"],
         "fusion": "cantor",
         "latent_dim": 2048,
+        "checkpoint_format": "model.pt",
         "recommended_for": "SDXL text encoder replacement"
     },
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # V2 Models - Adaptive Cantor with learned parameters
+    # ─────────────────────────────────────────────────────────────────────────
     "AbstractPhil/vae-lyra-xl-adaptive-cantor": {
         "version": "v2",
         "description": "Adaptive Cantor with decoupled T5 scales and learned parameters",
         "modalities": ["clip_l", "clip_g", "t5_xl_l", "t5_xl_g"],
         "fusion": "adaptive_cantor",
         "latent_dim": 2048,
+        "checkpoint_format": "safetensors",
+        "weights_folder": "weights",
         "has_adaptive_params": True,
         "has_variable_seq_lens": True,
         "recommended_for": "Advanced SDXL with geometric consciousness"
-    }
+    },
+    "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious": {
+        "version": "v2",
+        "description": "Illustrious variant - trained on anime/illustration data with enhanced generalization",
+        "modalities": ["clip_l", "clip_g", "t5_xl_l", "t5_xl_g"],
+        "fusion": "adaptive_cantor",
+        "latent_dim": 2048,
+        "checkpoint_format": "safetensors",
+        "weights_folder": "weights",
+        "has_adaptive_params": True,
+        "has_variable_seq_lens": True,
+        "has_binding_groups": True,
+        "recommended_for": "Illustrious/anime generation with SDXL architecture"
+    },
 }
+
+# Aliases for convenience
+MODEL_ALIASES = {
+    "lyra": "AbstractPhil/vae-lyra",
+    "lyra-sdxl": "AbstractPhil/vae-lyra-sdxl-t5xl",
+    "lyra-xl": "AbstractPhil/vae-lyra-xl-adaptive-cantor",
+    "lyra-illustrious": "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+    "lyra-cantor": "AbstractPhil/vae-lyra-xl-adaptive-cantor",
+}
+
+
+def resolve_repo_id(repo_id: str) -> str:
+    """Resolve aliases to full repo IDs."""
+    return MODEL_ALIASES.get(repo_id, repo_id)
 
 
 def list_known_models():
@@ -92,17 +151,25 @@ def list_known_models():
         print(f"   Modalities: {', '.join(info['modalities'])}")
         print(f"   Fusion: {info['fusion']}")
         print(f"   Latent dim: {info['latent_dim']}")
+        print(f"   Checkpoint format: {info['checkpoint_format']}")
         if info.get('has_adaptive_params'):
             print(f"   🎯 Learned alpha/beta parameters")
         if info.get('has_variable_seq_lens'):
             print(f"   📏 Variable sequence lengths")
+        if info.get('has_binding_groups'):
+            print(f"   🔗 Binding group configuration")
         print(f"   Use case: {info['recommended_for']}")
+
+    print("\n📝 Aliases:")
+    for alias, full_id in MODEL_ALIASES.items():
+        print(f"   {alias} → {full_id}")
 
     print("\n" + "=" * 80 + "\n")
 
 
 def get_known_model_info(repo_id: str) -> Optional[Dict[str, Any]]:
     """Get registry info for a known model."""
+    repo_id = resolve_repo_id(repo_id)
     return KNOWN_MODELS.get(repo_id)
 
 
@@ -122,8 +189,10 @@ def detect_lyra_version(config: Dict[str, Any], repo_id: Optional[str] = None) -
         Version string: "v1" or "v2"
     """
     # Check registry first if repo_id provided
-    if repo_id and repo_id in KNOWN_MODELS:
-        return KNOWN_MODELS[repo_id]['version']
+    if repo_id:
+        repo_id = resolve_repo_id(repo_id)
+        if repo_id in KNOWN_MODELS:
+            return KNOWN_MODELS[repo_id]['version']
 
     # v2 signature features
     v2_indicators = [
@@ -143,6 +212,11 @@ def detect_lyra_version(config: Dict[str, Any], repo_id: Optional[str] = None) -
     if config.get('fusion_strategy') == 'adaptive_cantor':
         v2_score += 3  # Strong indicator
 
+    # Check for decoupled T5 (t5_xl_l, t5_xl_g)
+    modality_dims = config.get('modality_dims', {})
+    if 't5_xl_l' in modality_dims or 't5_xl_g' in modality_dims:
+        v2_score += 2
+
     # Decision threshold
     if v2_score >= 2:
         return "v2"
@@ -150,46 +224,187 @@ def detect_lyra_version(config: Dict[str, Any], repo_id: Optional[str] = None) -
         return "v1"
 
 
-def validate_config_for_version(config: Dict[str, Any], version: str) -> Tuple[bool, str]:
+def detect_model_variant(config: Dict[str, Any], repo_id: Optional[str] = None) -> str:
     """
-    Validate that config is compatible with specified version.
+    Detect specific model variant for more precise loading.
 
-    Args:
-        config: Configuration dictionary
-        version: Target version ("v1" or "v2")
+    Returns: "base", "sdxl", "xl-adaptive", "illustrious"
+    """
+    if repo_id:
+        repo_id = resolve_repo_id(repo_id)
+        if "illustrious" in repo_id.lower():
+            return "illustrious"
+        if "adaptive-cantor" in repo_id.lower():
+            return "xl-adaptive"
+        if "sdxl" in repo_id.lower():
+            return "sdxl"
+
+    # Detect from config
+    modality_dims = config.get('modality_dims', {})
+
+    if 't5_xl_l' in modality_dims and 't5_xl_g' in modality_dims:
+        # Decoupled T5 = xl-adaptive or illustrious
+        model_name = config.get('model_name', '').lower()
+        if 'illustrious' in model_name:
+            return "illustrious"
+        return "xl-adaptive"
+
+    if 'clip_g' in modality_dims:
+        return "sdxl"
+
+    return "base"
+
+
+# ============================================================================
+# CHECKPOINT DISCOVERY
+# ============================================================================
+
+def discover_checkpoints(repo_id: str) -> Dict[str, List[str]]:
+    """
+    Discover available checkpoints in a repository.
 
     Returns:
-        (is_valid, error_message)
+        Dict with 'weights' (safetensors in weights/), 'root' (files in root)
     """
-    if version == "v1":
-        # v1 should not have v2-specific features
-        v2_only_keys = ['modality_seq_lens', 'binding_config', 'alpha_init',
-                        'beta_init', 'alpha_lr_scale', 'beta_lr_scale']
+    if not HAS_HF_HUB:
+        return {'weights': [], 'root': []}
 
-        found_v2_keys = [k for k in v2_only_keys if k in config]
+    try:
+        files = list_repo_files(repo_id, repo_type="model")
+    except Exception as e:
+        print(f"⚠️ Could not list files in {repo_id}: {e}")
+        return {'weights': [], 'root': []}
 
-        if found_v2_keys:
-            return False, f"Config contains v2-only keys: {found_v2_keys}. Use load_vae_lyra_v2() instead."
+    result = {
+        'weights': [],  # Files in weights/ folder
+        'root': [],  # Files in root
+    }
 
-        # v1 should not use adaptive_cantor
-        if config.get('fusion_strategy') == 'adaptive_cantor':
-            return False, "adaptive_cantor fusion requires v2. Use load_vae_lyra_v2() instead."
+    for f in files:
+        if f.endswith('.safetensors') or f.endswith('.pt'):
+            if f.startswith('weights/'):
+                result['weights'].append(f.replace('weights/', ''))
+            else:
+                result['root'].append(f)
 
-        return True, ""
+    return result
 
-    elif version == "v2":
-        # v2 with adaptive_cantor needs specific config
-        if config.get('fusion_strategy') == 'adaptive_cantor':
-            required_keys = ['modality_seq_lens', 'binding_config']
-            missing_keys = [k for k in required_keys if k not in config]
 
-            if missing_keys:
-                return False, f"adaptive_cantor requires: {missing_keys}"
+def find_best_checkpoint(repo_id: str, config: Dict[str, Any]) -> Tuple[str, str]:
+    """
+    Find the best checkpoint file to load.
 
-        return True, ""
+    Returns:
+        (checkpoint_path, format) where format is 'safetensors' or 'pt'
+    """
+    repo_id = resolve_repo_id(repo_id)
+    model_name = config.get('model_name', 'lyra')
 
+    # Registry hint
+    registry_info = get_known_model_info(repo_id)
+    preferred_format = registry_info.get('checkpoint_format', 'safetensors') if registry_info else 'safetensors'
+    weights_folder = registry_info.get('weights_folder', 'weights') if registry_info else 'weights'
+
+    # Priority order for checkpoint discovery
+    candidates = []
+
+    if preferred_format == 'safetensors':
+        # Prefer safetensors in weights/ folder
+        candidates.extend([
+            (f"{weights_folder}/{model_name}_best.safetensors", 'safetensors'),
+            (f"{weights_folder}/{model_name}_illustrious_best.safetensors", 'safetensors'),
+            (f"{weights_folder}/lyra_best.safetensors", 'safetensors'),
+            (f"{weights_folder}/lyra_illustrious_best.safetensors", 'safetensors'),
+            ("model.safetensors", 'safetensors'),
+            ("model.pt", 'pt'),
+        ])
     else:
-        return False, f"Unknown version: {version}"
+        # Prefer .pt files
+        candidates.extend([
+            ("model.pt", 'pt'),
+            (f"{weights_folder}/{model_name}_best.safetensors", 'safetensors'),
+            ("model.safetensors", 'safetensors'),
+        ])
+
+    # Try each candidate
+    for ckpt_path, fmt in candidates:
+        try:
+            _ = hf_hub_download(repo_id=repo_id, filename=ckpt_path, repo_type="model")
+            return ckpt_path, fmt
+        except:
+            continue
+
+    raise FileNotFoundError(f"No checkpoint found in {repo_id}. Tried: {[c[0] for c in candidates]}")
+
+
+def extract_step_from_filename(filename: str) -> Optional[int]:
+    """Extract training step from checkpoint filename."""
+    patterns = [
+        r'step[_-](\d+)',
+        r'_(\d+)\.(?:safetensors|pt)$',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, filename)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+# ============================================================================
+# WEIGHT LOADING
+# ============================================================================
+
+def load_weights(
+        path: str,
+        device: str = "cpu",
+        is_safetensors: Optional[bool] = None
+) -> Dict[str, torch.Tensor]:
+    """
+    Load weights from file (safetensors or pt).
+
+    Args:
+        path: Path to weight file
+        device: Device to load to
+        is_safetensors: Force format detection (None = auto-detect from extension)
+
+    Returns:
+        State dict
+    """
+    if is_safetensors is None:
+        is_safetensors = path.endswith('.safetensors')
+
+    if is_safetensors:
+        if not HAS_SAFETENSORS:
+            raise ImportError("safetensors not installed. Run: pip install safetensors")
+        return load_safetensors(path, device=device)
+    else:
+        checkpoint = torch.load(path, map_location=device, weights_only=False)
+        # Handle different checkpoint formats
+        if isinstance(checkpoint, dict):
+            if 'model_state_dict' in checkpoint:
+                return checkpoint['model_state_dict']
+            elif 'state_dict' in checkpoint:
+                return checkpoint['state_dict']
+        return checkpoint
+
+
+def load_training_state(path: str, device: str = "cpu") -> Optional[Dict[str, Any]]:
+    """
+    Load training state (optimizer, step, loss) from .pt checkpoint.
+    Returns None for safetensors (no training state).
+    """
+    if path.endswith('.safetensors'):
+        return None
+
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(checkpoint, dict):
+        return {
+            'global_step': checkpoint.get('global_step'),
+            'epoch': checkpoint.get('epoch'),
+            'best_loss': checkpoint.get('best_loss'),
+            'optimizer_state_dict': checkpoint.get('optimizer_state_dict'),
+        }
+    return None
 
 
 # ============================================================================
@@ -198,49 +413,55 @@ def validate_config_for_version(config: Dict[str, Any], version: str) -> Tuple[b
 
 def load_vae_lyra(
         repo_id: str,
+        checkpoint: Optional[str] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        force_version: Optional[str] = None
-) -> torch.nn.Module:
+        force_version: Optional[str] = None,
+        return_info: bool = False
+) -> Union[torch.nn.Module, Tuple[torch.nn.Module, Dict[str, Any]]]:
     """
     Load VAE Lyra from HuggingFace Hub with automatic version detection.
 
     Args:
-        repo_id: HuggingFace repository ID (e.g., "AbstractPhil/vae-lyra")
+        repo_id: HuggingFace repository ID or alias (e.g., "lyra-illustrious")
+        checkpoint: Specific checkpoint file (e.g., "lyra_step_9000.safetensors")
+                   If in weights/ folder, can omit the prefix.
         device: Device to load model on
         force_version: Force specific version ("v1" or "v2"), otherwise auto-detect
+        return_info: If True, return (model, info_dict) tuple
 
     Returns:
-        Loaded VAE Lyra model
+        Loaded VAE Lyra model, or (model, info) if return_info=True
 
     Examples:
-    #   >>> # Original model
-    #   >>> model = load_vae_lyra("AbstractPhil/vae-lyra")
+        # Auto-detect best checkpoint
+        model = load_vae_lyra("AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious")
 
-    #   >>> # SDXL model
-    #   >>> model = load_vae_lyra("AbstractPhil/vae-lyra-sdxl-t5xl")
+        # Use alias
+        model = load_vae_lyra("lyra-illustrious")
 
-    #   >>> # Adaptive Cantor model
-    #   >>> model = load_vae_lyra("AbstractPhil/vae-lyra-xl-adaptive-cantor")
+        # Specific checkpoint
+        model = load_vae_lyra("lyra-illustrious", checkpoint="lyra_step_9000.safetensors")
+
+        # Get info alongside model
+        model, info = load_vae_lyra("lyra-illustrious", return_info=True)
     """
+    repo_id = resolve_repo_id(repo_id)
     print(f"🔍 Loading VAE Lyra from: {repo_id}")
 
     # Show registry info if available
     registry_info = get_known_model_info(repo_id)
     if registry_info:
         print(f"📋 Known model: {registry_info['description']}")
-        print(f"   Modalities: {', '.join(registry_info['modalities'])}")
 
     # Download config
+    if not HAS_HF_HUB:
+        raise ImportError("huggingface_hub not installed. Run: pip install huggingface_hub")
+
     try:
-        config_path = hf_hub_download(
-            repo_id=repo_id,
-            filename="config.json",
-            repo_type="model"
-        )
+        config_path = hf_hub_download(repo_id=repo_id, filename="config.json", repo_type="model")
     except Exception as e:
         raise ValueError(f"Could not download config from {repo_id}: {e}")
 
-    # Load config
     with open(config_path) as f:
         config_dict = json.load(f)
 
@@ -252,65 +473,85 @@ def load_vae_lyra(
         version = detect_lyra_version(config_dict, repo_id)
         print(f"✓ Detected version: {version}")
 
-    # Validate config
-    is_valid, error_msg = validate_config_for_version(config_dict, version)
-    if not is_valid:
-        raise ValueError(f"Config validation failed: {error_msg}")
+    # Detect variant
+    variant = detect_model_variant(config_dict, repo_id)
+    print(f"✓ Variant: {variant}")
+
+    # Find checkpoint
+    if checkpoint:
+        # User specified checkpoint
+        # Auto-add weights/ prefix if needed
+        if not checkpoint.startswith('weights/') and not checkpoint.startswith('/'):
+            ckpt_path = f"weights/{checkpoint}"
+        else:
+            ckpt_path = checkpoint
+
+        ckpt_format = 'safetensors' if checkpoint.endswith('.safetensors') else 'pt'
+
+        try:
+            weights_path = hf_hub_download(repo_id=repo_id, filename=ckpt_path, repo_type="model")
+            print(f"✓ Checkpoint: {ckpt_path}")
+        except Exception as e:
+            # Try without weights/ prefix
+            try:
+                weights_path = hf_hub_download(repo_id=repo_id, filename=checkpoint, repo_type="model")
+                ckpt_path = checkpoint
+                print(f"✓ Checkpoint: {ckpt_path}")
+            except:
+                raise FileNotFoundError(f"Checkpoint not found: {checkpoint} (tried {ckpt_path} and {checkpoint})")
+    else:
+        # Auto-discover best checkpoint
+        ckpt_path, ckpt_format = find_best_checkpoint(repo_id, config_dict)
+        weights_path = hf_hub_download(repo_id=repo_id, filename=ckpt_path, repo_type="model")
+        print(f"✓ Auto-selected checkpoint: {ckpt_path}")
+
+    # Extract step from filename
+    step = extract_step_from_filename(ckpt_path)
+    if step:
+        print(f"✓ Training step: {step:,}")
 
     # Load appropriate version
     if version == "v1":
-        return load_vae_lyra_v1(repo_id, device, config_dict)
+        model = _load_vae_lyra_v1(config_dict, weights_path, device)
     elif version == "v2":
-        return load_vae_lyra_v2(repo_id, device, config_dict)
+        model = _load_vae_lyra_v2(config_dict, weights_path, device)
     else:
         raise ValueError(f"Unknown version: {version}")
 
+    # Compile info
+    info = {
+        'repo_id': repo_id,
+        'version': version,
+        'variant': variant,
+        'checkpoint': ckpt_path,
+        'step': step,
+        'config': config_dict,
+        'device': device,
+        'registry_info': registry_info,
+    }
 
-def load_vae_lyra_v1(
-        repo_id: str,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        config_dict: Optional[Dict[str, Any]] = None
+    # Try to get training state
+    training_state = load_training_state(weights_path, device)
+    if training_state:
+        info['training_state'] = training_state
+        if training_state.get('best_loss'):
+            print(f"✓ Best loss: {training_state['best_loss']:.6f}")
+
+    if return_info:
+        return model, info
+    return model
+
+
+def _load_vae_lyra_v1(
+        config_dict: Dict[str, Any],
+        weights_path: str,
+        device: str
 ) -> torch.nn.Module:
-    """
-    Load VAE Lyra v1 (standard fusion strategies).
-
-    Supports:
-    - AbstractPhil/vae-lyra (CLIP-L + T5-base)
-    - AbstractPhil/vae-lyra-sdxl-t5xl (CLIP-L + CLIP-G + T5-XL)
-
-    Args:
-        repo_id: HuggingFace repository ID
-        device: Device to load model on
-        config_dict: Optional pre-loaded config dictionary
-
-    Returns:
-        VAE Lyra v1 model
-    """
-    from geofractal.model.vae.vae_lyra import (
-        MultiModalVAE,
-        MultiModalVAEConfig
-    )
+    """Load VAE Lyra v1 (standard fusion strategies)."""
+    from geofractal.model.vae.vae_lyra import MultiModalVAE, MultiModalVAEConfig
 
     print("📦 Loading VAE Lyra v1...")
 
-    # Download config if not provided
-    if config_dict is None:
-        config_path = hf_hub_download(
-            repo_id=repo_id,
-            filename="config.json",
-            repo_type="model"
-        )
-        with open(config_path) as f:
-            config_dict = json.load(f)
-
-    # Download model weights
-    model_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="model.pt",
-        repo_type="model"
-    )
-
-    # Create config
     vae_config = MultiModalVAEConfig(
         modality_dims=config_dict.get('modality_dims', {"clip": 768, "t5": 768}),
         latent_dim=config_dict.get('latent_dim', 768),
@@ -328,65 +569,29 @@ def load_vae_lyra_v1(
         seed=config_dict.get('seed')
     )
 
-    # Load model
-    checkpoint = torch.load(model_path, map_location=device)
     model = MultiModalVAE(vae_config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    state_dict = load_weights(weights_path, device)
+    model.load_state_dict(state_dict)
     model.to(device)
 
-    print(f"✓ Loaded v1 model from step {checkpoint.get('global_step', 'unknown')}")
-    print(f"✓ Best loss: {checkpoint.get('best_loss', 'unknown')}")
     print(f"✓ Fusion strategy: {vae_config.fusion_strategy}")
     print(f"✓ Modalities: {list(vae_config.modality_dims.keys())}")
     print(f"✓ Latent dimension: {vae_config.latent_dim}")
+    print(f"✓ Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     return model
 
 
-def load_vae_lyra_v2(
-        repo_id: str,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
-        config_dict: Optional[Dict[str, Any]] = None
+def _load_vae_lyra_v2(
+        config_dict: Dict[str, Any],
+        weights_path: str,
+        device: str
 ) -> torch.nn.Module:
-    """
-    Load VAE Lyra v2 (adaptive Cantor with learned parameters).
-
-    Supports:
-    - AbstractPhil/vae-lyra-xl-adaptive-cantor
-
-    Args:
-        repo_id: HuggingFace repository ID
-        device: Device to load model on
-        config_dict: Optional pre-loaded config dictionary
-
-    Returns:
-        VAE Lyra v2 model
-    """
-    from geofractal.model.vae.vae_lyra_v2 import (
-        MultiModalVAE,
-        MultiModalVAEConfig
-    )
+    """Load VAE Lyra v2 (adaptive Cantor with learned parameters)."""
+    from geofractal.model.vae.vae_lyra_v2 import MultiModalVAE, MultiModalVAEConfig
 
     print("📦 Loading VAE Lyra v2 (Adaptive Cantor)...")
 
-    # Download config if not provided
-    if config_dict is None:
-        config_path = hf_hub_download(
-            repo_id=repo_id,
-            filename="config.json",
-            repo_type="model"
-        )
-        with open(config_path) as f:
-            config_dict = json.load(f)
-
-    # Download model weights
-    model_path = hf_hub_download(
-        repo_id=repo_id,
-        filename="model.pt",
-        repo_type="model"
-    )
-
-    # Create config with v2-specific parameters
     vae_config = MultiModalVAEConfig(
         modality_dims=config_dict.get('modality_dims'),
         modality_seq_lens=config_dict.get('modality_seq_lens'),
@@ -413,32 +618,98 @@ def load_vae_lyra_v2(
         seed=config_dict.get('seed')
     )
 
-    # Load model
-    checkpoint = torch.load(model_path, map_location=device)
     model = MultiModalVAE(vae_config)
-    model.load_state_dict(checkpoint['model_state_dict'])
+    state_dict = load_weights(weights_path, device)
+    model.load_state_dict(state_dict)
     model.to(device)
 
-    # Show learned parameters
-    fusion_params = model.get_fusion_params()
-
-    print(f"✓ Loaded v2 model from step {checkpoint.get('global_step', 'unknown')}")
-    print(f"✓ Best loss: {checkpoint.get('best_loss', 'unknown')}")
     print(f"✓ Fusion strategy: {vae_config.fusion_strategy}")
     print(f"✓ Modalities: {list(vae_config.modality_dims.keys())}")
     print(f"✓ Latent dimension: {vae_config.latent_dim}")
-    print(f"✓ Sequence lengths: {vae_config.modality_seq_lens}")
+    if vae_config.modality_seq_lens:
+        print(f"✓ Sequence lengths: {vae_config.modality_seq_lens}")
+    print(f"✓ Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    if fusion_params:
-        print(f"\n📊 Learned Parameters:")
-        if 'alphas' in fusion_params:
-            print(f"   Alpha (visibility):")
-            for name, alpha in fusion_params['alphas'].items():
-                print(f"     • {name}: {torch.sigmoid(alpha).item():.4f}")
-        if 'betas' in fusion_params:
-            print(f"   Beta (capacity):")
-            for name, beta in fusion_params['betas'].items():
-                print(f"     • {name}: {torch.sigmoid(beta).item():.4f}")
+    # Show learned fusion parameters
+    if hasattr(model, 'get_fusion_params'):
+        fusion_params = model.get_fusion_params()
+        if fusion_params:
+            print(f"\n📊 Learned Fusion Parameters:")
+            if 'alphas' in fusion_params and fusion_params['alphas']:
+                print(f"   Alpha (visibility):")
+                for name, alpha in fusion_params['alphas'].items():
+                    val = torch.sigmoid(alpha).item() if isinstance(alpha, torch.Tensor) else alpha
+                    print(f"     • {name}: {val:.4f}")
+            if 'betas' in fusion_params and fusion_params['betas']:
+                print(f"   Beta (cross-group):")
+                for name, beta in fusion_params['betas'].items():
+                    val = torch.sigmoid(beta).item() if isinstance(beta, torch.Tensor) else beta
+                    print(f"     • {name}: {val:.4f}")
+
+    return model
+
+
+# ============================================================================
+# LOCAL LOADING
+# ============================================================================
+
+def load_vae_lyra_local(
+        checkpoint_path: str,
+        config_path: Optional[str] = None,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        force_version: Optional[str] = None
+) -> torch.nn.Module:
+    """
+    Load VAE Lyra from local files.
+
+    Args:
+        checkpoint_path: Path to .pt or .safetensors file
+        config_path: Path to config.json (auto-discovers if None)
+        device: Device to load model on
+        force_version: Force specific version
+
+    Returns:
+        Loaded VAE Lyra model
+    """
+    checkpoint_path = Path(checkpoint_path)
+
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    # Find config
+    if config_path is None:
+        # Try common locations
+        candidates = [
+            checkpoint_path.parent / "config.json",
+            checkpoint_path.parent.parent / "config.json",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                config_path = candidate
+                break
+
+    if config_path is None or not Path(config_path).exists():
+        raise FileNotFoundError(f"Config not found. Searched: {candidates}")
+
+    print(f"🔍 Loading VAE Lyra from local files...")
+    print(f"   Checkpoint: {checkpoint_path}")
+    print(f"   Config: {config_path}")
+
+    with open(config_path) as f:
+        config_dict = json.load(f)
+
+    # Detect version
+    if force_version:
+        version = force_version
+    else:
+        version = detect_lyra_version(config_dict)
+    print(f"✓ Detected version: {version}")
+
+    # Load model
+    if version == "v1":
+        model = _load_vae_lyra_v1(config_dict, str(checkpoint_path), device)
+    else:
+        model = _load_vae_lyra_v2(config_dict, str(checkpoint_path), device)
 
     return model
 
@@ -449,72 +720,54 @@ def load_vae_lyra_v2(
 
 def get_model_info(repo_id: str) -> Dict[str, Any]:
     """
-    Get information about a VAE Lyra model without loading it.
+    Get information about a VAE Lyra model without loading weights.
 
     Args:
-        repo_id: HuggingFace repository ID
+        repo_id: HuggingFace repository ID or alias
 
     Returns:
         Dictionary with model information
     """
+    repo_id = resolve_repo_id(repo_id)
     print(f"🔍 Inspecting model: {repo_id}")
 
-    # Check registry first
     registry_info = get_known_model_info(repo_id)
-    if registry_info:
-        print(f"📋 Found in registry: {registry_info['description']}")
 
     # Download config
-    try:
-        config_path = hf_hub_download(
-            repo_id=repo_id,
-            filename="config.json",
-            repo_type="model"
-        )
-    except Exception as e:
-        raise ValueError(f"Could not download config from {repo_id}: {e}")
-
-    # Load config
+    config_path = hf_hub_download(repo_id=repo_id, filename="config.json", repo_type="model")
     with open(config_path) as f:
         config_dict = json.load(f)
 
-    # Detect version
     version = detect_lyra_version(config_dict, repo_id)
+    variant = detect_model_variant(config_dict, repo_id)
 
-    # Compile info
+    # Discover checkpoints
+    checkpoints = discover_checkpoints(repo_id)
+
     info = {
         'repo_id': repo_id,
         'version': version,
+        'variant': variant,
         'fusion_strategy': config_dict.get('fusion_strategy', 'unknown'),
         'modality_dims': config_dict.get('modality_dims', {}),
+        'modality_seq_lens': config_dict.get('modality_seq_lens', {}),
         'latent_dim': config_dict.get('latent_dim', 'unknown'),
         'has_adaptive_params': version == 'v2' and config_dict.get('fusion_strategy') == 'adaptive_cantor',
         'has_variable_seq_lens': 'modality_seq_lens' in config_dict,
         'has_binding_config': 'binding_config' in config_dict,
+        'available_checkpoints': checkpoints,
+        'config': config_dict,
     }
 
-    # Add registry info if available
     if registry_info:
         info['registry_description'] = registry_info['description']
         info['recommended_for'] = registry_info['recommended_for']
-
-    # Add v2-specific info
-    if version == 'v2':
-        info['modality_seq_lens'] = config_dict.get('modality_seq_lens', {})
-        info['binding_config'] = config_dict.get('binding_config', {})
-        info['alpha_init'] = config_dict.get('alpha_init', 'N/A')
-        info['beta_init'] = config_dict.get('beta_init', 'N/A')
 
     return info
 
 
 def print_model_info(repo_id: str):
-    """
-    Print formatted information about a VAE Lyra model.
-
-    Args:
-        repo_id: HuggingFace repository ID
-    """
+    """Print formatted information about a VAE Lyra model."""
     info = get_model_info(repo_id)
 
     print(f"\n{'=' * 80}")
@@ -522,6 +775,7 @@ def print_model_info(repo_id: str):
     print(f"{'=' * 80}")
     print(f"Repository: {info['repo_id']}")
     print(f"Version: {info['version']}")
+    print(f"Variant: {info['variant']}")
 
     if 'registry_description' in info:
         print(f"Description: {info['registry_description']}")
@@ -533,212 +787,85 @@ def print_model_info(repo_id: str):
 
     print(f"\nModalities:")
     for name, dim in info['modality_dims'].items():
-        print(f"  • {name}: {dim}d", end="")
-        if info['has_variable_seq_lens']:
-            seq_len = info['modality_seq_lens'].get(name, 'unknown')
-            print(f" @ {seq_len} tokens")
-        else:
-            print()
+        seq_len = info['modality_seq_lens'].get(name, 77)
+        print(f"  • {name}: {dim}d @ {seq_len} tokens")
 
-    if info['has_adaptive_params']:
-        print(f"\n🎯 Adaptive Parameters:")
-        print(f"  Alpha init: {info['alpha_init']}")
-        print(f"  Beta init: {info['beta_init']}")
-
-    if info['has_binding_config']:
-        print(f"\n🔗 Binding Configuration:")
-        for target, sources in info['binding_config'].items():
-            if sources:
-                print(f"  {target} ← {', '.join(f'{s} ({w})' for s, w in sources.items())}")
-            else:
-                print(f"  {target} (independent)")
+    if info['available_checkpoints']['weights']:
+        print(f"\n📦 Available Checkpoints (weights/):")
+        for ckpt in info['available_checkpoints']['weights'][:10]:
+            step = extract_step_from_filename(ckpt)
+            step_str = f" (step {step:,})" if step else ""
+            print(f"  • {ckpt}{step_str}")
+        if len(info['available_checkpoints']['weights']) > 10:
+            print(f"  ... and {len(info['available_checkpoints']['weights']) - 10} more")
 
     print(f"{'=' * 80}\n")
 
 
 # ============================================================================
-# COMPATIBILITY UTILITIES
+# CONVENIENCE FUNCTIONS
 # ============================================================================
 
-def convert_v1_to_v2_config(v1_config: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert a v1 config to v2 format (for migration/compatibility).
-
-    Args:
-        v1_config: v1 configuration dictionary
-
-    Returns:
-        v2-compatible configuration dictionary
-    """
-    v2_config = v1_config.copy()
-
-    # Add v2-specific defaults
-    if 'modality_seq_lens' not in v2_config:
-        # Create uniform sequence lengths based on seq_len
-        seq_len = v2_config.get('seq_len', 77)
-        modality_dims = v2_config.get('modality_dims', {})
-        v2_config['modality_seq_lens'] = {
-            name: seq_len for name in modality_dims.keys()
-        }
-
-    if 'binding_config' not in v2_config:
-        # Create empty binding config (all independent)
-        modality_dims = v2_config.get('modality_dims', {})
-        v2_config['binding_config'] = {
-            name: {} for name in modality_dims.keys()
-        }
-
-    if 'alpha_init' not in v2_config:
-        v2_config['alpha_init'] = 1.0
-
-    if 'beta_init' not in v2_config:
-        v2_config['beta_init'] = 0.3
-
-    if 'alpha_lr_scale' not in v2_config:
-        v2_config['alpha_lr_scale'] = 0.1
-
-    if 'beta_lr_scale' not in v2_config:
-        v2_config['beta_lr_scale'] = 1.0
-
-    if 'beta_alpha_regularization' not in v2_config:
-        v2_config['beta_alpha_regularization'] = 0.01
-
-    return v2_config
+def load_lyra_illustrious(
+        checkpoint: Optional[str] = None,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+) -> torch.nn.Module:
+    """Convenience function to load the Illustrious variant."""
+    return load_vae_lyra(
+        "AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious",
+        checkpoint=checkpoint,
+        device=device
+    )
 
 
-def is_compatible_checkpoint(model_state_dict: Dict[str, Any], config: Dict[str, Any]) -> Tuple[bool, str]:
-    """
-    Check if a checkpoint is compatible with a given config.
-
-    Args:
-        model_state_dict: Model state dictionary
-        config: Configuration dictionary
-
-    Returns:
-        (is_compatible, message)
-    """
-    # Check for v2-specific keys in state dict
-    has_alphas = any('alphas' in key for key in model_state_dict.keys())
-    has_betas = any('betas' in key for key in model_state_dict.keys())
-
-    version = detect_lyra_version(config)
-
-    if version == 'v2' and config.get('fusion_strategy') == 'adaptive_cantor':
-        if not (has_alphas and has_betas):
-            return False, "Config specifies adaptive_cantor but checkpoint lacks alpha/beta parameters"
-
-    if version == 'v1' and (has_alphas or has_betas):
-        return False, "Config is v1 but checkpoint contains v2 parameters (alpha/beta)"
-
-    return True, "Compatible"
+def load_lyra_xl(
+        checkpoint: Optional[str] = None,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+) -> torch.nn.Module:
+    """Convenience function to load the XL adaptive cantor variant."""
+    return load_vae_lyra(
+        "AbstractPhil/vae-lyra-xl-adaptive-cantor",
+        checkpoint=checkpoint,
+        device=device
+    )
 
 
 # ============================================================================
-# BATCH LOADING
-# ============================================================================
-
-def load_all_known_models(device: str = "cpu") -> Dict[str, torch.nn.Module]:
-    """
-    Load all known VAE Lyra models.
-
-    Args:
-        device: Device to load models on
-
-    Returns:
-        Dictionary of {repo_id: model}
-
-    Warning: This will download and load all models, which may take significant
-            time and memory.
-    """
-    print("🚀 Loading all known VAE Lyra models...")
-    print("⚠️  This may take several minutes and require significant memory.\n")
-
-    models = {}
-
-    for repo_id in KNOWN_MODELS.keys():
-        try:
-            print(f"\nLoading {repo_id}...")
-            model = load_vae_lyra(repo_id, device=device)
-            models[repo_id] = model
-            print(f"✓ Loaded {repo_id}")
-        except Exception as e:
-            print(f"✗ Failed to load {repo_id}: {e}")
-
-    print(f"\n✓ Successfully loaded {len(models)}/{len(KNOWN_MODELS)} models")
-    return models
-
-
-# ============================================================================
-# EXAMPLE USAGE
+# MAIN
 # ============================================================================
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("VAE Lyra Loader - Examples with Real Models")
+    print("VAE Lyra Loader - Examples")
     print("=" * 80)
 
-    # Example 1: List known models
-    print("\n[Example 1] List all known models:")
-    print("-" * 80)
+    # List known models
     list_known_models()
 
-    # Example 2: Get info for each model
-    print("\n[Example 2] Inspect each known model:")
+    # Example usage
+    print("\n📝 Usage Examples:")
     print("-" * 80)
+    print("""
+    from geofractal.model.vae.loader import load_vae_lyra, load_lyra_illustrious
 
-    for repo_id in KNOWN_MODELS.keys():
-        try:
-            print_model_info(repo_id)
-        except Exception as e:
-            print(f"⚠️  Could not load info for {repo_id}: {e}\n")
+    # Auto-detect and load best checkpoint
+    model = load_vae_lyra("AbstractPhil/vae-lyra-xl-adaptive-cantor-illustrious")
 
-    # Example 3: Load specific models
-    print("\n[Example 3] Load specific models:")
-    print("-" * 80)
+    # Use alias
+    model = load_vae_lyra("lyra-illustrious")
 
-    models_to_try = [
-        "AbstractPhil/vae-lyra",
-        "AbstractPhil/vae-lyra-sdxl-t5xl",
-        "AbstractPhil/vae-lyra-xl-adaptive-cantor"
-    ]
+    # Load specific checkpoint
+    model = load_vae_lyra("lyra-illustrious", checkpoint="lyra_step_9000.safetensors")
 
-    for repo_id in models_to_try:
-        try:
-            print(f"\nLoading {repo_id}...")
-            model = load_vae_lyra(repo_id, device="cpu")
-            print(f"✓ Successfully loaded: {type(model).__name__}")
+    # Convenience function
+    model = load_lyra_illustrious()
 
-            # Show some model details
-            total_params = sum(p.numel() for p in model.parameters())
-            print(f"✓ Total parameters: {total_params:,}")
+    # Get model info without loading weights
+    from geofractal.model.vae.loader import print_model_info
+    print_model_info("lyra-illustrious")
 
-        except Exception as e:
-            print(f"✗ Failed: {e}")
-            print("   (This is expected if the model hasn't been uploaded yet)")
-
-    # Example 4: Compare models
-    print("\n[Example 4] Compare model architectures:")
-    print("-" * 80)
-
-    print(f"\n{'Model':<45} {'Version':<8} {'Modalities':<8} {'Latent Dim':<12}")
-    print("-" * 80)
-
-    for repo_id, info in KNOWN_MODELS.items():
-        short_name = repo_id.split('/')[-1]
-        version = info['version']
-        num_mods = len(info['modalities'])
-        latent = info['latent_dim']
-        print(f"{short_name:<45} {version:<8} {num_mods:<8} {latent:<12}")
-
-    print("\n" + "=" * 80)
-    print("✨ VAE Lyra Loader ready for use!")
-    print("\nQuick start:")
-    print("  from geofractal.model.vae.loader import load_vae_lyra, list_known_models")
-    print("  ")
-    print("  # See what's available")
-    print("  list_known_models()")
-    print("  ")
-    print("  # Load a model")
-    print("  model = load_vae_lyra('AbstractPhil/vae-lyra-xl-adaptive-cantor')")
-    print("  model.eval()")
+    # Load from local files
+    from geofractal.model.vae.loader import load_vae_lyra_local
+    model = load_vae_lyra_local("./weights/lyra_best.safetensors", config_path="./config.json")
+    """)
     print("=" * 80)
