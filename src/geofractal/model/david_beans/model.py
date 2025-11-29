@@ -464,6 +464,7 @@ class CrystalProjectionHead(nn.Module):
         crystal_dim: int,
         use_belly: bool = True,
         belly_expand: float = 2.0,
+        dropout: float = 0.1,
         temperature: float = 0.07
     ):
         super().__init__()
@@ -475,7 +476,7 @@ class CrystalProjectionHead(nn.Module):
             self.projection = nn.Sequential(
                 nn.Linear(input_dim, belly_dim),
                 nn.GELU(),
-                nn.Dropout(0.1),
+                nn.Dropout(dropout),
                 nn.Linear(belly_dim, crystal_dim, bias=False)
             )
         else:
@@ -509,6 +510,7 @@ class MultiScaleCrystalHead(nn.Module):
                 crystal_dim=scale,
                 use_belly=config.use_belly,
                 belly_expand=config.belly_expand,
+                dropout=config.dropout,
                 temperature=config.contrast_temperature
             )
             for scale in config.scales
@@ -528,8 +530,8 @@ class MultiScaleCrystalHead(nn.Module):
         features: torch.Tensor,
         anchors_dict: Dict[int, torch.Tensor]
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
-        B = features.shape[0]
-        num_classes = anchors_dict[self.scales[0]].shape[0]
+        #B = features.shape[0]
+        #num_classes = anchors_dict[self.scales[0]].shape[0]
 
         # Process all scales (can't batch due to different dims)
         scale_logits = []
