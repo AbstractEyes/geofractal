@@ -1,6 +1,9 @@
 """
 DavidBeans Optimized: Vectorized Operations
 ============================================
+geofractal.model.david_beans.model
+============================================
+
 
 Key optimizations:
 1. PentachoronExpertLayer: chunk-based parallel processing
