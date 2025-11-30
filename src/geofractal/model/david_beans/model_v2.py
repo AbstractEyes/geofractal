@@ -8,13 +8,20 @@ Key upgrades from V1:
 3. WormholeTessellationExpert: Tiles connect via learned wormholes
 4. Proper gradient flow through all routing decisions
 
+V2.1 Additions:
+- Configurable belly depth with residual connections
+- Scale weighting modes (balanced, geometric, top_heavy, learned)
+- Redundant multiscale with theta differentiation
+- Collective shared space option with fingerprint masks
+- Conv spine for persistent spatial coherence
+
 Based on experimental validation:
 - Permutation recovery: 100% routing accuracy
 - Patch matching: 99.6% correspondence learning
 - Key insight: When routing IS necessary, routing learns structure
 
 Author: AbstractPhil
-Date: November 29, 2025
+Date: November 30, 2025
 """
 
 import torch
@@ -54,11 +61,33 @@ class DavidBeansV2Config:
     num_tiles: int = 16  # Feature-dim tessellation
     tile_wormholes: int = 4  # Cross-tile connections
 
-    # Crystal head
+    # Crystal head - scales
     scales: List[int] = field(default_factory=lambda: [64, 128, 256, 384, 512])
     num_classes: int = 100
+
+    # Crystal head - belly configuration
     use_belly: bool = True
     belly_expand: float = 2.0
+    belly_layers: int = 2  # Number of layers in belly (2-4)
+    belly_residual: bool = False  # Use residual connections in deep belly
+
+    # Crystal head - scale weighting
+    weighting_mode: str = "learned"  # "balanced", "geometric", "top_heavy", "learned"
+    scale_weight_floor: float = 0.1  # Minimum weight per scale (prevents collapse)
+
+    # Crystal head - redundant scales
+    scale_copies: Optional[List[int]] = None  # e.g., [2, 1, 1, 1, 1] for 2 copies of first scale
+    copy_theta_step: float = 0.15  # Theta rotation between copies
+
+    # Crystal head - collective mode
+    use_collective: bool = False  # Use shared anchor space with pad/mask
+    collective_temperature: float = 0.07
+
+    # Conv spine
+    use_spine: bool = False
+    spine_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
+    spine_cross_attn: bool = True  # Per-layer cross-attention to spine
+    spine_gate_init: float = 0.0  # Initial gate value (0 = start gated off)
 
     # Loss weights
     contrast_temperature: float = 0.07
@@ -80,6 +109,17 @@ class DavidBeansV2Config:
     @property
     def tile_dim(self) -> int:
         return self.dim // self.num_tiles
+
+    def __post_init__(self):
+        """Validate configuration."""
+        assert self.dim % self.num_tiles == 0, \
+            f"dim ({self.dim}) must be divisible by num_tiles ({self.num_tiles})"
+        assert self.dim % self.num_heads == 0, \
+            f"dim ({self.dim}) must be divisible by num_heads ({self.num_heads})"
+        assert self.weighting_mode in ["balanced", "geometric", "top_heavy", "learned"], \
+            f"Invalid weighting_mode: {self.weighting_mode}"
+        assert 2 <= self.belly_layers <= 4, \
+            f"belly_layers must be 2-4, got {self.belly_layers}"
 
 
 # ============================================================================
@@ -281,6 +321,69 @@ class LearnedWormholeRouter(nn.Module):
 
 
 # ============================================================================
+# CONV SPINE - Persistent Spatial Coherence
+# ============================================================================
+
+class ConvSpine(nn.Module):
+    """
+    Persistent wide conv pathway that runs parallel to transformer.
+    Provides spatial coherence that patches can't forget.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        spine_channels: List[int] = [64, 128, 256],
+        output_dim: int = 512,
+    ):
+        super().__init__()
+        self.output_dim = output_dim
+
+        # Progressive conv stages (maintains spatial structure)
+        self.stages = nn.ModuleList()
+        ch_in = in_channels
+
+        for ch_out in spine_channels:
+            self.stages.append(nn.Sequential(
+                nn.Conv2d(ch_in, ch_out, 3, padding=1),
+                nn.BatchNorm2d(ch_out),
+                nn.GELU(),
+                nn.Conv2d(ch_out, ch_out, 3, padding=1),
+                nn.BatchNorm2d(ch_out),
+                nn.GELU(),
+            ))
+            ch_in = ch_out
+
+        # Final projection to match transformer dim
+        self.proj = nn.Conv2d(spine_channels[-1], output_dim, 1)
+
+        # Learnable spatial pooling (keeps gradient flow)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns:
+            spine_global: [B, D] global conv features
+            spine_tokens: [B, H*W, D] flattened spatial features for cross-attn
+        """
+        for stage in self.stages:
+            x = stage(x)
+            x = F.max_pool2d(x, 2)  # Downsample
+
+        # Final projection
+        x = self.proj(x)  # [B, D, H', W']
+
+        # Global feature
+        spine_global = self.pool(x).flatten(1)  # [B, D]
+
+        # Flatten for cross-attention: [B, D, H, W] -> [B, H*W, D]
+        B, D, H, W = x.shape
+        spine_tokens = x.flatten(2).transpose(1, 2)  # [B, H*W, D]
+
+        return spine_global, spine_tokens
+
+
+# ============================================================================
 # WORMHOLE ATTENTION BLOCK
 # ============================================================================
 
@@ -290,6 +393,7 @@ class WormholeAttentionBlock(nn.Module):
 
     CLS token: Dense attention to all patches
     Patches: Sparse attention via learned wormholes
+    Optional: Cross-attention to conv spine features
     """
 
     def __init__(
@@ -301,7 +405,9 @@ class WormholeAttentionBlock(nn.Module):
             temperature: float = 0.1,
             mode: str = "hybrid",
             mlp_ratio: float = 4.0,
-            dropout: float = 0.1
+            dropout: float = 0.1,
+            use_spine_cross_attn: bool = False,
+            spine_gate_init: float = 0.0
     ):
         super().__init__()
         self.dim = dim
@@ -310,6 +416,7 @@ class WormholeAttentionBlock(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.num_patches = num_patches
         self.num_wormholes = num_wormholes
+        self.use_spine_cross_attn = use_spine_cross_attn
 
         # Wormhole router
         self.router = LearnedWormholeRouter(
@@ -340,9 +447,19 @@ class WormholeAttentionBlock(nn.Module):
         self.attn_drop = nn.Dropout(dropout)
         self.proj_drop = nn.Dropout(dropout)
 
+        # Spine cross-attention (optional)
+        if use_spine_cross_attn:
+            self.spine_cross_attn = nn.MultiheadAttention(
+                dim, num_heads=max(1, num_heads // 2),
+                batch_first=True, dropout=dropout
+            )
+            self.spine_norm = nn.LayerNorm(dim)
+            self.spine_gate = nn.Parameter(torch.ones(1) * spine_gate_init)
+
     def forward(
             self,
             x: torch.Tensor,
+            spine_tokens: Optional[torch.Tensor] = None,
             return_routing: bool = False
     ) -> Tuple[torch.Tensor, Optional[Dict]]:
         B, S, D = x.shape
@@ -393,8 +510,18 @@ class WormholeAttentionBlock(nn.Module):
         out = torch.cat([out_cls, out_patches], dim=2)
         out = self.proj_drop(self.proj(out.transpose(1, 2).reshape(B, S, D)))
 
-        # Residual + MLP
+        # Residual
         x = x + out
+
+        # === SPINE CROSS-ATTENTION (optional) ===
+        if self.use_spine_cross_attn and spine_tokens is not None:
+            x_norm_spine = self.spine_norm(x)
+            spine_context, _ = self.spine_cross_attn(
+                x_norm_spine, spine_tokens, spine_tokens
+            )
+            x = x + torch.sigmoid(self.spine_gate) * spine_context
+
+        # MLP
         x = x + self.mlp(self.norm2(x))
 
         if return_routing:
@@ -497,11 +624,138 @@ class WormholeTessellationExpert(nn.Module):
 
 
 # ============================================================================
+# CONFIGURABLE BELLY PROJECTION
+# ============================================================================
+
+class ConfigurableBelly(nn.Module):
+    """
+    Multi-layer belly projection with optional residual connections.
+
+    Supports 2-4 layers with configurable expansion and residual.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        expand: float = 2.0,
+        num_layers: int = 2,
+        use_residual: bool = False,
+        dropout: float = 0.1
+    ):
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.num_layers = num_layers
+        self.use_residual = use_residual
+
+        belly_dim = int(output_dim * expand)
+
+        layers = []
+
+        if num_layers == 2:
+            # Standard: input -> belly -> output
+            layers = [
+                nn.Linear(input_dim, belly_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(belly_dim, output_dim, bias=False)
+            ]
+        elif num_layers == 3:
+            # input -> belly -> belly -> output
+            layers = [
+                nn.Linear(input_dim, belly_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(belly_dim, belly_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(belly_dim, output_dim, bias=False)
+            ]
+        elif num_layers == 4:
+            # input -> belly -> belly -> belly -> output
+            layers = [
+                nn.Linear(input_dim, belly_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(belly_dim, belly_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(belly_dim, belly_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(belly_dim, output_dim, bias=False)
+            ]
+
+        self.layers = nn.Sequential(*layers)
+
+        # Residual projection if dimensions differ and residual enabled
+        if use_residual and input_dim != output_dim:
+            self.residual_proj = nn.Linear(input_dim, output_dim, bias=False)
+        else:
+            self.residual_proj = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.layers(x)
+
+        if self.use_residual:
+            if self.residual_proj is not None:
+                out = out + self.residual_proj(x)
+            elif self.input_dim == self.output_dim:
+                out = out + x
+
+        return out
+
+
+# ============================================================================
+# CANTOR FINGERPRINT UTILITIES
+# ============================================================================
+
+def compute_cantor_fingerprint(
+    active_dim: int,
+    max_dim: int,
+    theta: float = 0.0
+) -> torch.Tensor:
+    """
+    Compute unique fingerprint mask with theta rotation.
+    Prevents redundant scales from learning identical representations.
+
+    Args:
+        active_dim: Active dimension for this scale
+        max_dim: Maximum scale dimension (for padding)
+        theta: Rotation angle for differentiation
+
+    Returns:
+        fingerprint: [max_dim] soft mask
+    """
+    positions = torch.arange(max_dim).float()
+
+    # Cantor pairing for base pattern
+    grid_size = int(max_dim ** 0.5) + 1
+    x = positions % grid_size
+    y = positions // grid_size
+    cantor_z = ((x + y) * (x + y + 1)) / 2 + y
+    cantor_z = cantor_z / cantor_z.max().clamp(min=1)
+
+    # Theta rotation (unique per copy)
+    rotated = cantor_z * math.cos(theta) + (positions / max_dim) * math.sin(theta)
+
+    # Create soft mask: active region = 1, padded = decay
+    mask = torch.zeros(max_dim)
+    mask[:active_dim] = 1.0
+
+    # Blend: fingerprint modulates the mask
+    fingerprint = mask * (0.5 + 0.5 * torch.tanh(rotated))
+
+    return fingerprint
+
+
+# ============================================================================
 # MULTI-SCALE CRYSTAL HEAD
 # ============================================================================
 
 class CrystalProjectionHead(nn.Module):
-    """Single scale projection head."""
+    """Single scale projection head with configurable belly."""
 
     def __init__(
             self,
@@ -509,59 +763,152 @@ class CrystalProjectionHead(nn.Module):
             crystal_dim: int,
             use_belly: bool = True,
             belly_expand: float = 2.0,
+            belly_layers: int = 2,
+            belly_residual: bool = False,
             dropout: float = 0.1,
-            temperature: float = 0.07
+            temperature: float = 0.07,
+            theta: float = 0.0,  # For redundant scale differentiation
+            copy_index: int = 0  # Which copy this is (0 = primary)
     ):
         super().__init__()
         self.crystal_dim = crystal_dim
         self.temperature = temperature
+        self.theta = theta
+        self.copy_index = copy_index
 
         if use_belly:
-            belly_dim = int(crystal_dim * belly_expand)
-            self.projection = nn.Sequential(
-                nn.Linear(input_dim, belly_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(belly_dim, crystal_dim, bias=False)
+            self.projection = ConfigurableBelly(
+                input_dim=input_dim,
+                output_dim=crystal_dim,
+                expand=belly_expand,
+                num_layers=belly_layers,
+                use_residual=belly_residual,
+                dropout=dropout
             )
         else:
             self.projection = nn.Linear(input_dim, crystal_dim, bias=False)
 
+        # Learnable fingerprint for redundant copies
+        if theta != 0.0:
+            fingerprint = compute_cantor_fingerprint(crystal_dim, crystal_dim, theta)
+            self.register_buffer('fingerprint', fingerprint)
+        else:
+            self.fingerprint = None
+
     def forward(self, features: torch.Tensor, anchors: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = F.normalize(self.projection(features), dim=-1)
+        z = self.projection(features)
+
+        # Apply fingerprint modulation for redundant copies
+        if self.fingerprint is not None:
+            z = z * self.fingerprint.unsqueeze(0)
+
+        z = F.normalize(z, dim=-1)
         anchors_norm = F.normalize(anchors, dim=-1)
         logits = torch.mm(z, anchors_norm.T) / self.temperature
         return logits, z
 
 
 class MultiScaleCrystalHead(nn.Module):
-    """Multi-scale projection with learned fusion."""
+    """
+    Multi-scale projection with learned fusion.
+
+    Supports:
+    - Multiple weighting modes (balanced, geometric, top_heavy, learned)
+    - Redundant scales with theta differentiation
+    - Collective shared space option
+    """
 
     def __init__(self, config: DavidBeansV2Config):
         super().__init__()
         self.config = config
         self.scales = config.scales
-        self.num_scales = len(config.scales)
+        self.num_base_scales = len(config.scales)
+        self.weighting_mode = config.weighting_mode
+        self.scale_weight_floor = config.scale_weight_floor
 
-        self.heads = nn.ModuleList([
-            CrystalProjectionHead(
-                input_dim=config.dim,
-                crystal_dim=scale,
-                use_belly=config.use_belly,
-                belly_expand=config.belly_expand,
-                dropout=config.dropout,
-                temperature=config.contrast_temperature
+        # Handle redundant scale copies
+        scale_copies = config.scale_copies or [1] * len(config.scales)
+        assert len(scale_copies) == len(config.scales), \
+            f"scale_copies length ({len(scale_copies)}) must match scales length ({len(config.scales)})"
+
+        # Build heads (including copies)
+        self.heads = nn.ModuleList()
+        self.head_scale_map = []  # Maps head index to (scale, copy_index)
+
+        for scale_idx, scale in enumerate(config.scales):
+            num_copies = scale_copies[scale_idx]
+            for copy_idx in range(num_copies):
+                theta = copy_idx * config.copy_theta_step
+
+                head = CrystalProjectionHead(
+                    input_dim=config.dim,
+                    crystal_dim=scale,
+                    use_belly=config.use_belly,
+                    belly_expand=config.belly_expand,
+                    belly_layers=config.belly_layers,
+                    belly_residual=config.belly_residual,
+                    dropout=config.dropout,
+                    temperature=config.contrast_temperature,
+                    theta=theta,
+                    copy_index=copy_idx
+                )
+                self.heads.append(head)
+                self.head_scale_map.append((scale, copy_idx))
+
+        self.num_heads = len(self.heads)
+
+        # Compute fixed scale weights based on mode
+        if config.weighting_mode == "learned":
+            # Learned fusion network
+            self.fusion = nn.Sequential(
+                nn.Linear(config.dim, config.dim // 2),
+                nn.LayerNorm(config.dim // 2),
+                nn.GELU(),
+                nn.Dropout(config.dropout),
+                nn.Linear(config.dim // 2, self.num_heads)
             )
-            for scale in config.scales
-        ])
+            self.fixed_weights = None
+        else:
+            self.fusion = None
+            self.fixed_weights = self._compute_fixed_weights(config.weighting_mode, scale_copies)
 
-        self.fusion = nn.Sequential(
-            nn.Linear(config.dim, config.dim // 2),
-            nn.LayerNorm(config.dim // 2),
-            nn.GELU(),
-            nn.Dropout(config.dropout),
-            nn.Linear(config.dim // 2, self.num_scales)
-        )
+    def _compute_fixed_weights(
+        self,
+        mode: str,
+        scale_copies: List[int]
+    ) -> torch.Tensor:
+        """Compute fixed scale weights based on weighting mode."""
+        weights = []
+
+        for scale_idx, scale in enumerate(self.scales):
+            num_copies = scale_copies[scale_idx]
+
+            if mode == "balanced":
+                base_weight = 1.0
+            elif mode == "geometric":
+                # Larger scales get more weight
+                base_weight = 2.0 ** (scale_idx / (self.num_base_scales - 1))
+            elif mode == "top_heavy":
+                # Only top scales get significant weight
+                if scale_idx >= self.num_base_scales - 2:
+                    base_weight = 1.5
+                else:
+                    base_weight = 0.5
+            else:
+                base_weight = 1.0
+
+            # Distribute weight among copies
+            copy_weight = base_weight / num_copies
+            for _ in range(num_copies):
+                weights.append(copy_weight)
+
+        weights = torch.tensor(weights, dtype=torch.float32)
+
+        # Apply floor and normalize
+        weights = weights.clamp(min=self.scale_weight_floor)
+        weights = weights / weights.sum()
+
+        return weights
 
     def forward(
             self,
@@ -569,15 +916,23 @@ class MultiScaleCrystalHead(nn.Module):
             anchors_dict: Dict[int, torch.Tensor]
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
 
-        # Pre-compute fusion weights once
-        fusion_weights = F.softmax(self.fusion(features), dim=-1)
+        # Compute fusion weights
+        if self.fusion is not None:
+            fusion_weights = F.softmax(self.fusion(features), dim=-1)
+            # Apply floor
+            fusion_weights = fusion_weights.clamp(min=self.scale_weight_floor)
+            fusion_weights = fusion_weights / fusion_weights.sum(dim=-1, keepdim=True)
+        else:
+            # Use fixed weights, expand for batch
+            fusion_weights = self.fixed_weights.to(features.device).unsqueeze(0).expand(features.shape[0], -1)
 
-        # Process scales - preallocate lists
-        scale_logits = [None] * self.num_scales
-        scale_features = [None] * self.num_scales
+        # Process all heads
+        scale_logits = [None] * self.num_heads
+        scale_features = [None] * self.num_heads
 
-        for i, scale in enumerate(self.scales):
-            scale_logits[i], scale_features[i] = self.heads[i](features, anchors_dict[scale])
+        for i, head in enumerate(self.heads):
+            scale, copy_idx = self.head_scale_map[i]
+            scale_logits[i], scale_features[i] = head(features, anchors_dict[scale])
 
         # Fused weighted combination
         stacked_logits = torch.stack(scale_logits, dim=1)
@@ -587,15 +942,123 @@ class MultiScaleCrystalHead(nn.Module):
 
 
 # ============================================================================
-# DAVIDBEANS V2 BACKBONE
+# COLLECTIVE CRYSTAL HEAD (Alternative Mode)
 # ============================================================================
 
-class BeansBackboneV2(nn.Module):
-    """Backbone with wormhole routing throughout."""
+class CollectiveCrystalHead(nn.Module):
+    """
+    Collective multi-scale head with shared anchor space.
+
+    All scales project to max_scale dimension with pad/mask,
+    competing in shared space with fingerprint differentiation.
+    """
 
     def __init__(self, config: DavidBeansV2Config):
         super().__init__()
         self.config = config
+        self.scales = config.scales
+        self.max_scale = max(config.scales)
+        self.num_scales = len(config.scales)
+
+        # Per-scale projections (to active subspace)
+        self.projections = nn.ModuleList()
+        self.fingerprints = nn.ParameterList()
+        self.weight_biases = nn.ParameterList()
+
+        for i, scale in enumerate(config.scales):
+            theta = i * config.copy_theta_step
+
+            if config.use_belly:
+                proj = ConfigurableBelly(
+                    input_dim=config.dim,
+                    output_dim=scale,
+                    expand=config.belly_expand,
+                    num_layers=config.belly_layers,
+                    use_residual=config.belly_residual,
+                    dropout=config.dropout
+                )
+            else:
+                proj = nn.Linear(config.dim, scale, bias=False)
+
+            self.projections.append(proj)
+
+            # Cantor fingerprint mask
+            fingerprint = compute_cantor_fingerprint(scale, self.max_scale, theta)
+            self.fingerprints.append(nn.Parameter(fingerprint, requires_grad=True))
+
+            # Weight bias scalar (like GeoDavid)
+            self.weight_biases.append(nn.Parameter(torch.ones(1)))
+
+        # Learnable fusion weights
+        self.fusion_weights = nn.Parameter(torch.ones(self.num_scales) / self.num_scales)
+
+    def forward(
+        self,
+        features: torch.Tensor,
+        anchors: torch.Tensor  # Single shared anchor: [num_classes, max_scale]
+    ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+        B = features.shape[0]
+
+        scale_outputs = []
+        scale_logits = []
+
+        for i, (proj, fingerprint, bias) in enumerate(
+            zip(self.projections, self.fingerprints, self.weight_biases)
+        ):
+            # Project to active subspace
+            z_active = proj(features)  # [B, active_dim]
+            z_active = F.normalize(z_active, dim=-1)
+
+            # Pad to max_scale
+            z_padded = F.pad(z_active, (0, self.max_scale - z_active.shape[-1]))
+
+            # Apply fingerprint mask
+            z_masked = z_padded * fingerprint.unsqueeze(0)
+
+            # Apply weight bias
+            z_biased = z_masked * bias
+
+            scale_outputs.append(z_biased)
+
+            # Compute logits against shared anchors
+            anchors_norm = F.normalize(anchors, dim=-1)
+            logits = torch.mm(z_biased, anchors_norm.T) / self.config.collective_temperature
+            scale_logits.append(logits)
+
+        # Stack for collective processing
+        stacked = torch.stack(scale_outputs, dim=1)  # [B, num_scales, max_scale]
+
+        # Fusion with learned weights
+        fusion = F.softmax(self.fusion_weights, dim=0)
+        fusion_expanded = fusion.unsqueeze(0).expand(B, -1)
+
+        # Combined logits
+        stacked_logits = torch.stack(scale_logits, dim=1)  # [B, num_scales, num_classes]
+        combined = torch.einsum('bs,bsc->bc', fusion_expanded, stacked_logits)
+
+        return combined, scale_logits, scale_outputs, fusion_expanded
+
+
+# ============================================================================
+# DAVIDBEANS V2 BACKBONE
+# ============================================================================
+
+class BeansBackboneV2(nn.Module):
+    """Backbone with wormhole routing throughout and optional conv spine."""
+
+    def __init__(self, config: DavidBeansV2Config):
+        super().__init__()
+        self.config = config
+
+        # Conv spine (optional)
+        if config.use_spine:
+            self.spine = ConvSpine(
+                in_channels=config.in_channels,
+                spine_channels=config.spine_channels,
+                output_dim=config.dim
+            )
+        else:
+            self.spine = None
 
         # Patch embedding
         self.patch_embed = nn.Conv2d(
@@ -625,7 +1088,9 @@ class BeansBackboneV2(nn.Module):
                     temperature=config.wormhole_temperature,
                     mode=config.wormhole_mode,
                     mlp_ratio=config.mlp_ratio,
-                    dropout=config.dropout
+                    dropout=config.dropout,
+                    use_spine_cross_attn=config.use_spine and config.spine_cross_attn,
+                    spine_gate_init=config.spine_gate_init
                 )
             )
             self.expert_layers.append(
@@ -644,8 +1109,14 @@ class BeansBackboneV2(nn.Module):
             self,
             x: torch.Tensor,
             return_routing: bool = False
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[Dict]]]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[List[Dict]], Optional[torch.Tensor]]:
         B = x.shape[0]
+
+        # Compute spine features (if enabled)
+        spine_global = None
+        spine_tokens = None
+        if self.spine is not None:
+            spine_global, spine_tokens = self.spine(x)
 
         # Patch embed
         x = self.patch_embed(x).flatten(2).transpose(1, 2)
@@ -654,11 +1125,15 @@ class BeansBackboneV2(nn.Module):
         x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
         x = self.dropout(x + self.pos_embed)
 
+        # Optionally inject spine global into CLS
+        if spine_global is not None:
+            x[:, 0] = x[:, 0] + spine_global
+
         # Process layers
         all_routing = [] if return_routing else None
 
         for attn_block, expert_layer in zip(self.attention_blocks, self.expert_layers):
-            x, attn_routing = attn_block(x, return_routing=return_routing)
+            x, attn_routing = attn_block(x, spine_tokens=spine_tokens, return_routing=return_routing)
             x, expert_routing = expert_layer(x, return_routing=return_routing)
 
             if return_routing:
@@ -672,7 +1147,7 @@ class BeansBackboneV2(nn.Module):
         # Pool
         features = x[:, 0] if self.config.pooling == "cls" else x[:, 1:].mean(dim=1)
 
-        return features, x, all_routing
+        return features, x, all_routing, spine_global
 
 
 # ============================================================================
@@ -687,6 +1162,13 @@ class DavidBeansV2(nn.Module):
     - Learned content-aware routing (not fixed Cantor)
     - Wormhole connections in both attention and tessellation
     - Gradient flow through all routing decisions
+
+    V2.1 additions:
+    - Configurable belly depth with residual
+    - Multiple scale weighting modes
+    - Redundant scales with theta differentiation
+    - Optional conv spine for spatial coherence
+    - Optional collective shared space mode
     """
 
     def __init__(self, config: DavidBeansV2Config):
@@ -694,15 +1176,25 @@ class DavidBeansV2(nn.Module):
         self.config = config
 
         self.backbone = BeansBackboneV2(config)
-        self.head = MultiScaleCrystalHead(config)
 
-        # Crystal anchors
-        self.anchors = nn.ParameterDict({
-            str(scale): nn.Parameter(torch.randn(config.num_classes, scale) * 0.02)
-            for scale in config.scales
-        })
+        # Choose head type based on config
+        if config.use_collective:
+            self.head = CollectiveCrystalHead(config)
+            # Single shared anchor space
+            self.anchors = nn.ParameterDict({
+                'shared': nn.Parameter(torch.randn(config.num_classes, max(config.scales)) * 0.02)
+            })
+        else:
+            self.head = MultiScaleCrystalHead(config)
+            # Per-scale anchors
+            self.anchors = nn.ParameterDict({
+                str(scale): nn.Parameter(torch.randn(config.num_classes, scale) * 0.02)
+                for scale in config.scales
+            })
 
     def get_anchors_dict(self) -> Dict[int, torch.Tensor]:
+        if self.config.use_collective:
+            return self.anchors['shared']
         return {int(k): v for k, v in self.anchors.items()}
 
     def forward(
@@ -714,14 +1206,14 @@ class DavidBeansV2(nn.Module):
     ) -> Dict[str, torch.Tensor]:
 
         # Backbone
-        features, all_tokens, routing_info = self.backbone(
+        features, all_tokens, routing_info, spine_global = self.backbone(
             x, return_routing=return_routing
         )
 
         # Head
-        anchors_dict = self.get_anchors_dict()
+        anchors = self.get_anchors_dict()
         combined_logits, scale_logits, scale_features, fusion_weights = self.head(
-            features, anchors_dict
+            features, anchors
         )
 
         result = {
@@ -732,35 +1224,59 @@ class DavidBeansV2(nn.Module):
             'fusion_weights': fusion_weights
         }
 
+        if spine_global is not None:
+            result['spine_features'] = spine_global
+
         if return_routing:
             result['routing'] = routing_info
 
         if return_loss and targets is not None:
-            losses = {}
-
-            # CE loss
-            losses['ce'] = F.cross_entropy(combined_logits, targets)
-
-            # Per-scale CE
-            for i, (scale, logits) in enumerate(zip(self.config.scales, scale_logits)):
-                losses[f'ce_{scale}'] = F.cross_entropy(logits, targets)
-
-            # Contrastive losses
-            patch_tokens = all_tokens[:, 1:, :]
-            contrast_loss = self._compute_contrast_loss(
-                patch_tokens, scale_features, anchors_dict, targets
+            losses = self._compute_losses(
+                combined_logits, scale_logits, scale_features,
+                all_tokens, anchors, targets
             )
-            losses['contrast'] = contrast_loss
-
-            # Total
-            losses['total'] = (
-                    losses['ce'] +
-                    self.config.contrast_weight * contrast_loss
-            )
-
             result['losses'] = losses
 
         return result
+
+    def _compute_losses(
+        self,
+        combined_logits: torch.Tensor,
+        scale_logits: List[torch.Tensor],
+        scale_features: List[torch.Tensor],
+        all_tokens: torch.Tensor,
+        anchors: Dict[int, torch.Tensor],
+        targets: torch.Tensor
+    ) -> Dict[str, torch.Tensor]:
+        """Compute all loss components."""
+        losses = {}
+
+        # CE loss on combined logits
+        losses['ce'] = F.cross_entropy(combined_logits, targets)
+
+        # Per-scale CE (for logging)
+        for i, logits in enumerate(scale_logits):
+            scale, copy_idx = self.head.head_scale_map[i] if hasattr(self.head, 'head_scale_map') else (self.config.scales[i], 0)
+            key = f'ce_{scale}' if copy_idx == 0 else f'ce_{scale}_c{copy_idx}'
+            losses[key] = F.cross_entropy(logits, targets)
+
+        # Contrastive loss
+        if not self.config.use_collective:
+            patch_tokens = all_tokens[:, 1:, :]
+            contrast_loss = self._compute_contrast_loss(
+                patch_tokens, scale_features, anchors, targets
+            )
+            losses['contrast'] = contrast_loss
+        else:
+            losses['contrast'] = torch.tensor(0.0, device=combined_logits.device)
+
+        # Total loss
+        losses['total'] = (
+            losses['ce'] +
+            self.config.contrast_weight * losses['contrast']
+        )
+
+        return losses
 
     def _compute_contrast_loss(
             self,
@@ -771,25 +1287,32 @@ class DavidBeansV2(nn.Module):
     ) -> torch.Tensor:
         """Batched contrastive loss across scales."""
         device = patch_features.device
-        num_scales = len(self.config.scales)
 
-        # Stack scale features and anchors for batched computation where possible
         total_loss = torch.tensor(0.0, device=device)
+        num_primary_scales = 0
 
-        for scale, scale_feat in zip(self.config.scales, scale_features):
-            anchors = anchors_dict[scale]
-            scale_feat_norm = F.normalize(scale_feat, dim=-1)
-            anchors_norm = F.normalize(anchors, dim=-1)
+        for i, scale_feat in enumerate(scale_features):
+            scale, copy_idx = self.head.head_scale_map[i] if hasattr(self.head, 'head_scale_map') else (self.config.scales[i], 0)
 
-            # Anchor contrastive
-            logits = torch.mm(scale_feat_norm, anchors_norm.T) / self.config.contrast_temperature
-            total_loss = total_loss + F.cross_entropy(logits, targets)
+            # Only compute contrast for primary copies
+            if copy_idx == 0:
+                anchors = anchors_dict[scale]
+                scale_feat_norm = F.normalize(scale_feat, dim=-1)
+                anchors_norm = F.normalize(anchors, dim=-1)
 
-        return total_loss / num_scales
+                logits = torch.mm(scale_feat_norm, anchors_norm.T) / self.config.contrast_temperature
+                total_loss = total_loss + F.cross_entropy(logits, targets)
+                num_primary_scales += 1
+
+        return total_loss / max(num_primary_scales, 1)
 
     def get_model_info(self) -> Dict:
+        # Count total heads including copies
+        num_heads = len(self.head.heads) if hasattr(self.head, 'heads') else len(self.config.scales)
+
         return {
             'name': 'DavidBeans-V2-Wormhole',
+            'version': '2.1',
             'image_size': self.config.image_size,
             'patch_size': self.config.patch_size,
             'dim': self.config.dim,
@@ -800,6 +1323,13 @@ class DavidBeansV2(nn.Module):
             'tile_wormholes': self.config.tile_wormholes,
             'wormhole_mode': self.config.wormhole_mode,
             'scales': self.config.scales,
+            'scale_copies': self.config.scale_copies,
+            'num_scale_heads': num_heads,
+            'weighting_mode': self.config.weighting_mode,
+            'belly_layers': self.config.belly_layers,
+            'belly_residual': self.config.belly_residual,
+            'use_spine': self.config.use_spine,
+            'use_collective': self.config.use_collective,
             'num_classes': self.config.num_classes,
             'num_patches': self.config.num_patches,
             'total_params': sum(p.numel() for p in self.parameters()),
@@ -807,14 +1337,19 @@ class DavidBeansV2(nn.Module):
 
     def __repr__(self):
         info = self.get_model_info()
+        spine_str = f"\n  Spine: {self.config.spine_channels}" if info['use_spine'] else ""
+        collective_str = " (collective)" if info['use_collective'] else ""
+        copies_str = f", copies={info['scale_copies']}" if info['scale_copies'] else ""
+
         return (
-            f"DavidBeans-V2-Wormhole(\n"
+            f"DavidBeans-V2.1-Wormhole(\n"
             f"  Vision: {info['image_size']}px → {info['num_patches']} patches\n"
             f"  Backbone: {info['num_layers']} layers, {info['dim']}d, {info['num_heads']} heads\n"
             f"  Wormholes: {info['num_wormholes']} per position, mode={info['wormhole_mode']}\n"
             f"  Tessellation: {info['num_tiles']} tiles × {info['tile_wormholes']} wormholes\n"
-            f"  Scales: {info['scales']}\n"
-            f"  Parameters: {info['total_params']:,}\n"
+            f"  Scales: {info['scales']}{copies_str}{collective_str}\n"
+            f"  Weighting: {info['weighting_mode']}, belly={info['belly_layers']}L\n"
+            f"  Parameters: {info['total_params']:,}{spine_str}\n"
             f")"
         )
 
@@ -826,9 +1361,10 @@ class DavidBeansV2(nn.Module):
 def test_v2():
     """Quick functionality test."""
     print("=" * 60)
-    print("DavidBeans V2 - Wormhole Routing Test")
+    print("DavidBeans V2.1 - Wormhole Routing Test")
     print("=" * 60)
 
+    # Test basic config
     config = DavidBeansV2Config(
         image_size=32,
         patch_size=4,
@@ -839,7 +1375,10 @@ def test_v2():
         num_tiles=8,
         tile_wormholes=3,
         scales=[64, 128, 256],
-        num_classes=100
+        num_classes=100,
+        belly_layers=3,
+        belly_residual=True,
+        weighting_mode="geometric"
     )
 
     model = DavidBeansV2(config)
@@ -855,18 +1394,63 @@ def test_v2():
     print(f"  Logits: {result['logits'].shape}")
     print(f"  Features: {result['features'].shape}")
     print(f"  Total loss: {result['losses']['total'].item():.4f}")
+    print(f"  Fusion weights: {result['fusion_weights'][0]}")
 
-    # Check routing info
-    if result['routing']:
-        attn_routing = result['routing'][0]['attention']
-        expert_routing = result['routing'][0]['expert']
-        print(f"\nRouting shapes (layer 0):")
-        print(f"  Attention routes: {attn_routing['routes'].shape}")
-        print(f"  Attention weights: {attn_routing['weights'].shape}")
-        print(f"  Expert routes: {expert_routing['routes'].shape}")
-        print(f"  Expert weights: {expert_routing['weights'].shape}")
+    # Test with redundant scales
+    print("\n" + "=" * 60)
+    print("Testing redundant scales...")
 
-    print("\n✓ V2 forward pass successful!")
+    config2 = DavidBeansV2Config(
+        image_size=32,
+        patch_size=4,
+        dim=256,
+        num_layers=2,
+        num_heads=4,
+        num_wormholes=8,
+        num_tiles=8,
+        tile_wormholes=3,
+        scales=[64, 128, 256],
+        scale_copies=[2, 1, 1],  # 2 copies of 64d scale
+        copy_theta_step=0.15,
+        num_classes=100
+    )
+
+    model2 = DavidBeansV2(config2)
+    print(model2)
+
+    result2 = model2(x, targets=targets)
+    print(f"  Num scale heads: {len(result2['scale_logits'])}")
+    print(f"  Fusion weights shape: {result2['fusion_weights'].shape}")
+
+    # Test with spine
+    print("\n" + "=" * 60)
+    print("Testing conv spine...")
+
+    config3 = DavidBeansV2Config(
+        image_size=32,
+        patch_size=4,
+        dim=256,
+        num_layers=2,
+        num_heads=4,
+        num_wormholes=8,
+        num_tiles=8,
+        tile_wormholes=3,
+        scales=[64, 128, 256],
+        num_classes=100,
+        use_spine=True,
+        spine_channels=[32, 64, 128],
+        spine_cross_attn=True
+    )
+
+    model3 = DavidBeansV2(config3)
+    print(model3)
+
+    result3 = model3(x, targets=targets)
+    print(f"  Has spine features: {'spine_features' in result3}")
+    if 'spine_features' in result3:
+        print(f"  Spine features shape: {result3['spine_features'].shape}")
+
+    print("\n✓ All V2.1 tests passed!")
 
     return model, config
 
