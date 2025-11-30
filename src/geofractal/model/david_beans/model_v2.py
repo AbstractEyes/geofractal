@@ -83,6 +83,81 @@ class DavidBeansV2Config:
 
 
 # ============================================================================
+# BATCHED WORMHOLE GATHER UTILITIES
+# ============================================================================
+
+def gather_wormhole(x: torch.Tensor, routes: torch.Tensor) -> torch.Tensor:
+    """
+    Efficient batched gather via wormhole routes using torch.gather.
+
+    Args:
+        x: [B, P, D] features to gather from
+        routes: [B, P, K] destination indices
+    Returns:
+        gathered: [B, P, K, D]
+    """
+    B, P, D = x.shape
+    K = routes.shape[-1]
+
+    # Flatten routes and expand for gather: [B, P*K, D]
+    routes_flat = routes.reshape(B, P * K).unsqueeze(-1).expand(-1, -1, D)
+
+    # Gather and reshape
+    gathered = torch.gather(x, 1, routes_flat)
+    return gathered.view(B, P, K, D)
+
+
+def gather_wormhole_multihead(x: torch.Tensor, routes: torch.Tensor, num_heads: int) -> torch.Tensor:
+    """
+    Batched gather for multi-head attention.
+
+    Args:
+        x: [B, H, P, D] features per head
+        routes: [B, P, K] shared routes across heads
+    Returns:
+        gathered: [B, H, P, K, D]
+    """
+    B, H, P, D = x.shape
+    K = routes.shape[-1]
+
+    # Flatten B*H for efficient gather
+    x_flat = x.reshape(B * H, P, D)
+
+    # Expand routes: [B, P, K] -> [B*H, P*K]
+    routes_exp = routes.unsqueeze(1).expand(-1, H, -1, -1).reshape(B * H, P * K)
+    routes_exp = routes_exp.unsqueeze(-1).expand(-1, -1, D)
+
+    # Gather and reshape
+    gathered = torch.gather(x_flat, 1, routes_exp)
+    return gathered.view(B, H, P, K, D)
+
+
+def gather_tiles(x_tiles: torch.Tensor, routes: torch.Tensor, seq_len: int) -> torch.Tensor:
+    """
+    Batched gather for tile wormholes across sequence positions.
+
+    Args:
+        x_tiles: [B, S, T, tile_dim] tiled features
+        routes: [B, T, K] tile routes (shared across S)
+    Returns:
+        gathered: [B, S, T, K, tile_dim]
+    """
+    B, S, T, tile_dim = x_tiles.shape
+    K = routes.shape[-1]
+
+    # Flatten B*S as batch dimension
+    x_flat = x_tiles.reshape(B * S, T, tile_dim)
+
+    # Expand routes for all sequence positions: [B, T, K] -> [B*S, T*K]
+    routes_exp = routes.unsqueeze(1).expand(-1, S, -1, -1).reshape(B * S, T * K)
+    routes_exp = routes_exp.unsqueeze(-1).expand(-1, -1, tile_dim)
+
+    # Gather and reshape
+    gathered = torch.gather(x_flat, 1, routes_exp)
+    return gathered.view(B, S, T, K, tile_dim)
+
+
+# ============================================================================
 # LEARNED WORMHOLE ROUTER
 # ============================================================================
 
@@ -170,7 +245,6 @@ class LearnedWormholeRouter(nn.Module):
             weights: [B, P, K] soft weights for selected positions
             scores: [B, P, P] raw routing scores (if return_scores=True)
         """
-        #B, S, D = x.shape
         P = self.num_positions
         K = self.num_wormholes
 
@@ -178,8 +252,8 @@ class LearnedWormholeRouter(nn.Module):
         x_patches = x[:, 1:, :]  # [B, P, D]
 
         # Content-based routing scores
-        queries = F.normalize(self.query_proj(x_patches), dim=-1)  # [B, P, D]
-        keys = F.normalize(self.key_proj(x_patches), dim=-1)  # [B, P, D]
+        queries = F.normalize(self.query_proj(x_patches), dim=-1)
+        keys = F.normalize(self.key_proj(x_patches), dim=-1)
 
         # Similarity scores
         scores = torch.bmm(queries, keys.transpose(1, 2))  # [B, P, P]
@@ -196,43 +270,14 @@ class LearnedWormholeRouter(nn.Module):
         scores_scaled = scores / self.temperature
 
         # Top-k selection
-        topk_scores, routes = torch.topk(scores_scaled, K, dim=-1)  # [B, P, K]
+        topk_scores, routes = torch.topk(scores_scaled, K, dim=-1)
 
         # Soft weights over selected routes
-        weights = F.softmax(topk_scores, dim=-1)  # [B, P, K]
+        weights = F.softmax(topk_scores, dim=-1)
 
         if return_scores:
             return routes, weights, scores
         return routes, weights, None
-
-
-class WormholeGather(nn.Module):
-    """Efficiently gather features through wormhole routes."""
-
-    def __init__(self):
-        super().__init__()
-
-    def forward(
-            self,
-            x: torch.Tensor,  # [B, P, D]
-            routes: torch.Tensor,  # [B, P, K]
-            weights: torch.Tensor  # [B, P, K]
-    ) -> torch.Tensor:
-        """Gather and weight features from wormhole destinations."""
-        B, P, D = x.shape
-        K = routes.shape[-1]
-
-        # Expand for gathering: [B, P, K] -> indices into [B, P, D]
-        batch_idx = torch.arange(B, device=x.device).view(B, 1, 1).expand(-1, P, K)
-
-        # Gather: [B, P, K, D]
-        gathered = x[batch_idx, routes, :]
-
-        # Weight and sum: [B, P, K, D] * [B, P, K, 1] -> [B, P, D]
-        weighted = gathered * weights.unsqueeze(-1)
-        output = weighted.sum(dim=2)
-
-        return output
 
 
 # ============================================================================
@@ -303,7 +348,6 @@ class WormholeAttentionBlock(nn.Module):
         B, S, D = x.shape
         H = self.num_heads
         P = self.num_patches
-        K = self.num_wormholes
         head_dim = self.head_dim
 
         # Pre-norm
@@ -312,72 +356,49 @@ class WormholeAttentionBlock(nn.Module):
         # Get wormhole routes from content
         routes, route_weights, route_scores = self.router(
             x_norm, return_scores=return_routing
-        )  # [B, P, K], [B, P, K], [B, P, P]
+        )
 
-        # QKV projection
-        qkv = self.qkv(x_norm).reshape(B, S, 3, H, head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, H, S, head_dim]
-        Q, K_full, V = qkv.unbind(0)
+        # QKV projection - fused reshape
+        qkv = self.qkv(x_norm).view(B, S, 3, H, head_dim).permute(2, 0, 3, 1, 4)
+        Q, K_full, V = qkv.unbind(0)  # Each: [B, H, S, head_dim]
 
         # === CLS ATTENTION (dense) ===
-        Q_cls = Q[:, :, :1, :]  # [B, H, 1, head_dim]
-        scores_cls = torch.einsum('bhqd,bhkd->bhqk', Q_cls, K_full) * self.scale
-        attn_cls = F.softmax(scores_cls, dim=-1)
+        Q_cls = Q[:, :, :1, :]
+        attn_cls = F.softmax(
+            torch.einsum('bhqd,bhkd->bhqk', Q_cls, K_full) * self.scale,
+            dim=-1
+        )
         attn_cls = self.attn_drop(attn_cls)
         out_cls = torch.einsum('bhqk,bhkd->bhqd', attn_cls, V)
 
-        # === PATCH ATTENTION (sparse via wormholes) ===
+        # === PATCH ATTENTION (sparse via wormholes) - BATCHED ===
         Q_patches = Q[:, :, 1:, :]  # [B, H, P, head_dim]
-        K_patches = K_full[:, :, 1:, :]  # [B, H, P, head_dim]
-        V_patches = V[:, :, 1:, :]  # [B, H, P, head_dim]
+        K_patches = K_full[:, :, 1:, :]
+        V_patches = V[:, :, 1:, :]
 
-        # Gather K, V through wormhole routes
-        # routes: [B, P, K] -> need to gather from [B, H, P, head_dim]
-        routes_exp = routes.unsqueeze(1).expand(-1, H, -1, -1)  # [B, H, P, K]
+        # Batched gather through wormholes
+        K_gathered = gather_wormhole_multihead(K_patches, routes, H)  # [B, H, P, K, head_dim]
+        V_gathered = gather_wormhole_multihead(V_patches, routes, H)
 
-        # Reshape for gathering
-        K_flat = K_patches.reshape(B * H, P, head_dim)
-        V_flat = V_patches.reshape(B * H, P, head_dim)
-        routes_flat = routes_exp.reshape(B * H, P, K)
-
-        # Batch indices
-        batch_idx = torch.arange(B * H, device=x.device).view(-1, 1, 1).expand(-1, P, K)
-
-        # Gather
-        K_gathered = K_flat[batch_idx, routes_flat, :]  # [B*H, P, K, head_dim]
-        V_gathered = V_flat[batch_idx, routes_flat, :]
-
-        K_gathered = K_gathered.view(B, H, P, K, head_dim)
-        V_gathered = V_gathered.view(B, H, P, K, head_dim)
-
-        # Sparse attention over wormhole neighbors
+        # Sparse attention scores
         scores_patches = torch.einsum('bhpd,bhpkd->bhpk', Q_patches, K_gathered) * self.scale
 
-        # Combine attention scores with route weights (content + routing)
-        route_weights_exp = route_weights.unsqueeze(1)  # [B, 1, P, K]
-        scores_patches = scores_patches + route_weights_exp.log().clamp(min=-10)
+        # Incorporate route weights (log-space addition = multiplication)
+        scores_patches = scores_patches + route_weights.unsqueeze(1).log().clamp(min=-10)
 
-        attn_patches = F.softmax(scores_patches, dim=-1)
-        attn_patches = self.attn_drop(attn_patches)
+        attn_patches = self.attn_drop(F.softmax(scores_patches, dim=-1))
         out_patches = torch.einsum('bhpk,bhpkd->bhpd', attn_patches, V_gathered)
 
-        # Combine CLS and patches
+        # Combine and project
         out = torch.cat([out_cls, out_patches], dim=2)
-        out = out.permute(0, 2, 1, 3).reshape(B, S, D)
-        out = self.proj_drop(self.proj(out))
+        out = self.proj_drop(self.proj(out.transpose(1, 2).reshape(B, S, D)))
 
         # Residual + MLP
         x = x + out
         x = x + self.mlp(self.norm2(x))
 
         if return_routing:
-            routing_info = {
-                'routes': routes,
-                'weights': route_weights,
-                'scores': route_scores
-            }
-            return x, routing_info
-
+            return x, {'routes': routes, 'weights': route_weights, 'scores': route_scores}
         return x, None
 
 
@@ -405,11 +426,11 @@ class WormholeTessellationExpert(nn.Module):
         self.num_tiles = num_tiles
         self.tile_dim = dim // num_tiles
         self.num_wormholes = min(num_wormholes, num_tiles - 1)
+        self.temperature = temperature
 
         # Tile router (learns which tiles connect)
         self.tile_query = nn.Linear(self.tile_dim, self.tile_dim)
         self.tile_key = nn.Linear(self.tile_dim, self.tile_dim)
-        self.temperature = temperature
 
         # Process: self + wormhole context
         context_dim = self.tile_dim * (1 + self.num_wormholes)
@@ -440,7 +461,6 @@ class WormholeTessellationExpert(nn.Module):
         x_tiles = x_norm.view(B, S, T, tile_dim)
 
         # Compute tile routing (shared across sequence positions)
-        # Use mean tile representation for routing
         tile_repr = x_tiles.mean(dim=1)  # [B, T, tile_dim]
 
         queries = F.normalize(self.tile_query(tile_repr), dim=-1)
@@ -457,54 +477,27 @@ class WormholeTessellationExpert(nn.Module):
         topk_scores, routes = torch.topk(scores / self.temperature, K, dim=-1)
         weights = F.softmax(topk_scores, dim=-1)  # [B, T, K]
 
-        # Gather wormhole neighbors
-        # routes: [B, T, K] -> gather from [B, S, T, tile_dim]
-        batch_idx = torch.arange(B, device=x.device).view(B, 1, 1).expand(-1, T, K)
-
-        # For each tile, gather its K wormhole neighbors
-        # x_tiles: [B, S, T, tile_dim] -> need [B, T, K, tile_dim] from mean
-        tile_repr_gathered = tile_repr[batch_idx, routes, :]  # [B, T, K, tile_dim]
-
-        # But we want to process per position, so gather for each S
-        # Expand routes for all sequence positions
-        routes_exp = routes.unsqueeze(1).expand(-1, S, -1, -1)  # [B, S, T, K]
-        weights_exp = weights.unsqueeze(1).expand(-1, S, -1, -1)  # [B, S, T, K]
-
-        # Gather neighbors per position
-        x_tiles_flat = x_tiles.reshape(B * S, T, tile_dim)
-        routes_flat = routes_exp.reshape(B * S, T, K)
-        batch_idx_flat = torch.arange(B * S, device=x.device).view(-1, 1, 1).expand(-1, T, K)
-
-        gathered = x_tiles_flat[batch_idx_flat, routes_flat, :]  # [B*S, T, K, tile_dim]
-        gathered = gathered.view(B, S, T, K, tile_dim)
+        # === BATCHED GATHER across all sequence positions ===
+        gathered = gather_tiles(x_tiles, routes, S)  # [B, S, T, K, tile_dim]
 
         # Concatenate: self + all wormhole neighbors
-        # [B, S, T, tile_dim] cat [B, S, T, K*tile_dim]
         gathered_flat = gathered.view(B, S, T, K * tile_dim)
         combined = torch.cat([x_tiles, gathered_flat], dim=-1)  # [B, S, T, (1+K)*tile_dim]
 
-        # Process
-        combined_flat = combined.view(B * S * T, -1)
-        out_tiles = self.processor(combined_flat)
-        out_tiles = out_tiles.view(B, S, T, tile_dim)
+        # Process all tiles in parallel
+        out_tiles = self.processor(combined)  # [B, S, T, tile_dim]
 
         # Reconstruct
         out = out_tiles.reshape(B, S, D)
         out = x + out  # Residual
 
         if return_routing:
-            routing_info = {
-                'routes': routes,
-                'weights': weights,
-                'scores': scores
-            }
-            return out, routing_info
-
+            return out, {'routes': routes, 'weights': weights, 'scores': scores}
         return out, None
 
 
 # ============================================================================
-# MULTI-SCALE CRYSTAL HEAD (from V1, optimized)
+# MULTI-SCALE CRYSTAL HEAD
 # ============================================================================
 
 class CrystalProjectionHead(nn.Module):
@@ -575,15 +568,18 @@ class MultiScaleCrystalHead(nn.Module):
             features: torch.Tensor,
             anchors_dict: Dict[int, torch.Tensor]
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
-        scale_logits = []
-        scale_features = []
+
+        # Pre-compute fusion weights once
+        fusion_weights = F.softmax(self.fusion(features), dim=-1)
+
+        # Process scales - preallocate lists
+        scale_logits = [None] * self.num_scales
+        scale_features = [None] * self.num_scales
 
         for i, scale in enumerate(self.scales):
-            logits, z = self.heads[i](features, anchors_dict[scale])
-            scale_logits.append(logits)
-            scale_features.append(z)
+            scale_logits[i], scale_features[i] = self.heads[i](features, anchors_dict[scale])
 
-        fusion_weights = F.softmax(self.fusion(features), dim=-1)
+        # Fused weighted combination
         stacked_logits = torch.stack(scale_logits, dim=1)
         combined = torch.einsum('bs,bsc->bc', fusion_weights, stacked_logits)
 
@@ -773,12 +769,12 @@ class DavidBeansV2(nn.Module):
             anchors_dict: Dict[int, torch.Tensor],
             targets: torch.Tensor
     ) -> torch.Tensor:
-        """Simplified contrastive loss."""
-        B, P, D = patch_features.shape
+        """Batched contrastive loss across scales."""
         device = patch_features.device
+        num_scales = len(self.config.scales)
 
+        # Stack scale features and anchors for batched computation where possible
         total_loss = torch.tensor(0.0, device=device)
-        patch_mean = F.normalize(patch_features.mean(dim=1), dim=-1)
 
         for scale, scale_feat in zip(self.config.scales, scale_features):
             anchors = anchors_dict[scale]
@@ -789,7 +785,7 @@ class DavidBeansV2(nn.Module):
             logits = torch.mm(scale_feat_norm, anchors_norm.T) / self.config.contrast_temperature
             total_loss = total_loss + F.cross_entropy(logits, targets)
 
-        return total_loss / len(self.config.scales)
+        return total_loss / num_scales
 
     def get_model_info(self) -> Dict:
         return {
