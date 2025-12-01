@@ -129,7 +129,6 @@ class DavidBeansV2Config:
     fractal_num_levels: int = 4    # Cantor staircase levels (2^n stairs)
     fractal_drop_prob: float = 0.1 # Topological dropout probability
     fractal_min_routes: int = 2    # Minimum routes to keep during dropout
-    fractal_temperature: float = 0.05  # CantorGate sharpness
 
     @property
     def num_patches(self) -> int:
@@ -452,8 +451,7 @@ class WormholeAttentionBlock(nn.Module):
             use_fractal_reg: bool = False,
             fractal_num_levels: int = 4,
             fractal_drop_prob: float = 0.1,
-            fractal_min_routes: int = 2,
-            fractal_temperature: float = 0.05
+            fractal_min_routes: int = 2
     ):
         super().__init__()
         self.dim = dim
@@ -488,7 +486,7 @@ class WormholeAttentionBlock(nn.Module):
             # Use CantorGate instead of GELU, no dropout in MLP
             self.mlp = nn.Sequential(
                 nn.Linear(dim, mlp_dim),
-                CantorGate(dim=mlp_dim, num_levels=fractal_num_levels, temperature=fractal_temperature),
+                CantorGate(dim=mlp_dim, num_levels=fractal_num_levels),
                 nn.Linear(mlp_dim, dim),
             )
 
@@ -639,8 +637,7 @@ class WormholeTessellationExpert(nn.Module):
             temperature: float = 0.5,
             dropout: float = 0.1,
             use_fractal_reg: bool = False,
-            fractal_num_levels: int = 4,
-            fractal_temperature: float = 0.05
+            fractal_num_levels: int = 4
     ):
         super().__init__()
         self.dim = dim
@@ -661,7 +658,7 @@ class WormholeTessellationExpert(nn.Module):
         if self.use_fractal_reg:
             self.processor = nn.Sequential(
                 nn.Linear(context_dim, hidden_dim),
-                CantorGate(dim=hidden_dim, num_levels=fractal_num_levels, temperature=fractal_temperature),
+                CantorGate(dim=hidden_dim, num_levels=fractal_num_levels),
                 nn.Linear(hidden_dim, self.tile_dim)
             )
         else:
@@ -747,8 +744,7 @@ class ConfigurableBelly(nn.Module):
         use_residual: bool = False,
         dropout: float = 0.1,
         use_fractal_reg: bool = False,
-        fractal_num_levels: int = 4,
-        fractal_temperature: float = 0.05
+        fractal_num_levels: int = 4
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -764,7 +760,7 @@ class ConfigurableBelly(nn.Module):
         # Choose activation
         if self.use_fractal_reg:
             def make_activation(dim):
-                return CantorGate(dim=dim, num_levels=fractal_num_levels, temperature=fractal_temperature)
+                return CantorGate(dim=dim, num_levels=fractal_num_levels)
         else:
             def make_activation(dim):
                 return nn.Sequential(nn.GELU(), nn.Dropout(dropout))
@@ -877,8 +873,7 @@ class CrystalProjectionHead(nn.Module):
             theta: float = 0.0,  # For redundant scale differentiation
             copy_index: int = 0,  # Which copy this is (0 = primary)
             use_fractal_reg: bool = False,
-            fractal_num_levels: int = 4,
-            fractal_temperature: float = 0.05
+            fractal_num_levels: int = 4
     ):
         super().__init__()
         self.crystal_dim = crystal_dim
@@ -895,8 +890,7 @@ class CrystalProjectionHead(nn.Module):
                 use_residual=belly_residual,
                 dropout=dropout,
                 use_fractal_reg=use_fractal_reg,
-                fractal_num_levels=fractal_num_levels,
-                fractal_temperature=fractal_temperature
+                fractal_num_levels=fractal_num_levels
             )
         else:
             self.projection = nn.Linear(input_dim, crystal_dim, bias=False)
@@ -965,8 +959,7 @@ class MultiScaleCrystalHead(nn.Module):
                     theta=theta,
                     copy_index=copy_idx,
                     use_fractal_reg=config.use_fractal_reg,
-                    fractal_num_levels=config.fractal_num_levels,
-                    fractal_temperature=config.fractal_temperature
+                    fractal_num_levels=config.fractal_num_levels
                 )
                 self.heads.append(head)
                 self.head_scale_map.append((scale, copy_idx))
@@ -1093,8 +1086,7 @@ class CollectiveCrystalHead(nn.Module):
                     use_residual=config.belly_residual,
                     dropout=config.dropout,
                     use_fractal_reg=config.use_fractal_reg,
-                    fractal_num_levels=config.fractal_num_levels,
-                    fractal_temperature=config.fractal_temperature
+                    fractal_num_levels=config.fractal_num_levels
                 )
             else:
                 proj = nn.Linear(config.dim, scale, bias=False)
@@ -1213,8 +1205,7 @@ class BeansBackboneV2(nn.Module):
                     use_fractal_reg=config.use_fractal_reg,
                     fractal_num_levels=config.fractal_num_levels,
                     fractal_drop_prob=config.fractal_drop_prob,
-                    fractal_min_routes=config.fractal_min_routes,
-                    fractal_temperature=config.fractal_temperature
+                    fractal_min_routes=config.fractal_min_routes
                 )
             )
             self.expert_layers.append(
@@ -1224,8 +1215,7 @@ class BeansBackboneV2(nn.Module):
                     num_wormholes=config.tile_wormholes,
                     dropout=config.dropout,
                     use_fractal_reg=config.use_fractal_reg,
-                    fractal_num_levels=config.fractal_num_levels,
-                    fractal_temperature=config.fractal_temperature
+                    fractal_num_levels=config.fractal_num_levels
                 )
             )
 
