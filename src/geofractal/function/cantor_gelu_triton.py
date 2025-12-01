@@ -1,3 +1,14 @@
+# geofractal.function.cantor_gelu_triton.py
+# Experimental cantor_gelu_triton module with Triton kernels and benchmarking suite.
+# These are proven ineffective in current experimentation, stored for utilization later.
+# =============================================================================
+# Authors: AbstractPhil + Claude Opus 4.5
+# =============================================================================
+# License: Apache-2.0
+# =============================================================================
+# This version temporarily requires triton, there will be a standard pytorch version later.
+# =============================================================================
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
