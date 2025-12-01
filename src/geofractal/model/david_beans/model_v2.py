@@ -36,10 +36,23 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 import math
 
+try:
+    import triton
+    import triton.language as tl
+    TRITON_AVAILABLE = True
+except:
+    TRITON_AVAILABLE = False
+
 # Import FractalRegularizer - adjust path as needed
 try:
-    from geofractal.function.fractal_regularizer import FractalRegularizer, CantorGate, TopologicalDropout
+    if not TRITON_AVAILABLE:
+        print("Triton not available, attempting to use slower regularizer")
+        from geofractal.function.fractal_regularizer import FractalRegularizer, CantorGate, TopologicalDropout
+    else:
+        print("Triton available, using optimized FractalRegularizer")
+        from geofractal.function.fractal_regularizer_triton import FractalRegularizer, CantorGate, TopologicalDropout
     FRACTAL_AVAILABLE = True
+
 except ImportError:
     FRACTAL_AVAILABLE = False
     print("Warning: FractalRegularizer not available, falling back to standard dropout")
