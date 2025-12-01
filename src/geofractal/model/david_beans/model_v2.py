@@ -1,32 +1,22 @@
 """
-DavidBeans V2: Wormhole Routing Integration
-============================================
+DavidBeans V2.3: Wormhole Routing with Topological Dropout
+==========================================================
 
-Key upgrades from V1:
-1. LearnedWormholeRouter: Content-aware routing (replaces fixed Cantor)
-2. WormholeAttentionBlock: Learned sparse attention patterns
-3. WormholeTessellationExpert: Tiles connect via learned wormholes
-4. Proper gradient flow through all routing decisions
+Key upgrades from V2.2:
+- Removed FractalRegularizer (CantorGELU mothballed - didn't improve convergence)
+- Added TopologicalDropout variants based on Fashion-MNIST experiments:
+  - ScheduledTopologicalDropout: Best accuracy (warmup aligns with crystallization)
+  - SpatialTopologicalDropout: Best generalization (0.62% gap)
+  - WormholeDropout: Combined strategy for attention blocks
 
-V2.1 Additions:
-- Configurable belly depth with residual connections
-- Scale weighting modes (balanced, geometric, top_heavy, learned)
-- Redundant multiscale with theta differentiation
-- Collective shared space option with fingerprint masks
-- Conv spine for persistent spatial coherence
-
-V2.2 Additions:
-- FractalRegularizer: CantorGate activation + TopologicalDropout
-- Router-aware regularization (importance-weighted dropout)
-- Structure-preserving dropout that drops routes, not neurons
-
-Based on experimental validation:
-- Permutation recovery: 100% routing accuracy
-- Patch matching: 99.6% correspondence learning
-- Key insight: When routing IS necessary, routing learns structure
+Experimental Results (Fashion-MNIST):
+- topo_scheduled: 93.01% (1.66% gap) - WINNER
+- standard:       92.82% (1.23% gap) - baseline
+- spatial:        92.78% (0.62% gap) - best generalization
+- topo_importance: 90.48% (5.17% gap) - HARMFUL, not included
 
 Author: AbstractPhil
-Date: November 30, 2025
+Date: December 1, 2025
 """
 
 import torch
@@ -36,35 +26,27 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass, field
 import math
 
+# Import topological dropout - adjust path as needed
 try:
-    import triton
-    import triton.language as tl
-    TRITON_AVAILABLE = True
-except:
-    TRITON_AVAILABLE = False
-
-# Import FractalRegularizer - adjust path as needed
-try:
-    if not TRITON_AVAILABLE:
-        print("Triton not available, attempting to use slower regularizer")
-        from geofractal.function.fractal_regularizer import FractalRegularizer, CantorGate, TopologicalDropout
-    else:
-        print("Triton available, using optimized FractalRegularizer")
-        from geofractal.function.fractal_regularizer_triton import FractalRegularizer, CantorGate, TopologicalDropout
-    FRACTAL_AVAILABLE = True
-
+    from geofractal.model.layers.dropout.topological_dropout import (
+        TopologicalDropout,
+        ScheduledTopologicalDropout,
+        SpatialTopologicalDropout,
+        WormholeDropout,
+    )
+    TOPO_DROPOUT_AVAILABLE = True
 except ImportError:
-    FRACTAL_AVAILABLE = False
-    print("Warning: FractalRegularizer not available, falling back to standard dropout")
+    TOPO_DROPOUT_AVAILABLE = False
+    print("Warning: Topological dropout not available, falling back to standard dropout")
 
 
 # ============================================================================
-# CONFIGURATION V2
+# CONFIGURATION V2.3
 # ============================================================================
 
 @dataclass
 class DavidBeansV2Config:
-    """Configuration for DavidBeans V2 with wormhole routing."""
+    """Configuration for DavidBeans V2.3 with wormhole routing and topological dropout."""
 
     # Vision
     image_size: int = 32
@@ -78,14 +60,14 @@ class DavidBeansV2Config:
     mlp_ratio: float = 4.0
 
     # Wormhole routing
-    num_wormholes: int = 8  # Connections per position
+    num_wormholes: int = 8
     wormhole_temperature: float = 0.1
-    wormhole_mode: str = "hybrid"  # "learned", "cantor", "hybrid"
-    cantor_weight: float = 0.3  # For hybrid mode initialization
+    wormhole_mode: str = "hybrid"
+    cantor_weight: float = 0.3
 
     # Tessellation
-    num_tiles: int = 16  # Feature-dim tessellation
-    tile_wormholes: int = 4  # Cross-tile connections
+    num_tiles: int = 16
+    tile_wormholes: int = 4
 
     # Crystal head - scales
     scales: List[int] = field(default_factory=lambda: [64, 128, 256, 384, 512])
@@ -94,41 +76,52 @@ class DavidBeansV2Config:
     # Crystal head - belly configuration
     use_belly: bool = True
     belly_expand: float = 2.0
-    belly_layers: int = 2  # Number of layers in belly (2-4)
-    belly_residual: bool = False  # Use residual connections in deep belly
+    belly_layers: int = 2
+    belly_residual: bool = False
 
     # Crystal head - scale weighting
-    weighting_mode: str = "learned"  # "balanced", "geometric", "top_heavy", "learned"
-    scale_weight_floor: float = 0.1  # Minimum weight per scale (prevents collapse)
+    weighting_mode: str = "learned"
+    scale_weight_floor: float = 0.1
 
     # Crystal head - redundant scales
-    scale_copies: Optional[List[int]] = None  # e.g., [2, 1, 1, 1, 1] for 2 copies of first scale
-    copy_theta_step: float = 0.15  # Theta rotation between copies
+    scale_copies: Optional[List[int]] = None
+    copy_theta_step: float = 0.15
 
     # Crystal head - collective mode
-    use_collective: bool = False  # Use shared anchor space with pad/mask
+    use_collective: bool = False
     collective_temperature: float = 0.07
 
     # Conv spine
     use_spine: bool = False
     spine_channels: List[int] = field(default_factory=lambda: [64, 128, 256])
-    spine_cross_attn: bool = True  # Per-layer cross-attention to spine
-    spine_gate_init: float = 0.0  # Initial gate value (0 = start gated off)
+    spine_cross_attn: bool = True
+    spine_gate_init: float = 0.0
 
     # Loss weights
     contrast_temperature: float = 0.07
     contrast_weight: float = 0.5
-    routing_weight: float = 0.0  # Optional: auxiliary routing loss
+    routing_weight: float = 0.0
 
-    # Regularization
-    dropout: float = 0.1
+    # === DROPOUT CONFIGURATION (V2.3) ===
+    dropout: float = 0.1  # Base dropout rate (used if topo disabled)
+
+    # Topological dropout (structure-preserving)
+    use_topo_dropout: bool = True
+    topo_drop_prob: float = 0.15        # Route dropout probability
+    topo_warmup_epochs: int = 35        # Warmup before full dropout (align with crystallization)
+    topo_min_routes_keep: int = 2       # Minimum routes to preserve
+    topo_steps_per_epoch: int = 391     # Steps per epoch (CIFAR-100 with batch 128)
+
+    # Spatial dropout (for patch embeddings)
+    use_spatial_dropout: bool = True
+    spatial_drop_prob: float = 0.1
+    spatial_patch_size: int = 2
+
+    # Route dimension in tensors
+    route_dim_attention: int = -2       # For [B, S, K, D] gathered values
+    route_dim_tiles: int = 2            # For [B, S, T, tile_dim] tessellation
+
     pooling: str = "cls"
-
-    # Fractal Regularizer (V2.2)
-    use_fractal_reg: bool = False  # Use FractalRegularizer instead of dropout
-    fractal_num_levels: int = 4    # Cantor staircase levels (2^n stairs)
-    fractal_drop_prob: float = 0.1 # Topological dropout probability
-    fractal_min_routes: int = 2    # Minimum routes to keep during dropout
 
     @property
     def num_patches(self) -> int:
@@ -153,10 +146,10 @@ class DavidBeansV2Config:
         assert 2 <= self.belly_layers <= 4, \
             f"belly_layers must be 2-4, got {self.belly_layers}"
 
-        # Validate fractal reg settings
-        if self.use_fractal_reg and not FRACTAL_AVAILABLE:
-            print("Warning: use_fractal_reg=True but FractalRegularizer not available, disabling")
-            self.use_fractal_reg = False
+        # Validate topo dropout settings
+        if self.use_topo_dropout and not TOPO_DROPOUT_AVAILABLE:
+            print("Warning: use_topo_dropout=True but TopologicalDropout not available, disabling")
+            self.use_topo_dropout = False
 
 
 # ============================================================================
@@ -176,10 +169,7 @@ def gather_wormhole(x: torch.Tensor, routes: torch.Tensor) -> torch.Tensor:
     B, P, D = x.shape
     K = routes.shape[-1]
 
-    # Flatten routes and expand for gather: [B, P*K, D]
     routes_flat = routes.reshape(B, P * K).unsqueeze(-1).expand(-1, -1, D)
-
-    # Gather and reshape
     gathered = torch.gather(x, 1, routes_flat)
     return gathered.view(B, P, K, D)
 
@@ -197,14 +187,10 @@ def gather_wormhole_multihead(x: torch.Tensor, routes: torch.Tensor, num_heads: 
     B, H, P, D = x.shape
     K = routes.shape[-1]
 
-    # Flatten B*H for efficient gather
     x_flat = x.reshape(B * H, P, D)
-
-    # Expand routes: [B, P, K] -> [B*H, P*K]
     routes_exp = routes.unsqueeze(1).expand(-1, H, -1, -1).reshape(B * H, P * K)
     routes_exp = routes_exp.unsqueeze(-1).expand(-1, -1, D)
 
-    # Gather and reshape
     gathered = torch.gather(x_flat, 1, routes_exp)
     return gathered.view(B, H, P, K, D)
 
@@ -222,14 +208,10 @@ def gather_tiles(x_tiles: torch.Tensor, routes: torch.Tensor, seq_len: int) -> t
     B, S, T, tile_dim = x_tiles.shape
     K = routes.shape[-1]
 
-    # Flatten B*S as batch dimension
     x_flat = x_tiles.reshape(B * S, T, tile_dim)
-
-    # Expand routes for all sequence positions: [B, T, K] -> [B*S, T*K]
     routes_exp = routes.unsqueeze(1).expand(-1, S, -1, -1).reshape(B * S, T * K)
     routes_exp = routes_exp.unsqueeze(-1).expand(-1, -1, tile_dim)
 
-    # Gather and reshape
     gathered = torch.gather(x_flat, 1, routes_exp)
     return gathered.view(B, S, T, K, tile_dim)
 
@@ -241,12 +223,6 @@ def gather_tiles(x_tiles: torch.Tensor, routes: torch.Tensor, seq_len: int) -> t
 class LearnedWormholeRouter(nn.Module):
     """
     Content-aware wormhole routing with Cantor initialization.
-
-    Key properties:
-    - Routes computed from content (query @ key), not just position
-    - Straight-through estimator for hard routing
-    - Cantor fingerprints provide geometric initialization
-    - Fully learnable with gradient flow
     """
 
     def __init__(
@@ -267,23 +243,19 @@ class LearnedWormholeRouter(nn.Module):
         self.mode = mode
         self.grid_size = grid_size or int(math.sqrt(num_positions))
 
-        # Query/Key projections for content-aware routing
         self.query_proj = nn.Linear(dim, dim)
         self.key_proj = nn.Linear(dim, dim)
 
-        # Cantor fingerprints for initialization/bias
         fingerprints = self._compute_cantor_fingerprints()
         self.register_buffer('fingerprints', fingerprints)
 
         if mode in ["hybrid", "cantor"]:
-            # Learnable position bias initialized from Cantor distance
             cantor_bias = self._compute_cantor_bias()
             self.position_bias = nn.Parameter(cantor_bias * cantor_weight)
         else:
             self.position_bias = None
 
     def _compute_cantor_fingerprints(self) -> torch.Tensor:
-        """Cantor pairing function for position fingerprints."""
         P = self.num_positions
         G = self.grid_size
 
@@ -296,12 +268,9 @@ class LearnedWormholeRouter(nn.Module):
         return z.float() / z.max().clamp(min=1)
 
     def _compute_cantor_bias(self) -> torch.Tensor:
-        """Initialize bias from Cantor distance (closer = higher affinity)."""
         fp = self.fingerprints
         dist = (fp.unsqueeze(0) - fp.unsqueeze(1)).abs()
-        # Convert distance to affinity (closer = higher)
         affinity = 1.0 - dist
-        # Mask self-connections
         affinity.fill_diagonal_(-1e9)
         return affinity
 
@@ -310,46 +279,25 @@ class LearnedWormholeRouter(nn.Module):
             x: torch.Tensor,
             return_scores: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """
-        Compute wormhole routes from content.
-
-        Args:
-            x: [B, S, D] input features (S = num_positions + 1 for CLS)
-            return_scores: whether to return raw scores for loss
-
-        Returns:
-            routes: [B, P, K] indices of selected positions per query
-            weights: [B, P, K] soft weights for selected positions
-            scores: [B, P, P] raw routing scores (if return_scores=True)
-        """
         P = self.num_positions
         K = self.num_wormholes
 
-        # Exclude CLS token for patch routing
-        x_patches = x[:, 1:, :]  # [B, P, D]
+        x_patches = x[:, 1:, :]
 
-        # Content-based routing scores
         queries = F.normalize(self.query_proj(x_patches), dim=-1)
         keys = F.normalize(self.key_proj(x_patches), dim=-1)
 
-        # Similarity scores
-        scores = torch.bmm(queries, keys.transpose(1, 2))  # [B, P, P]
+        scores = torch.bmm(queries, keys.transpose(1, 2))
 
-        # Add position bias if hybrid/cantor mode
         if self.position_bias is not None:
             scores = scores + self.position_bias.unsqueeze(0)
 
-        # Mask self-connections
         mask = torch.eye(P, device=x.device, dtype=torch.bool)
         scores = scores.masked_fill(mask.unsqueeze(0), -1e9)
 
-        # Temperature scaling
         scores_scaled = scores / self.temperature
 
-        # Top-k selection
         topk_scores, routes = torch.topk(scores_scaled, K, dim=-1)
-
-        # Soft weights over selected routes
         weights = F.softmax(topk_scores, dim=-1)
 
         if return_scores:
@@ -358,14 +306,11 @@ class LearnedWormholeRouter(nn.Module):
 
 
 # ============================================================================
-# CONV SPINE - Persistent Spatial Coherence
+# CONV SPINE
 # ============================================================================
 
 class ConvSpine(nn.Module):
-    """
-    Persistent wide conv pathway that runs parallel to transformer.
-    Provides spatial coherence that patches can't forget.
-    """
+    """Persistent wide conv pathway for spatial coherence."""
 
     def __init__(
         self,
@@ -376,7 +321,6 @@ class ConvSpine(nn.Module):
         super().__init__()
         self.output_dim = output_dim
 
-        # Progressive conv stages (maintains spatial structure)
         self.stages = nn.ModuleList()
         ch_in = in_channels
 
@@ -391,33 +335,91 @@ class ConvSpine(nn.Module):
             ))
             ch_in = ch_out
 
-        # Final projection to match transformer dim
         self.proj = nn.Conv2d(spine_channels[-1], output_dim, 1)
-
-        # Learnable spatial pooling (keeps gradient flow)
         self.pool = nn.AdaptiveAvgPool2d(1)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-            spine_global: [B, D] global conv features
-            spine_tokens: [B, H*W, D] flattened spatial features for cross-attn
-        """
         for stage in self.stages:
             x = stage(x)
-            x = F.max_pool2d(x, 2)  # Downsample
+            x = F.max_pool2d(x, 2)
 
-        # Final projection
-        x = self.proj(x)  # [B, D, H', W']
+        x = self.proj(x)
 
-        # Global feature
-        spine_global = self.pool(x).flatten(1)  # [B, D]
+        spine_global = self.pool(x).flatten(1)
 
-        # Flatten for cross-attention: [B, D, H, W] -> [B, H*W, D]
         B, D, H, W = x.shape
-        spine_tokens = x.flatten(2).transpose(1, 2)  # [B, H*W, D]
+        spine_tokens = x.flatten(2).transpose(1, 2)
 
         return spine_global, spine_tokens
+
+
+# ============================================================================
+# DROPOUT FACTORY
+# ============================================================================
+
+def create_dropout(
+    config: DavidBeansV2Config,
+    dropout_type: str = "standard",
+    route_dim: int = 1,
+    num_routes: Optional[int] = None,
+) -> nn.Module:
+    """
+    Factory for creating appropriate dropout based on config and type.
+
+    Args:
+        config: Model configuration
+        dropout_type: "standard", "topo", "topo_scheduled", "spatial", "wormhole"
+        route_dim: Which dimension contains routes
+        num_routes: Number of routes (for min_keep calculation)
+
+    Returns:
+        Dropout module
+    """
+    if not config.use_topo_dropout or not TOPO_DROPOUT_AVAILABLE:
+        # Fallback to standard dropout
+        return nn.Dropout(config.dropout)
+
+    if dropout_type == "standard":
+        return nn.Dropout(config.dropout)
+
+    elif dropout_type == "topo":
+        return TopologicalDropout(
+            drop_prob=config.topo_drop_prob,
+            min_keep=config.topo_min_routes_keep,
+            route_dim=route_dim,
+        )
+
+    elif dropout_type == "topo_scheduled":
+        warmup_steps = config.topo_warmup_epochs * config.topo_steps_per_epoch
+        return ScheduledTopologicalDropout(
+            drop_prob=config.topo_drop_prob,
+            min_keep=config.topo_min_routes_keep,
+            route_dim=route_dim,
+            warmup_steps=warmup_steps,
+        )
+
+    elif dropout_type == "spatial":
+        if config.use_spatial_dropout:
+            return SpatialTopologicalDropout(
+                drop_prob=config.spatial_drop_prob,
+                patch_size=config.spatial_patch_size,
+            )
+        else:
+            return nn.Identity()
+
+    elif dropout_type == "wormhole":
+        return WormholeDropout(
+            route_drop_prob=config.topo_drop_prob,
+            spatial_drop_prob=config.spatial_drop_prob if config.use_spatial_dropout else 0.0,
+            num_routes=num_routes or config.num_wormholes,
+            min_routes_keep=config.topo_min_routes_keep,
+            warmup_epochs=config.topo_warmup_epochs,
+            steps_per_epoch=config.topo_steps_per_epoch,
+            patch_size=config.spatial_patch_size,
+        )
+
+    else:
+        raise ValueError(f"Unknown dropout_type: {dropout_type}")
 
 
 # ============================================================================
@@ -426,13 +428,9 @@ class ConvSpine(nn.Module):
 
 class WormholeAttentionBlock(nn.Module):
     """
-    Attention block with learned wormhole routing.
+    Attention block with learned wormhole routing and topological dropout.
 
-    CLS token: Dense attention to all patches
-    Patches: Sparse attention via learned wormholes
-    Optional: Cross-attention to conv spine features
-
-    V2.2: Optional FractalRegularizer for structure-preserving dropout
+    V2.3: Uses ScheduledTopologicalDropout for route regularization
     """
 
     def __init__(
@@ -444,14 +442,11 @@ class WormholeAttentionBlock(nn.Module):
             temperature: float = 0.1,
             mode: str = "hybrid",
             mlp_ratio: float = 4.0,
+            config: Optional[DavidBeansV2Config] = None,
+            # Legacy params (used if config not provided)
             dropout: float = 0.1,
             use_spine_cross_attn: bool = False,
             spine_gate_init: float = 0.0,
-            # Fractal regularizer options
-            use_fractal_reg: bool = False,
-            fractal_num_levels: int = 4,
-            fractal_drop_prob: float = 0.1,
-            fractal_min_routes: int = 2
     ):
         super().__init__()
         self.dim = dim
@@ -460,8 +455,14 @@ class WormholeAttentionBlock(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.num_patches = num_patches
         self.num_wormholes = num_wormholes
+
+        # Use config if provided, else legacy params
+        self.config = config
+        use_topo = config.use_topo_dropout if config else False
+        base_dropout = config.dropout if config else dropout
+        use_spine_cross_attn = config.spine_cross_attn if config and config.use_spine else use_spine_cross_attn
+        spine_gate_init = config.spine_gate_init if config else spine_gate_init
         self.use_spine_cross_attn = use_spine_cross_attn
-        self.use_fractal_reg = use_fractal_reg and FRACTAL_AVAILABLE
 
         # Wormhole router
         self.router = LearnedWormholeRouter(
@@ -472,55 +473,42 @@ class WormholeAttentionBlock(nn.Module):
             mode=mode
         )
 
-        # Standard QKV for attention values
+        # QKV and projection
         self.qkv = nn.Linear(dim, dim * 3)
         self.proj = nn.Linear(dim, dim)
 
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-        # MLP
+        # MLP with standard dropout (not route-based)
         mlp_dim = int(dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(base_dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(base_dropout)
+        )
 
-        if self.use_fractal_reg:
-            # Use CantorGate instead of GELU, no dropout in MLP
-            self.mlp = nn.Sequential(
-                nn.Linear(dim, mlp_dim),
-                CantorGate(dim=mlp_dim, num_levels=fractal_num_levels),
-                nn.Linear(mlp_dim, dim),
-            )
+        # === TOPOLOGICAL DROPOUT (V2.3) ===
+        if use_topo and TOPO_DROPOUT_AVAILABLE:
+            # Scheduled dropout for attention (warms up with crystallization)
+            self.attn_drop = create_dropout(config, "topo_scheduled", route_dim=-1)
 
-            # FractalRegularizer for post-routing regularization
-            self.fractal_reg = FractalRegularizer(
-                dim=self.head_dim,  # Per-head dimension
-                num_routes=num_wormholes,
-                num_levels=fractal_num_levels,
-                drop_prob=fractal_drop_prob,
-                min_routes_keep=fractal_min_routes
-            )
+            # Route dropout for gathered values [B, H, P, K, D] -> route_dim=3
+            self.route_drop = create_dropout(config, "topo_scheduled", route_dim=3)
 
-            # No separate dropout layers needed
-            self.attn_drop = nn.Identity()
-            self.proj_drop = nn.Identity()
+            self.proj_drop = nn.Dropout(base_dropout)  # Standard for projection
         else:
-            # Standard MLP with dropout
-            self.mlp = nn.Sequential(
-                nn.Linear(dim, mlp_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(mlp_dim, dim),
-                nn.Dropout(dropout)
-            )
-
-            self.fractal_reg = None
-            self.attn_drop = nn.Dropout(dropout)
-            self.proj_drop = nn.Dropout(dropout)
+            self.attn_drop = nn.Dropout(base_dropout)
+            self.route_drop = nn.Identity()
+            self.proj_drop = nn.Dropout(base_dropout)
 
         # Spine cross-attention (optional)
         if use_spine_cross_attn:
             self.spine_cross_attn = nn.MultiheadAttention(
                 dim, num_heads=max(1, num_heads // 2),
-                batch_first=True, dropout=dropout
+                batch_first=True, dropout=base_dropout
             )
             self.spine_norm = nn.LayerNorm(dim)
             self.spine_gate = nn.Parameter(torch.ones(1) * spine_gate_init)
@@ -536,17 +524,16 @@ class WormholeAttentionBlock(nn.Module):
         P = self.num_patches
         head_dim = self.head_dim
 
-        # Pre-norm
         x_norm = self.norm1(x)
 
-        # Get wormhole routes from content
+        # Get wormhole routes
         routes, route_weights, route_scores = self.router(
             x_norm, return_scores=return_routing
         )
 
-        # QKV projection - fused reshape
+        # QKV projection
         qkv = self.qkv(x_norm).view(B, S, 3, H, head_dim).permute(2, 0, 3, 1, 4)
-        Q, K_full, V = qkv.unbind(0)  # Each: [B, H, S, head_dim]
+        Q, K_full, V = qkv.unbind(0)
 
         # === CLS ATTENTION (dense) ===
         Q_cls = Q[:, :, :1, :]
@@ -557,39 +544,24 @@ class WormholeAttentionBlock(nn.Module):
         attn_cls = self.attn_drop(attn_cls)
         out_cls = torch.einsum('bhqk,bhkd->bhqd', attn_cls, V)
 
-        # === PATCH ATTENTION (sparse via wormholes) - BATCHED ===
-        Q_patches = Q[:, :, 1:, :]  # [B, H, P, head_dim]
+        # === PATCH ATTENTION (sparse via wormholes) ===
+        Q_patches = Q[:, :, 1:, :]
         K_patches = K_full[:, :, 1:, :]
         V_patches = V[:, :, 1:, :]
 
         # Batched gather through wormholes
-        K_gathered = gather_wormhole_multihead(K_patches, routes, H)  # [B, H, P, K, head_dim]
+        K_gathered = gather_wormhole_multihead(K_patches, routes, H)
         V_gathered = gather_wormhole_multihead(V_patches, routes, H)
+
+        # Apply topological dropout to gathered values (drops entire routes)
+        V_gathered = self.route_drop(V_gathered)
 
         # Sparse attention scores
         scores_patches = torch.einsum('bhpd,bhpkd->bhpk', Q_patches, K_gathered) * self.scale
-
-        # Incorporate route weights (log-space addition = multiplication)
         scores_patches = scores_patches + route_weights.unsqueeze(1).log().clamp(min=-10)
 
         attn_patches = F.softmax(scores_patches, dim=-1)
-
-        # Apply fractal regularization if enabled
-        if self.use_fractal_reg and self.fractal_reg is not None:
-            # Apply FractalRegularizer to gathered values before weighted sum
-            # V_gathered: [B, H, P, K, head_dim]
-            # Reshape for fractal reg: [B*H*P, K, head_dim]
-            V_shape = V_gathered.shape
-            V_flat = V_gathered.reshape(-1, V_shape[-2], V_shape[-1])
-
-            # Get importance from attention weights for this batch
-            # attn_patches: [B, H, P, K] -> mean over B, H, P to get per-route importance
-            importance = attn_patches.mean(dim=(0, 1, 2))  # [K]
-
-            V_reg = self.fractal_reg(V_flat, route_dim=-2, routing_weights=importance.unsqueeze(0))
-            V_gathered = V_reg.reshape(V_shape)
-        else:
-            attn_patches = self.attn_drop(attn_patches)
+        attn_patches = self.attn_drop(attn_patches)
 
         out_patches = torch.einsum('bhpk,bhpkd->bhpd', attn_patches, V_gathered)
 
@@ -597,10 +569,9 @@ class WormholeAttentionBlock(nn.Module):
         out = torch.cat([out_cls, out_patches], dim=2)
         out = self.proj_drop(self.proj(out.transpose(1, 2).reshape(B, S, D)))
 
-        # Residual
         x = x + out
 
-        # === SPINE CROSS-ATTENTION (optional) ===
+        # Spine cross-attention (optional)
         if self.use_spine_cross_attn and spine_tokens is not None:
             x_norm_spine = self.spine_norm(x)
             spine_context, _ = self.spine_cross_attn(
@@ -624,9 +595,7 @@ class WormholeTessellationExpert(nn.Module):
     """
     Feature-dim tessellation with learned wormhole connections.
 
-    Each tile processes its slice + gathered wormhole context.
-
-    V2.2: Optional CantorGate activation
+    V2.3: Topological dropout for tile routes
     """
 
     def __init__(
@@ -635,9 +604,8 @@ class WormholeTessellationExpert(nn.Module):
             num_tiles: int,
             num_wormholes: int = 4,
             temperature: float = 0.5,
+            config: Optional[DavidBeansV2Config] = None,
             dropout: float = 0.1,
-            use_fractal_reg: bool = False,
-            fractal_num_levels: int = 4
     ):
         super().__init__()
         self.dim = dim
@@ -645,29 +613,29 @@ class WormholeTessellationExpert(nn.Module):
         self.tile_dim = dim // num_tiles
         self.num_wormholes = min(num_wormholes, num_tiles - 1)
         self.temperature = temperature
-        self.use_fractal_reg = use_fractal_reg and FRACTAL_AVAILABLE
+        self.config = config
 
-        # Tile router (learns which tiles connect)
+        use_topo = config.use_topo_dropout if config else False
+        base_dropout = config.dropout if config else dropout
+
         self.tile_query = nn.Linear(self.tile_dim, self.tile_dim)
         self.tile_key = nn.Linear(self.tile_dim, self.tile_dim)
 
-        # Process: self + wormhole context
         context_dim = self.tile_dim * (1 + self.num_wormholes)
         hidden_dim = self.tile_dim * 2
 
-        if self.use_fractal_reg:
-            self.processor = nn.Sequential(
-                nn.Linear(context_dim, hidden_dim),
-                CantorGate(dim=hidden_dim, num_levels=fractal_num_levels),
-                nn.Linear(hidden_dim, self.tile_dim)
-            )
+        self.processor = nn.Sequential(
+            nn.Linear(context_dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(base_dropout),
+            nn.Linear(hidden_dim, self.tile_dim)
+        )
+
+        # Topological dropout for tiles [B, S, T, tile_dim] -> route_dim=2
+        if use_topo and TOPO_DROPOUT_AVAILABLE:
+            self.tile_drop = create_dropout(config, "topo", route_dim=2)
         else:
-            self.processor = nn.Sequential(
-                nn.Linear(context_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, self.tile_dim)
-            )
+            self.tile_drop = nn.Identity()
 
         self.norm = nn.LayerNorm(dim)
 
@@ -683,39 +651,37 @@ class WormholeTessellationExpert(nn.Module):
 
         x_norm = self.norm(x)
 
-        # Tessellate: [B, S, D] -> [B, S, T, tile_dim]
+        # Tessellate
         x_tiles = x_norm.view(B, S, T, tile_dim)
 
-        # Compute tile routing (shared across sequence positions)
-        tile_repr = x_tiles.mean(dim=1)  # [B, T, tile_dim]
+        # Apply tile dropout
+        x_tiles = self.tile_drop(x_tiles)
+
+        # Compute tile routing
+        tile_repr = x_tiles.mean(dim=1)
 
         queries = F.normalize(self.tile_query(tile_repr), dim=-1)
         keys = F.normalize(self.tile_key(tile_repr), dim=-1)
 
-        # Routing scores
-        scores = torch.bmm(queries, keys.transpose(1, 2))  # [B, T, T]
+        scores = torch.bmm(queries, keys.transpose(1, 2))
 
-        # Mask self
         mask = torch.eye(T, device=x.device, dtype=torch.bool)
         scores = scores.masked_fill(mask.unsqueeze(0), -1e9)
 
-        # Top-k wormholes per tile
         topk_scores, routes = torch.topk(scores / self.temperature, K, dim=-1)
-        weights = F.softmax(topk_scores, dim=-1)  # [B, T, K]
+        weights = F.softmax(topk_scores, dim=-1)
 
-        # === BATCHED GATHER across all sequence positions ===
-        gathered = gather_tiles(x_tiles, routes, S)  # [B, S, T, K, tile_dim]
+        # Batched gather
+        gathered = gather_tiles(x_tiles, routes, S)
 
-        # Concatenate: self + all wormhole neighbors
+        # Concatenate and process
         gathered_flat = gathered.view(B, S, T, K * tile_dim)
-        combined = torch.cat([x_tiles, gathered_flat], dim=-1)  # [B, S, T, (1+K)*tile_dim]
+        combined = torch.cat([x_tiles, gathered_flat], dim=-1)
 
-        # Process all tiles in parallel
-        out_tiles = self.processor(combined)  # [B, S, T, tile_dim]
+        out_tiles = self.processor(combined)
 
-        # Reconstruct
         out = out_tiles.reshape(B, S, D)
-        out = x + out  # Residual
+        out = x + out
 
         if return_routing:
             return out, {'routes': routes, 'weights': weights, 'scores': scores}
@@ -727,13 +693,7 @@ class WormholeTessellationExpert(nn.Module):
 # ============================================================================
 
 class ConfigurableBelly(nn.Module):
-    """
-    Multi-layer belly projection with optional residual connections.
-
-    Supports 2-4 layers with configurable expansion and residual.
-
-    V2.2: Optional CantorGate activation
-    """
+    """Multi-layer belly projection with optional residual connections."""
 
     def __init__(
         self,
@@ -743,56 +703,43 @@ class ConfigurableBelly(nn.Module):
         num_layers: int = 2,
         use_residual: bool = False,
         dropout: float = 0.1,
-        use_fractal_reg: bool = False,
-        fractal_num_levels: int = 4
     ):
         super().__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.num_layers = num_layers
         self.use_residual = use_residual
-        self.use_fractal_reg = use_fractal_reg and FRACTAL_AVAILABLE
 
         belly_dim = int(output_dim * expand)
 
-        layers = []
-
-        # Choose activation
-        if self.use_fractal_reg:
-            def make_activation(dim):
-                return CantorGate(dim=dim, num_levels=fractal_num_levels)
-        else:
-            def make_activation(dim):
-                return nn.Sequential(nn.GELU(), nn.Dropout(dropout))
+        def make_block(in_d, out_d, is_last=False):
+            if is_last:
+                return nn.Linear(in_d, out_d, bias=False)
+            return nn.Sequential(
+                nn.Linear(in_d, out_d),
+                nn.GELU(),
+                nn.Dropout(dropout)
+            )
 
         if num_layers == 2:
-            layers = [
-                nn.Linear(input_dim, belly_dim),
-                make_activation(belly_dim),
-                nn.Linear(belly_dim, output_dim, bias=False)
-            ]
+            self.layers = nn.Sequential(
+                make_block(input_dim, belly_dim),
+                make_block(belly_dim, output_dim, is_last=True)
+            )
         elif num_layers == 3:
-            layers = [
-                nn.Linear(input_dim, belly_dim),
-                make_activation(belly_dim),
-                nn.Linear(belly_dim, belly_dim),
-                make_activation(belly_dim),
-                nn.Linear(belly_dim, output_dim, bias=False)
-            ]
+            self.layers = nn.Sequential(
+                make_block(input_dim, belly_dim),
+                make_block(belly_dim, belly_dim),
+                make_block(belly_dim, output_dim, is_last=True)
+            )
         elif num_layers == 4:
-            layers = [
-                nn.Linear(input_dim, belly_dim),
-                make_activation(belly_dim),
-                nn.Linear(belly_dim, belly_dim),
-                make_activation(belly_dim),
-                nn.Linear(belly_dim, belly_dim),
-                make_activation(belly_dim),
-                nn.Linear(belly_dim, output_dim, bias=False)
-            ]
+            self.layers = nn.Sequential(
+                make_block(input_dim, belly_dim),
+                make_block(belly_dim, belly_dim),
+                make_block(belly_dim, belly_dim),
+                make_block(belly_dim, output_dim, is_last=True)
+            )
 
-        self.layers = nn.Sequential(*layers)
-
-        # Residual projection if dimensions differ and residual enabled
         if use_residual and input_dim != output_dim:
             self.residual_proj = nn.Linear(input_dim, output_dim, bias=False)
         else:
@@ -819,42 +766,27 @@ def compute_cantor_fingerprint(
     max_dim: int,
     theta: float = 0.0
 ) -> torch.Tensor:
-    """
-    Compute unique fingerprint mask with theta rotation.
-    Prevents redundant scales from learning identical representations.
-
-    Args:
-        active_dim: Active dimension for this scale
-        max_dim: Maximum scale dimension (for padding)
-        theta: Rotation angle for differentiation
-
-    Returns:
-        fingerprint: [max_dim] soft mask
-    """
+    """Compute unique fingerprint mask with theta rotation."""
     positions = torch.arange(max_dim).float()
 
-    # Cantor pairing for base pattern
     grid_size = int(max_dim ** 0.5) + 1
     x = positions % grid_size
     y = positions // grid_size
     cantor_z = ((x + y) * (x + y + 1)) / 2 + y
     cantor_z = cantor_z / cantor_z.max().clamp(min=1)
 
-    # Theta rotation (unique per copy)
     rotated = cantor_z * math.cos(theta) + (positions / max_dim) * math.sin(theta)
 
-    # Create soft mask: active region = 1, padded = decay
     mask = torch.zeros(max_dim)
     mask[:active_dim] = 1.0
 
-    # Blend: fingerprint modulates the mask
     fingerprint = mask * (0.5 + 0.5 * torch.tanh(rotated))
 
     return fingerprint
 
 
 # ============================================================================
-# MULTI-SCALE CRYSTAL HEAD
+# CRYSTAL PROJECTION HEADS
 # ============================================================================
 
 class CrystalProjectionHead(nn.Module):
@@ -870,10 +802,8 @@ class CrystalProjectionHead(nn.Module):
             belly_residual: bool = False,
             dropout: float = 0.1,
             temperature: float = 0.07,
-            theta: float = 0.0,  # For redundant scale differentiation
-            copy_index: int = 0,  # Which copy this is (0 = primary)
-            use_fractal_reg: bool = False,
-            fractal_num_levels: int = 4
+            theta: float = 0.0,
+            copy_index: int = 0,
     ):
         super().__init__()
         self.crystal_dim = crystal_dim
@@ -889,13 +819,10 @@ class CrystalProjectionHead(nn.Module):
                 num_layers=belly_layers,
                 use_residual=belly_residual,
                 dropout=dropout,
-                use_fractal_reg=use_fractal_reg,
-                fractal_num_levels=fractal_num_levels
             )
         else:
             self.projection = nn.Linear(input_dim, crystal_dim, bias=False)
 
-        # Learnable fingerprint for redundant copies
         if theta != 0.0:
             fingerprint = compute_cantor_fingerprint(crystal_dim, crystal_dim, theta)
             self.register_buffer('fingerprint', fingerprint)
@@ -905,7 +832,6 @@ class CrystalProjectionHead(nn.Module):
     def forward(self, features: torch.Tensor, anchors: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         z = self.projection(features)
 
-        # Apply fingerprint modulation for redundant copies
         if self.fingerprint is not None:
             z = z * self.fingerprint.unsqueeze(0)
 
@@ -916,14 +842,7 @@ class CrystalProjectionHead(nn.Module):
 
 
 class MultiScaleCrystalHead(nn.Module):
-    """
-    Multi-scale projection with learned fusion.
-
-    Supports:
-    - Multiple weighting modes (balanced, geometric, top_heavy, learned)
-    - Redundant scales with theta differentiation
-    - Collective shared space option
-    """
+    """Multi-scale projection with learned fusion."""
 
     def __init__(self, config: DavidBeansV2Config):
         super().__init__()
@@ -933,14 +852,11 @@ class MultiScaleCrystalHead(nn.Module):
         self.weighting_mode = config.weighting_mode
         self.scale_weight_floor = config.scale_weight_floor
 
-        # Handle redundant scale copies
         scale_copies = config.scale_copies or [1] * len(config.scales)
-        assert len(scale_copies) == len(config.scales), \
-            f"scale_copies length ({len(scale_copies)}) must match scales length ({len(config.scales)})"
+        assert len(scale_copies) == len(config.scales)
 
-        # Build heads (including copies)
         self.heads = nn.ModuleList()
-        self.head_scale_map = []  # Maps head index to (scale, copy_index)
+        self.head_scale_map = []
 
         for scale_idx, scale in enumerate(config.scales):
             num_copies = scale_copies[scale_idx]
@@ -958,17 +874,13 @@ class MultiScaleCrystalHead(nn.Module):
                     temperature=config.contrast_temperature,
                     theta=theta,
                     copy_index=copy_idx,
-                    use_fractal_reg=config.use_fractal_reg,
-                    fractal_num_levels=config.fractal_num_levels
                 )
                 self.heads.append(head)
                 self.head_scale_map.append((scale, copy_idx))
 
         self.num_heads = len(self.heads)
 
-        # Compute fixed scale weights based on mode
         if config.weighting_mode == "learned":
-            # Learned fusion network
             self.fusion = nn.Sequential(
                 nn.Linear(config.dim, config.dim // 2),
                 nn.LayerNorm(config.dim // 2),
@@ -981,12 +893,7 @@ class MultiScaleCrystalHead(nn.Module):
             self.fusion = None
             self.fixed_weights = self._compute_fixed_weights(config.weighting_mode, scale_copies)
 
-    def _compute_fixed_weights(
-        self,
-        mode: str,
-        scale_copies: List[int]
-    ) -> torch.Tensor:
-        """Compute fixed scale weights based on weighting mode."""
+    def _compute_fixed_weights(self, mode: str, scale_copies: List[int]) -> torch.Tensor:
         weights = []
 
         for scale_idx, scale in enumerate(self.scales):
@@ -995,10 +902,8 @@ class MultiScaleCrystalHead(nn.Module):
             if mode == "balanced":
                 base_weight = 1.0
             elif mode == "geometric":
-                # Larger scales get more weight
                 base_weight = 2.0 ** (scale_idx / (self.num_base_scales - 1))
             elif mode == "top_heavy":
-                # Only top scales get significant weight
                 if scale_idx >= self.num_base_scales - 2:
                     base_weight = 1.5
                 else:
@@ -1006,14 +911,11 @@ class MultiScaleCrystalHead(nn.Module):
             else:
                 base_weight = 1.0
 
-            # Distribute weight among copies
             copy_weight = base_weight / num_copies
             for _ in range(num_copies):
                 weights.append(copy_weight)
 
         weights = torch.tensor(weights, dtype=torch.float32)
-
-        # Apply floor and normalize
         weights = weights.clamp(min=self.scale_weight_floor)
         weights = weights / weights.sum()
 
@@ -1025,17 +927,13 @@ class MultiScaleCrystalHead(nn.Module):
             anchors_dict: Dict[int, torch.Tensor]
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
 
-        # Compute fusion weights
         if self.fusion is not None:
             fusion_weights = F.softmax(self.fusion(features), dim=-1)
-            # Apply floor
             fusion_weights = fusion_weights.clamp(min=self.scale_weight_floor)
             fusion_weights = fusion_weights / fusion_weights.sum(dim=-1, keepdim=True)
         else:
-            # Use fixed weights, expand for batch
             fusion_weights = self.fixed_weights.to(features.device).unsqueeze(0).expand(features.shape[0], -1)
 
-        # Process all heads
         scale_logits = [None] * self.num_heads
         scale_features = [None] * self.num_heads
 
@@ -1043,24 +941,14 @@ class MultiScaleCrystalHead(nn.Module):
             scale, copy_idx = self.head_scale_map[i]
             scale_logits[i], scale_features[i] = head(features, anchors_dict[scale])
 
-        # Fused weighted combination
         stacked_logits = torch.stack(scale_logits, dim=1)
         combined = torch.einsum('bs,bsc->bc', fusion_weights, stacked_logits)
 
         return combined, scale_logits, scale_features, fusion_weights
 
 
-# ============================================================================
-# COLLECTIVE CRYSTAL HEAD (Alternative Mode)
-# ============================================================================
-
 class CollectiveCrystalHead(nn.Module):
-    """
-    Collective multi-scale head with shared anchor space.
-
-    All scales project to max_scale dimension with pad/mask,
-    competing in shared space with fingerprint differentiation.
-    """
+    """Collective multi-scale head with shared anchor space."""
 
     def __init__(self, config: DavidBeansV2Config):
         super().__init__()
@@ -1069,7 +957,6 @@ class CollectiveCrystalHead(nn.Module):
         self.max_scale = max(config.scales)
         self.num_scales = len(config.scales)
 
-        # Per-scale projections (to active subspace)
         self.projections = nn.ModuleList()
         self.fingerprints = nn.ParameterList()
         self.weight_biases = nn.ParameterList()
@@ -1085,28 +972,23 @@ class CollectiveCrystalHead(nn.Module):
                     num_layers=config.belly_layers,
                     use_residual=config.belly_residual,
                     dropout=config.dropout,
-                    use_fractal_reg=config.use_fractal_reg,
-                    fractal_num_levels=config.fractal_num_levels
                 )
             else:
                 proj = nn.Linear(config.dim, scale, bias=False)
 
             self.projections.append(proj)
 
-            # Cantor fingerprint mask
             fingerprint = compute_cantor_fingerprint(scale, self.max_scale, theta)
             self.fingerprints.append(nn.Parameter(fingerprint, requires_grad=True))
 
-            # Weight bias scalar (like GeoDavid)
             self.weight_biases.append(nn.Parameter(torch.ones(1)))
 
-        # Learnable fusion weights
         self.fusion_weights = nn.Parameter(torch.ones(self.num_scales) / self.num_scales)
 
     def forward(
         self,
         features: torch.Tensor,
-        anchors: torch.Tensor  # Single shared anchor: [num_classes, max_scale]
+        anchors: torch.Tensor
     ) -> Tuple[torch.Tensor, List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         B = features.shape[0]
 
@@ -1116,46 +998,34 @@ class CollectiveCrystalHead(nn.Module):
         for i, (proj, fingerprint, bias) in enumerate(
             zip(self.projections, self.fingerprints, self.weight_biases)
         ):
-            # Project to active subspace
-            z_active = proj(features)  # [B, active_dim]
+            z_active = proj(features)
             z_active = F.normalize(z_active, dim=-1)
 
-            # Pad to max_scale
             z_padded = F.pad(z_active, (0, self.max_scale - z_active.shape[-1]))
-
-            # Apply fingerprint mask
             z_masked = z_padded * fingerprint.unsqueeze(0)
-
-            # Apply weight bias
             z_biased = z_masked * bias
 
             scale_outputs.append(z_biased)
 
-            # Compute logits against shared anchors
             anchors_norm = F.normalize(anchors, dim=-1)
             logits = torch.mm(z_biased, anchors_norm.T) / self.config.collective_temperature
             scale_logits.append(logits)
 
-        # Stack for collective processing
-        stacked = torch.stack(scale_outputs, dim=1)  # [B, num_scales, max_scale]
-
-        # Fusion with learned weights
         fusion = F.softmax(self.fusion_weights, dim=0)
         fusion_expanded = fusion.unsqueeze(0).expand(B, -1)
 
-        # Combined logits
-        stacked_logits = torch.stack(scale_logits, dim=1)  # [B, num_scales, num_classes]
+        stacked_logits = torch.stack(scale_logits, dim=1)
         combined = torch.einsum('bs,bsc->bc', fusion_expanded, stacked_logits)
 
         return combined, scale_logits, scale_outputs, fusion_expanded
 
 
 # ============================================================================
-# DAVIDBEANS V2 BACKBONE
+# DAVIDBEANS V2.3 BACKBONE
 # ============================================================================
 
 class BeansBackboneV2(nn.Module):
-    """Backbone with wormhole routing throughout and optional conv spine."""
+    """Backbone with wormhole routing and topological dropout."""
 
     def __init__(self, config: DavidBeansV2Config):
         super().__init__()
@@ -1179,6 +1049,15 @@ class BeansBackboneV2(nn.Module):
             stride=config.patch_size
         )
 
+        # Spatial dropout after patch embedding (optional)
+        if config.use_topo_dropout and config.use_spatial_dropout and TOPO_DROPOUT_AVAILABLE:
+            self.spatial_drop = SpatialTopologicalDropout(
+                drop_prob=config.spatial_drop_prob,
+                patch_size=config.spatial_patch_size,
+            )
+        else:
+            self.spatial_drop = nn.Identity()
+
         # Learnable tokens
         self.cls_token = nn.Parameter(torch.randn(1, 1, config.dim) * 0.02)
         self.pos_embed = nn.Parameter(
@@ -1199,13 +1078,7 @@ class BeansBackboneV2(nn.Module):
                     temperature=config.wormhole_temperature,
                     mode=config.wormhole_mode,
                     mlp_ratio=config.mlp_ratio,
-                    dropout=config.dropout,
-                    use_spine_cross_attn=config.use_spine and config.spine_cross_attn,
-                    spine_gate_init=config.spine_gate_init,
-                    use_fractal_reg=config.use_fractal_reg,
-                    fractal_num_levels=config.fractal_num_levels,
-                    fractal_drop_prob=config.fractal_drop_prob,
-                    fractal_min_routes=config.fractal_min_routes
+                    config=config,
                 )
             )
             self.expert_layers.append(
@@ -1213,9 +1086,7 @@ class BeansBackboneV2(nn.Module):
                     dim=config.dim,
                     num_tiles=config.num_tiles,
                     num_wormholes=config.tile_wormholes,
-                    dropout=config.dropout,
-                    use_fractal_reg=config.use_fractal_reg,
-                    fractal_num_levels=config.fractal_num_levels
+                    config=config,
                 )
             )
 
@@ -1234,14 +1105,16 @@ class BeansBackboneV2(nn.Module):
         if self.spine is not None:
             spine_global, spine_tokens = self.spine(x)
 
-        # Patch embedding
-        x = self.patch_embed(x).flatten(2).transpose(1, 2)
+        # Patch embedding with optional spatial dropout
+        x = self.patch_embed(x)  # [B, D, H, W]
+        x = self.spatial_drop(x)  # Spatial topological dropout
+        x = x.flatten(2).transpose(1, 2)  # [B, N, D]
+
         x = torch.cat([self.cls_token.expand(B, -1, -1), x], dim=1)
         x = x + self.pos_embed
 
         routing_info = {'attention': [], 'expert': []} if return_routing else None
 
-        # Interleaved attention + expert layers
         for attn, expert in zip(self.attention_blocks, self.expert_layers):
             x, attn_routing = attn(x, spine_tokens=spine_tokens, return_routing=return_routing)
             if return_routing:
@@ -1257,44 +1130,58 @@ class BeansBackboneV2(nn.Module):
 
 
 # ============================================================================
-# DAVIDBEANS V2 FULL MODEL
+# DAVIDBEANS V2.3 FULL MODEL
 # ============================================================================
 
 class DavidBeansV2(nn.Module):
     """
-    DavidBeans V2: Multi-scale classification with wormhole routing.
-
-    V2.2: Optional FractalRegularizer for structure-preserving dropout
+    DavidBeans V2.3: Multi-scale classification with wormhole routing
+    and structure-preserving topological dropout.
     """
 
     def __init__(self, config: DavidBeansV2Config):
         super().__init__()
         self.config = config
 
-        # Backbone
         self.backbone = BeansBackboneV2(config)
 
-        # Crystal head (multi-scale or collective)
         if config.use_collective:
             self.head = CollectiveCrystalHead(config)
         else:
             self.head = MultiScaleCrystalHead(config)
 
-        # Class anchors per scale
         if config.use_collective:
-            # Single shared anchor for collective mode
             max_scale = max(config.scales)
             self.anchors = nn.Parameter(torch.randn(config.num_classes, max_scale) * 0.02)
         else:
-            # Per-scale anchors
             self.anchors = nn.ParameterDict({
                 str(s): nn.Parameter(torch.randn(config.num_classes, s) * 0.02)
                 for s in config.scales
             })
 
     def get_anchors_dict(self) -> Dict[int, torch.Tensor]:
-        """Get anchors dictionary for non-collective mode."""
         return {int(k): v for k, v in self.anchors.items()}
+
+    def set_epoch(self, epoch: int):
+        """
+        Set current epoch for scheduled dropout warmup.
+        Call this at the start of each epoch.
+        """
+        for block in self.backbone.attention_blocks:
+            if hasattr(block.attn_drop, 'set_step'):
+                step = epoch * self.config.topo_steps_per_epoch
+                block.attn_drop.set_step(step)
+            if hasattr(block.route_drop, 'set_step'):
+                step = epoch * self.config.topo_steps_per_epoch
+                block.route_drop.set_step(step)
+
+    def reset_dropout_schedule(self):
+        """Reset dropout schedules (call at start of training)."""
+        for block in self.backbone.attention_blocks:
+            if hasattr(block.attn_drop, 'reset_schedule'):
+                block.attn_drop.reset_schedule()
+            if hasattr(block.route_drop, 'reset_schedule'):
+                block.route_drop.reset_schedule()
 
     def forward(
             self,
@@ -1304,13 +1191,10 @@ class DavidBeansV2(nn.Module):
             return_loss: bool = True
     ) -> Dict[str, torch.Tensor]:
 
-        # Backbone forward
         all_tokens, routing_info, spine_features = self.backbone(x, return_routing=return_routing)
 
-        # Get CLS token
         cls_token = all_tokens[:, 0, :]
 
-        # Crystal head forward
         if self.config.use_collective:
             combined_logits, scale_logits, scale_features, fusion_weights = self.head(
                 cls_token, self.anchors
@@ -1354,19 +1238,15 @@ class DavidBeansV2(nn.Module):
         anchors: Dict[int, torch.Tensor],
         targets: torch.Tensor
     ) -> Dict[str, torch.Tensor]:
-        """Compute all loss components."""
         losses = {}
 
-        # CE loss on combined logits
         losses['ce'] = F.cross_entropy(combined_logits, targets)
 
-        # Per-scale CE (for logging)
         for i, logits in enumerate(scale_logits):
             scale, copy_idx = self.head.head_scale_map[i] if hasattr(self.head, 'head_scale_map') else (self.config.scales[i], 0)
             key = f'ce_{scale}' if copy_idx == 0 else f'ce_{scale}_c{copy_idx}'
             losses[key] = F.cross_entropy(logits, targets)
 
-        # Contrastive loss
         if not self.config.use_collective:
             patch_tokens = all_tokens[:, 1:, :]
             contrast_loss = self._compute_contrast_loss(
@@ -1376,7 +1256,6 @@ class DavidBeansV2(nn.Module):
         else:
             losses['contrast'] = torch.tensor(0.0, device=combined_logits.device)
 
-        # Total loss
         losses['total'] = (
             losses['ce'] +
             self.config.contrast_weight * losses['contrast']
@@ -1391,7 +1270,6 @@ class DavidBeansV2(nn.Module):
             anchors_dict: Dict[int, torch.Tensor],
             targets: torch.Tensor
     ) -> torch.Tensor:
-        """Batched contrastive loss across scales."""
         device = patch_features.device
 
         total_loss = torch.tensor(0.0, device=device)
@@ -1400,7 +1278,6 @@ class DavidBeansV2(nn.Module):
         for i, scale_feat in enumerate(scale_features):
             scale, copy_idx = self.head.head_scale_map[i] if hasattr(self.head, 'head_scale_map') else (self.config.scales[i], 0)
 
-            # Only compute contrast for primary copies
             if copy_idx == 0:
                 anchors = anchors_dict[scale]
                 scale_feat_norm = F.normalize(scale_feat, dim=-1)
@@ -1413,12 +1290,19 @@ class DavidBeansV2(nn.Module):
         return total_loss / max(num_primary_scales, 1)
 
     def get_model_info(self) -> Dict:
-        # Count total heads including copies
         num_heads = len(self.head.heads) if hasattr(self.head, 'heads') else len(self.config.scales)
+
+        # Get current dropout prob if scheduled
+        current_drop = self.config.topo_drop_prob
+        if self.config.use_topo_dropout:
+            for block in self.backbone.attention_blocks:
+                if hasattr(block.attn_drop, 'current_drop_prob'):
+                    current_drop = block.attn_drop.current_drop_prob
+                    break
 
         return {
             'name': 'DavidBeans-V2-Wormhole',
-            'version': '2.2',
+            'version': '2.3',
             'image_size': self.config.image_size,
             'patch_size': self.config.patch_size,
             'dim': self.config.dim,
@@ -1436,7 +1320,11 @@ class DavidBeansV2(nn.Module):
             'belly_residual': self.config.belly_residual,
             'use_spine': self.config.use_spine,
             'use_collective': self.config.use_collective,
-            'use_fractal_reg': self.config.use_fractal_reg,
+            'use_topo_dropout': self.config.use_topo_dropout,
+            'topo_drop_prob': self.config.topo_drop_prob,
+            'topo_warmup_epochs': self.config.topo_warmup_epochs,
+            'current_drop_prob': current_drop,
+            'use_spatial_dropout': self.config.use_spatial_dropout,
             'num_classes': self.config.num_classes,
             'num_patches': self.config.num_patches,
             'total_params': sum(p.numel() for p in self.parameters()),
@@ -1447,16 +1335,22 @@ class DavidBeansV2(nn.Module):
         spine_str = f"\n  Spine: {self.config.spine_channels}" if info['use_spine'] else ""
         collective_str = " (collective)" if info['use_collective'] else ""
         copies_str = f", copies={info['scale_copies']}" if info['scale_copies'] else ""
-        fractal_str = " [FractalReg]" if info['use_fractal_reg'] else ""
+
+        if info['use_topo_dropout']:
+            topo_str = f" [TopoDrop p={info['topo_drop_prob']}, warmup={info['topo_warmup_epochs']}ep]"
+        else:
+            topo_str = ""
+
+        spatial_str = " [SpatialDrop]" if info['use_spatial_dropout'] else ""
 
         return (
-            f"DavidBeans-V2.2-Wormhole(\n"
+            f"DavidBeans-V2.3-Wormhole(\n"
             f"  Vision: {info['image_size']}px → {info['num_patches']} patches\n"
             f"  Backbone: {info['num_layers']} layers, {info['dim']}d, {info['num_heads']} heads\n"
             f"  Wormholes: {info['num_wormholes']} per position, mode={info['wormhole_mode']}\n"
             f"  Tessellation: {info['num_tiles']} tiles × {info['tile_wormholes']} wormholes\n"
             f"  Scales: {info['scales']}{copies_str}{collective_str}\n"
-            f"  Weighting: {info['weighting_mode']}, belly={info['belly_layers']}L{fractal_str}\n"
+            f"  Weighting: {info['weighting_mode']}, belly={info['belly_layers']}L{topo_str}{spatial_str}\n"
             f"  Parameters: {info['total_params']:,}{spine_str}\n"
             f")"
         )
@@ -1469,10 +1363,10 @@ class DavidBeansV2(nn.Module):
 def test_v2():
     """Quick functionality test."""
     print("=" * 60)
-    print("DavidBeans V2.2 - Wormhole Routing Test")
+    print("DavidBeans V2.3 - Topological Dropout Test")
     print("=" * 60)
 
-    # Test basic config
+    # Test with topological dropout
     config = DavidBeansV2Config(
         image_size=32,
         patch_size=4,
@@ -1484,9 +1378,14 @@ def test_v2():
         tile_wormholes=3,
         scales=[64, 128, 256],
         num_classes=100,
-        belly_layers=3,
-        belly_residual=True,
-        weighting_mode="geometric"
+        belly_layers=2,
+        # Topological dropout settings
+        use_topo_dropout=True,
+        topo_drop_prob=0.15,
+        topo_warmup_epochs=35,
+        topo_min_routes_keep=2,
+        use_spatial_dropout=True,
+        spatial_drop_prob=0.1,
     )
 
     model = DavidBeansV2(config)
@@ -1496,49 +1395,36 @@ def test_v2():
     x = torch.randn(4, 3, 32, 32)
     targets = torch.randint(0, 100, (4,))
 
+    # Test training mode
+    model.train()
     result = model(x, targets=targets, return_routing=True)
 
-    print(f"\nOutput shapes:")
+    print(f"\nTraining mode:")
     print(f"  Logits: {result['logits'].shape}")
-    print(f"  Features: {result['features'].shape}")
     print(f"  Total loss: {result['losses']['total'].item():.4f}")
-    print(f"  Fusion weights: {result['fusion_weights'][0]}")
 
-    # Test with FractalRegularizer if available
-    if FRACTAL_AVAILABLE:
-        print("\n" + "=" * 60)
-        print("Testing FractalRegularizer...")
+    # Check dropout schedule
+    info = model.get_model_info()
+    print(f"  Current drop prob: {info['current_drop_prob']:.4f}")
 
-        config_fractal = DavidBeansV2Config(
-            image_size=32,
-            patch_size=4,
-            dim=256,
-            num_layers=2,
-            num_heads=4,
-            num_wormholes=8,
-            num_tiles=8,
-            tile_wormholes=3,
-            scales=[64, 128, 256],
-            num_classes=100,
-            use_fractal_reg=True,
-            fractal_num_levels=4,
-            fractal_drop_prob=0.1,
-            fractal_min_routes=2
-        )
+    # Simulate epoch progression
+    print(f"\nDropout schedule progression:")
+    for epoch in [0, 10, 20, 35, 50]:
+        model.set_epoch(epoch)
+        info = model.get_model_info()
+        print(f"  Epoch {epoch:2d}: drop_prob = {info['current_drop_prob']:.4f}")
 
-        model_fractal = DavidBeansV2(config_fractal)
-        print(model_fractal)
+    # Test eval mode
+    model.eval()
+    result_eval = model(x, targets=targets)
+    print(f"\nEval mode:")
+    print(f"  Total loss: {result_eval['losses']['total'].item():.4f}")
 
-        result_fractal = model_fractal(x, targets=targets)
-        print(f"  With FractalReg - Loss: {result_fractal['losses']['total'].item():.4f}")
-    else:
-        print("\n  FractalRegularizer not available, skipping test")
-
-    # Test with spine
+    # Test without topological dropout
     print("\n" + "=" * 60)
-    print("Testing conv spine...")
+    print("Testing without topological dropout...")
 
-    config3 = DavidBeansV2Config(
+    config_standard = DavidBeansV2Config(
         image_size=32,
         patch_size=4,
         dim=256,
@@ -1549,20 +1435,17 @@ def test_v2():
         tile_wormholes=3,
         scales=[64, 128, 256],
         num_classes=100,
-        use_spine=True,
-        spine_channels=[32, 64, 128],
-        spine_cross_attn=True
+        use_topo_dropout=False,
+        use_spatial_dropout=False,
     )
 
-    model3 = DavidBeansV2(config3)
-    print(model3)
+    model_standard = DavidBeansV2(config_standard)
+    print(model_standard)
 
-    result3 = model3(x, targets=targets)
-    print(f"  Has spine features: {'spine_features' in result3}")
-    if 'spine_features' in result3:
-        print(f"  Spine features shape: {result3['spine_features'].shape}")
+    result_standard = model_standard(x, targets=targets)
+    print(f"  Total loss: {result_standard['losses']['total'].item():.4f}")
 
-    print("\n✓ All V2.2 tests passed!")
+    print("\n✓ All V2.3 tests passed!")
 
     return model, config
 
