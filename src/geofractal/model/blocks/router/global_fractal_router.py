@@ -548,10 +548,21 @@ class RouterMessage:
         metadata: Optional[Dict] = None,
     ):
         self.sender_id = sender_id
-        self.sender_fingerprint = sender_fingerprint
-        self.routing_state = routing_state
-        self.anchor_affinities = anchor_affinities
+        # Detach and keep on same device
+        self.sender_fingerprint = sender_fingerprint.detach()
+        self.routing_state = routing_state.detach()
+        self.anchor_affinities = anchor_affinities.detach() if anchor_affinities is not None else None
         self.metadata = metadata or {}
+
+    def to(self, device: torch.device) -> 'RouterMessage':
+        """Move message tensors to device."""
+        return RouterMessage(
+            sender_id=self.sender_id,
+            sender_fingerprint=self.sender_fingerprint.to(device),
+            routing_state=self.routing_state.to(device),
+            anchor_affinities=self.anchor_affinities.to(device) if self.anchor_affinities is not None else None,
+            metadata=self.metadata,
+        )
 
 
 class RouterMailbox:
@@ -599,14 +610,20 @@ class RouterMailbox:
         if self._fingerprint_cache is None:
             return []
 
+        device = reader_fingerprint.device
+
+        # Ensure cache is on same device
+        fingerprint_cache = self._fingerprint_cache.to(device)
+
         # Batched cosine similarity
         fp_sims = F.cosine_similarity(
             reader_fingerprint.unsqueeze(0),
-            self._fingerprint_cache,
+            fingerprint_cache,
             dim=-1
         )
 
         reg_affinities = self.registry.compute_affinity_batched(reader_id, self._id_cache)
+        reg_affinities = reg_affinities.to(device)
 
         scores = 0.6 * reg_affinities + 0.4 * fp_sims
 
@@ -795,7 +812,8 @@ class GlobalFractalRouter(nn.Module):
         if mailbox is not None:
             messages = mailbox.read(self.module_id, self.fingerprint)
             if messages:
-                states = torch.stack([m.routing_state for m in messages])
+                # Move states to current device and stack
+                states = torch.stack([m.routing_state.to(data.device) for m in messages])
                 router_context = self.comm_decoder(states.mean(dim=0))
 
         # Compute anchor affinities

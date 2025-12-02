@@ -22,26 +22,20 @@ from dataclasses import dataclass, field
 from contextlib import contextmanager
 import math
 
-# Attempt imports from v2
-try:
-    from global_fractal_router_v2 import (
-        GlobalFractalRouter,
-        GlobalFractalRouterConfig,
-        FingerprintRegistry,
-        get_registry,
-        AnchorBank,
-        AdjacentGate,
-        RouterMailbox,
-        FractalRouterNetwork,
-        ProvenanceTensor,
-        build_local_mask,
-        get_primes,
-    )
-    IMPORT_SUCCESS = True
-except ImportError as e:
-    print(f"Warning: Could not import from global_fractal_router_v2: {e}")
-    print("Running in standalone mode with inline definitions")
-    IMPORT_SUCCESS = False
+from geofractal.model.blocks.router.global_fractal_router import (
+    GlobalFractalRouter,
+    GlobalFractalRouterConfig,
+    FingerprintRegistry,
+    get_registry,
+    AnchorBank,
+    AdjacentGate,
+    RouterMailbox,
+    FractalRouterNetwork,
+    ProvenanceTensor,
+    build_local_mask,
+    get_primes,
+)
+IMPORT_SUCCESS = True
 
 
 # =============================================================================
