@@ -420,7 +420,7 @@ class AnchorBank(nn.Module):
 # OPTIMIZED ADJACENT GATE
 # =============================================================================
 
-class AdjacentGateOptimized(nn.Module):
+class AdjacentGate(nn.Module):
     """
     Batched potential field computation - single forward pass.
     Original: 1.6ms for 16 fields (16 sequential forwards)
@@ -524,7 +524,7 @@ class RouterMessage:
         self.metadata = metadata or {}
 
 
-class RouterMailboxOptimized:
+class RouterMailbox:
     """
     Batched message reading with vectorized similarity.
     Original: 27ms for 256 messages
@@ -642,7 +642,7 @@ def build_local_mask_vectorized(
 # OPTIMIZED GLOBAL FRACTAL ROUTER
 # =============================================================================
 
-class GlobalFractalRouterOptimized(nn.Module):
+class GlobalFractalRouter(nn.Module):
     """
     Optimized fractal router with all vectorized operations.
     """
@@ -682,7 +682,7 @@ class GlobalFractalRouterOptimized(nn.Module):
 
         # OPTIMIZED: Use optimized adjacent gate
         if config.use_adjacent_gating:
-            self.adjacent_gate = AdjacentGateOptimized(
+            self.adjacent_gate = AdjacentGate(
                 feature_dim=config.feature_dim,
                 fingerprint_dim=config.fingerprint_dim,
                 num_fields=config.num_potential_fields,
@@ -750,7 +750,7 @@ class GlobalFractalRouterOptimized(nn.Module):
     def forward(
         self,
         x: Union[torch.Tensor, ProvenanceTensor],
-        mailbox: Optional[RouterMailboxOptimized] = None,
+        mailbox: Optional[RouterMailbox] = None,
         target_fingerprint: Optional[torch.Tensor] = None,
         skip_first: bool = True,
         return_provenance: bool = False,
@@ -855,7 +855,7 @@ class GlobalFractalRouterOptimized(nn.Module):
 # OPTIMIZED ROUTER NETWORK
 # =============================================================================
 
-class FractalRouterNetworkOptimized(nn.Module):
+class FractalRouterNetwork(nn.Module):
     def __init__(
         self,
         config: GlobalFractalRouterConfig,
@@ -874,7 +874,7 @@ class FractalRouterNetworkOptimized(nn.Module):
         if topology == "chain":
             parent = None
             for i in range(num_routers):
-                router = GlobalFractalRouterOptimized(
+                router = GlobalFractalRouter(
                     config=config,
                     parent_id=parent,
                     cooperation_group=group,
@@ -885,7 +885,7 @@ class FractalRouterNetworkOptimized(nn.Module):
 
         elif topology == "parallel":
             for i in range(num_routers):
-                router = GlobalFractalRouterOptimized(
+                router = GlobalFractalRouter(
                     config=config,
                     parent_id=None,
                     cooperation_group=group,
@@ -898,7 +898,7 @@ class FractalRouterNetworkOptimized(nn.Module):
             router_idx = 0
             while router_idx < num_routers:
                 parent = parents[router_idx // 2] if router_idx > 0 else None
-                router = GlobalFractalRouterOptimized(
+                router = GlobalFractalRouter(
                     config=config,
                     parent_id=parent,
                     cooperation_group=group,
@@ -908,7 +908,7 @@ class FractalRouterNetworkOptimized(nn.Module):
                 parents.append(router.module_id)
                 router_idx += 1
 
-        self.mailbox = RouterMailboxOptimized(config)
+        self.mailbox = RouterMailbox(config)
 
     def forward(
         self,
@@ -1037,7 +1037,7 @@ def benchmark_optimizations():
         num_routes=8,
     )
 
-    router = GlobalFractalRouterOptimized(config, name="test").to(device)
+    router = GlobalFractalRouter(config, name="test").to(device)
     router.eval()
 
     x = torch.randn(4, 65, 256, device=device)
