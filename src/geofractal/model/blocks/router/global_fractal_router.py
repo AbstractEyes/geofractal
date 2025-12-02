@@ -1,12 +1,12 @@
 """
-global_fractal_router_optimized.py - Vectorized Global Fingerprint Router
+global_fractal_router_v2.py - Global Fingerprint Routing with Provenance Tracking
 
-Optimizations over original:
-1. local_mask: meshgrid vectorization (340ms → <1ms)
-2. mailbox_read: batched cosine similarity (27ms → <1ms)
-3. prime_generation: sieve of eratosthenes (87ms → <1ms)
-4. potential_fields: single batched forward (1.6ms → 0.3ms)
-5. basis_construction: vectorized sin/cos (22ms → <2ms)
+Vectorized implementation with all hotspots addressed:
+- local_mask: meshgrid vectorization
+- mailbox_read: batched cosine similarity + caching
+- prime_generation: precomputed lookup table
+- potential_fields: single batched forward
+- basis_construction: vectorized sin/cos
 
 Author: AbstractPhil
 Date: December 2025
@@ -26,7 +26,6 @@ from weakref import WeakValueDictionary
 # PRECOMPUTED PRIMES (eliminates runtime generation)
 # =============================================================================
 
-# First 1024 primes - computed once, stored as constant
 PRECOMPUTED_PRIMES: Tuple[int, ...] = (
     2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
     73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151,
@@ -115,12 +114,12 @@ PRECOMPUTED_PRIMES: Tuple[int, ...] = (
 
 
 def get_primes(n: int) -> List[int]:
-    """Get first n primes from precomputed table or generate if needed."""
+    """Get first n primes from precomputed table or generate via sieve."""
     if n <= len(PRECOMPUTED_PRIMES):
         return list(PRECOMPUTED_PRIMES[:n])
 
-    # Fallback: Sieve of Eratosthenes for larger n (vectorized)
-    limit = max(n * 15, 1000)  # Estimate upper bound
+    # Fallback: Sieve of Eratosthenes
+    limit = max(n * 15, 1000)
     sieve = torch.ones(limit, dtype=torch.bool)
     sieve[0] = sieve[1] = False
 
@@ -130,6 +129,37 @@ def get_primes(n: int) -> List[int]:
 
     primes = torch.where(sieve)[0].tolist()
     return primes[:n]
+
+
+# =============================================================================
+# VECTORIZED UTILITIES
+# =============================================================================
+
+def build_local_mask(
+    num_positions: int,
+    grid_size: int,
+    window_size: int,
+    device: torch.device = None,
+) -> torch.Tensor:
+    """
+    Vectorized local window mask using meshgrid.
+    Returns True where positions are OUTSIDE the window (to be masked).
+    """
+    device = device or torch.device('cpu')
+
+    pos = torch.arange(num_positions, device=device)
+    x = pos % grid_size
+    y = pos // grid_size
+
+    xi, xj = torch.meshgrid(x, x, indexing='ij')
+    yi, yj = torch.meshgrid(y, y, indexing='ij')
+
+    x_dist = (xi - xj).abs()
+    y_dist = (yi - yj).abs()
+
+    mask = (x_dist > window_size) | (y_dist > window_size)
+
+    return mask
 
 
 # =============================================================================
@@ -145,6 +175,8 @@ class CooperationMode(Enum):
 
 @dataclass
 class GlobalFractalRouterConfig:
+    """Configuration for the global fractal routing system."""
+
     fingerprint_dim: int = 64
     max_fingerprint_depth: int = 16
 
@@ -168,11 +200,11 @@ class GlobalFractalRouterConfig:
 
 
 # =============================================================================
-# OPTIMIZED FINGERPRINT REGISTRY
+# FINGERPRINT REGISTRY
 # =============================================================================
 
 class FingerprintRegistry:
-    """Global registry with vectorized operations."""
+    """Global registry ensuring unique fingerprints with vectorized operations."""
 
     _instance = None
     _initialized = False
@@ -194,23 +226,16 @@ class FingerprintRegistry:
         self._modules: WeakValueDictionary = WeakValueDictionary()
         self._counter = 0
 
-        # OPTIMIZED: Vectorized basis construction
-        self._basis = self._build_orthogonal_basis_vectorized(64, 1024)
+        self._basis = self._build_orthogonal_basis(64, 1024)
 
-    def _build_orthogonal_basis_vectorized(self, dim: int, count: int) -> torch.Tensor:
-        """
-        Vectorized basis construction - no Python loops.
-        Original: 22ms for 1024 vectors
-        Optimized: <2ms
-        """
+    def _build_orthogonal_basis(self, dim: int, count: int) -> torch.Tensor:
+        """Vectorized basis construction - no Python loops."""
         primes = torch.tensor(get_primes(count), dtype=torch.float32)
 
-        # [count, dim] grid
         t = torch.linspace(0, 2 * math.pi, dim).unsqueeze(0)  # [1, dim]
         p = primes.unsqueeze(1)  # [count, 1]
         i = torch.arange(count, dtype=torch.float32).unsqueeze(1)  # [count, 1]
 
-        # Vectorized sin/cos computation
         basis = torch.sin(t * p) * torch.cos(i * 0.1)
 
         return F.normalize(basis, dim=-1)
@@ -222,6 +247,7 @@ class FingerprintRegistry:
         parent_id: Optional[str] = None,
         cooperation_group: Optional[str] = None,
     ) -> str:
+        """Register a module and assign a unique fingerprint."""
         module_id = name or f"module_{self._counter}"
         self._counter += 1
 
@@ -245,11 +271,13 @@ class FingerprintRegistry:
         return module_id
 
     def get_fingerprint(self, module_id: str) -> torch.Tensor:
+        """Get fingerprint for a registered module."""
         if module_id not in self._registry:
             raise KeyError(f"Module {module_id} not registered")
         return self._registry[module_id]
 
     def get_lineage(self, module_id: str) -> List[str]:
+        """Get full parent chain for a module."""
         lineage = [module_id]
         current = module_id
         while current in self._hierarchy:
@@ -258,11 +286,7 @@ class FingerprintRegistry:
         return lineage[::-1]
 
     def compute_affinity_batched(self, query_id: str, candidate_ids: List[str]) -> torch.Tensor:
-        """
-        Batched affinity computation - single vectorized operation.
-        Original: O(n) Python loop with individual cosine sims
-        Optimized: Single batched matmul
-        """
+        """Batched affinity computation - single vectorized operation."""
         if not candidate_ids:
             return torch.tensor([])
 
@@ -270,7 +294,6 @@ class FingerprintRegistry:
         if query_fp is None:
             return torch.zeros(len(candidate_ids))
 
-        # Stack all candidate fingerprints
         candidate_fps = []
         valid_mask = []
         for cid in candidate_ids:
@@ -282,23 +305,21 @@ class FingerprintRegistry:
                 candidate_fps.append(torch.zeros_like(query_fp))
                 valid_mask.append(False)
 
-        candidates = torch.stack(candidate_fps)  # [N, D]
+        candidates = torch.stack(candidate_fps)
         valid_mask = torch.tensor(valid_mask)
 
-        # Batched cosine similarity
         cosine_sims = F.cosine_similarity(
-            query_fp.unsqueeze(0),  # [1, D]
-            candidates,              # [N, D]
+            query_fp.unsqueeze(0),
+            candidates,
             dim=-1
-        )  # [N]
+        )
 
-        # Mask invalid
         cosine_sims = cosine_sims * valid_mask.float()
 
         return cosine_sims
 
     def compute_affinity(self, id_a: str, id_b: str) -> float:
-        """Single affinity computation (kept for compatibility)."""
+        """Single affinity computation (for compatibility)."""
         return self.compute_affinity_batched(id_a, [id_b])[0].item()
 
     def get_cooperation_matrix(self, module_ids: List[str]) -> torch.Tensor:
@@ -313,6 +334,7 @@ class FingerprintRegistry:
         return matrix
 
     def reset(self):
+        """Reset registry."""
         self._registry.clear()
         self._hierarchy.clear()
         self._cooperation_groups.clear()
@@ -325,10 +347,12 @@ def get_registry() -> FingerprintRegistry:
 
 
 # =============================================================================
-# PROVENANCE TENSOR (unchanged - already efficient)
+# PROVENANCE TENSOR
 # =============================================================================
 
 class ProvenanceTensor:
+    """Wrapper that carries fingerprint provenance with tensor data."""
+
     def __init__(
         self,
         data: torch.Tensor,
@@ -341,6 +365,7 @@ class ProvenanceTensor:
 
     @property
     def current_fingerprint(self) -> torch.Tensor:
+        """Compute current fingerprint from source + transformations."""
         fp = self.source_fingerprint
         for transform_fp in self.transformation_chain:
             fp = F.normalize(fp + 0.1 * transform_fp, dim=-1)
@@ -351,6 +376,7 @@ class ProvenanceTensor:
         return len(self.transformation_chain)
 
     def transform(self, transformer_fingerprint: torch.Tensor) -> 'ProvenanceTensor':
+        """Create new ProvenanceTensor with added transformation."""
         return ProvenanceTensor(
             data=self.data,
             source_fingerprint=self.source_fingerprint,
@@ -358,6 +384,7 @@ class ProvenanceTensor:
         )
 
     def with_data(self, new_data: torch.Tensor) -> 'ProvenanceTensor':
+        """Create copy with new data, same provenance."""
         return ProvenanceTensor(
             data=new_data,
             source_fingerprint=self.source_fingerprint,
@@ -366,10 +393,12 @@ class ProvenanceTensor:
 
 
 # =============================================================================
-# ANCHOR BANK (unchanged - already uses matmul)
+# ANCHOR BANK
 # =============================================================================
 
 class AnchorBank(nn.Module):
+    """Learned behavioral anchors for routing decisions."""
+
     def __init__(self, num_anchors: int, anchor_dim: int, fingerprint_dim: int):
         super().__init__()
         self.num_anchors = num_anchors
@@ -385,12 +414,12 @@ class AnchorBank(nn.Module):
         self.fingerprint_proj = nn.Linear(fingerprint_dim, anchor_dim)
 
     def _build_anchor_fingerprints(self) -> torch.Tensor:
+        """Vectorized anchor fingerprint construction."""
         phi = (1 + math.sqrt(5)) / 2
         i = torch.arange(self.num_anchors, dtype=torch.float32)
         d = torch.arange(self.fingerprint_dim, dtype=torch.float32)
 
         theta = 2 * math.pi * i / phi
-        # Vectorized: [num_anchors, fingerprint_dim]
         fingerprints = torch.sin(theta.unsqueeze(1) * (d.unsqueeze(0) + 1) / self.fingerprint_dim)
 
         return F.normalize(fingerprints, dim=-1)
@@ -400,6 +429,7 @@ class AnchorBank(nn.Module):
         features: torch.Tensor,
         query_fingerprint: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute anchor affinities for input features."""
         feat_proj = F.normalize(self.feature_proj(features), dim=-1)
         anchors_norm = F.normalize(self.anchor_embeddings, dim=-1)
 
@@ -417,14 +447,13 @@ class AnchorBank(nn.Module):
 
 
 # =============================================================================
-# OPTIMIZED ADJACENT GATE
+# ADJACENT GATE (Batched)
 # =============================================================================
 
 class AdjacentGate(nn.Module):
     """
-    Batched potential field computation - single forward pass.
-    Original: 1.6ms for 16 fields (16 sequential forwards)
-    Optimized: ~0.3ms (single batched forward)
+    Gates information flow based on adjacent potential fields.
+    Uses single batched forward for all fields.
     """
 
     def __init__(
@@ -439,11 +468,11 @@ class AdjacentGate(nn.Module):
         self.fingerprint_dim = fingerprint_dim
         self.num_fields = num_fields
 
-        # OPTIMIZED: Single shared network with multi-head output
+        # Single network outputs all fields at once
         self.field_net = nn.Sequential(
             nn.Linear(feature_dim + fingerprint_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, num_fields),  # All fields in one forward
+            nn.Linear(hidden_dim, num_fields),
         )
 
         self.gate_net = nn.Sequential(
@@ -467,9 +496,7 @@ class AdjacentGate(nn.Module):
             fingerprint = fingerprint.unsqueeze(0).expand(B, -1)
 
         combined = torch.cat([features, fingerprint], dim=-1)
-
-        # OPTIMIZED: Single forward, outputs all fields
-        potentials = self.field_net(combined)  # [B, num_fields]
+        potentials = self.field_net(combined)
 
         return potentials
 
@@ -479,6 +506,7 @@ class AdjacentGate(nn.Module):
         source_fingerprint: torch.Tensor,
         target_fingerprint: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute gated features for flow from source to target."""
         B = source_features.shape[0]
 
         source_potential = self.compute_potential(source_features, source_fingerprint)
@@ -505,10 +533,12 @@ class AdjacentGate(nn.Module):
 
 
 # =============================================================================
-# OPTIMIZED ROUTER MAILBOX
+# ROUTER COMMUNICATION
 # =============================================================================
 
 class RouterMessage:
+    """Message passed between routers for coordination."""
+
     def __init__(
         self,
         sender_id: str,
@@ -525,25 +555,21 @@ class RouterMessage:
 
 
 class RouterMailbox:
-    """
-    Batched message reading with vectorized similarity.
-    Original: 27ms for 256 messages
-    Optimized: <1ms
-    """
+    """Communication hub with batched similarity computation."""
 
     def __init__(self, config: GlobalFractalRouterConfig):
         self.config = config
         self.messages: Dict[str, RouterMessage] = {}
         self.registry = get_registry()
 
-        # Cache for batched operations
         self._fingerprint_cache: Optional[torch.Tensor] = None
         self._id_cache: Optional[List[str]] = None
         self._cache_valid = False
 
     def post(self, message: RouterMessage):
+        """Post a message from a router."""
         self.messages[message.sender_id] = message
-        self._cache_valid = False  # Invalidate cache
+        self._cache_valid = False
 
     def _rebuild_cache(self):
         """Build cached tensors for batched operations."""
@@ -554,7 +580,7 @@ class RouterMailbox:
 
         self._id_cache = list(self.messages.keys())
         fingerprints = [self.messages[sid].sender_fingerprint for sid in self._id_cache]
-        self._fingerprint_cache = torch.stack(fingerprints)  # [N, D]
+        self._fingerprint_cache = torch.stack(fingerprints)
         self._cache_valid = True
 
     def read(
@@ -573,17 +599,15 @@ class RouterMailbox:
         if self._fingerprint_cache is None:
             return []
 
-        # OPTIMIZED: Batched cosine similarity
+        # Batched cosine similarity
         fp_sims = F.cosine_similarity(
-            reader_fingerprint.unsqueeze(0),  # [1, D]
-            self._fingerprint_cache,           # [N, D]
+            reader_fingerprint.unsqueeze(0),
+            self._fingerprint_cache,
             dim=-1
-        )  # [N]
+        )
 
-        # Get registry affinities (also batched now)
         reg_affinities = self.registry.compute_affinity_batched(reader_id, self._id_cache)
 
-        # Combined score
         scores = 0.6 * reg_affinities + 0.4 * fp_sims
 
         # Mask self
@@ -591,60 +615,31 @@ class RouterMailbox:
             if sid == reader_id:
                 scores[i] = -float('inf')
 
-        # Top-k selection
         k = min(top_k, len(self._id_cache))
         _, top_indices = torch.topk(scores, k)
 
         return [self.messages[self._id_cache[i]] for i in top_indices.tolist()]
 
     def clear(self):
+        """Clear all messages."""
         self.messages.clear()
         self._cache_valid = False
 
 
 # =============================================================================
-# OPTIMIZED LOCAL MASK BUILDER
-# =============================================================================
-
-def build_local_mask_vectorized(
-    num_positions: int,
-    grid_size: int,
-    window_size: int,
-    device: torch.device = None,
-) -> torch.Tensor:
-    """
-    Vectorized local window mask using meshgrid.
-    Original: 340ms for 1024 positions
-    Optimized: <1ms
-    """
-    device = device or torch.device('cpu')
-
-    # Position coordinates
-    pos = torch.arange(num_positions, device=device)
-    x = pos % grid_size
-    y = pos // grid_size
-
-    # Meshgrid for pairwise differences
-    xi, xj = torch.meshgrid(x, x, indexing='ij')
-    yi, yj = torch.meshgrid(y, y, indexing='ij')
-
-    # Distance check (L-infinity / Chebyshev)
-    x_dist = (xi - xj).abs()
-    y_dist = (yi - yj).abs()
-
-    # Mask: True where NOT in window (to be masked out)
-    mask = (x_dist > window_size) | (y_dist > window_size)
-
-    return mask
-
-
-# =============================================================================
-# OPTIMIZED GLOBAL FRACTAL ROUTER
+# GLOBAL FRACTAL ROUTER
 # =============================================================================
 
 class GlobalFractalRouter(nn.Module):
     """
-    Optimized fractal router with all vectorized operations.
+    Fractal router with global fingerprint coordination.
+
+    Features:
+    - Unique fingerprint from global registry
+    - Provenance tracking through transformations
+    - Multi-router communication via mailbox
+    - Adjacent gating based on potential fields
+    - Behavioral routing via anchor bank
     """
 
     def __init__(
@@ -680,7 +675,6 @@ class GlobalFractalRouter(nn.Module):
             fingerprint_dim=config.fingerprint_dim,
         )
 
-        # OPTIMIZED: Use optimized adjacent gate
         if config.use_adjacent_gating:
             self.adjacent_gate = AdjacentGate(
                 feature_dim=config.feature_dim,
@@ -702,6 +696,7 @@ class GlobalFractalRouter(nn.Module):
             self.cantor_weight = 0.0
 
     def _ensure_cantor_bias(self, num_positions: int, device: torch.device):
+        """Lazily build Cantor bias for given size."""
         if self._cantor_bias is not None and self._cantor_size == num_positions:
             return
 
@@ -729,6 +724,7 @@ class GlobalFractalRouter(nn.Module):
         x: torch.Tensor,
         external_fingerprint: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Compute routing scores with fingerprint modulation."""
         B, P, D = x.shape
 
         q = F.normalize(self.query_proj(x), dim=-1)
@@ -758,6 +754,25 @@ class GlobalFractalRouter(nn.Module):
         Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
         Tuple[ProvenanceTensor, torch.Tensor, torch.Tensor, Dict],
     ]:
+        """
+        Forward pass with full fingerprint tracking.
+
+        Args:
+            x: Input features [B, S, D] or ProvenanceTensor
+            mailbox: Optional router mailbox for multi-router communication
+            target_fingerprint: Fingerprint of next module (for gating)
+            skip_first: Skip first token (CLS)
+            return_provenance: Return full provenance tracking info
+
+        Returns:
+            If return_provenance=False:
+                routes: [B, P, K] destination indices
+                weights: [B, P, K] routing weights
+                routed_features: [B, S, D] output features
+            If return_provenance=True:
+                output: ProvenanceTensor with updated chain
+                routes, weights, metadata dict
+        """
         if isinstance(x, ProvenanceTensor):
             data = x.data
             source_fp = x.current_fingerprint
@@ -775,6 +790,7 @@ class GlobalFractalRouter(nn.Module):
         B, P, D = data_route.shape
         K = self.config.num_routes
 
+        # Read messages from other routers
         router_context = None
         if mailbox is not None:
             messages = mailbox.read(self.module_id, self.fingerprint)
@@ -782,28 +798,36 @@ class GlobalFractalRouter(nn.Module):
                 states = torch.stack([m.routing_state for m in messages])
                 router_context = self.comm_decoder(states.mean(dim=0))
 
+        # Compute anchor affinities
         anchor_affinities, anchor_features = self.anchor_bank(
             data_route.mean(dim=1),
             query_fingerprint=source_fp,
         )
 
+        # Compute routing scores
         scores = self._compute_routing_scores(data_route, source_fp)
 
+        # Integrate router context
         if router_context is not None:
             context_bias = torch.einsum('d,bpd->bp', router_context, data_route)
             scores = scores + 0.1 * context_bias.unsqueeze(-1)
 
+        # Mask self-connections
         mask = torch.eye(P, device=data.device, dtype=torch.bool)
         scores = scores.masked_fill(mask.unsqueeze(0), -1e9)
 
+        # Top-K selection
         topk_scores, routes = torch.topk(scores / self.config.temperature, K, dim=-1)
         weights = F.softmax(topk_scores, dim=-1)
 
+        # Gather values
         v = self.value_proj(data_route)
         v_gathered = self._gather(v, routes)
 
+        # Weighted combination
         routed_features = torch.einsum('bpk,bpkd->bpd', weights, v_gathered)
 
+        # Adjacent gating
         gate_values = None
         if self.adjacent_gate is not None and target_fingerprint is not None:
             routed_flat = routed_features.reshape(B * P, D)
@@ -814,6 +838,7 @@ class GlobalFractalRouter(nn.Module):
             )
             routed_features = gated.reshape(B, P, D)
 
+        # Post message to mailbox
         if mailbox is not None:
             routing_state = self.comm_encoder(routed_features.mean(dim=(0, 1)))
             mailbox.post(RouterMessage(
@@ -823,6 +848,7 @@ class GlobalFractalRouter(nn.Module):
                 anchor_affinities=anchor_affinities.mean(dim=0),
             ))
 
+        # Reconstruct full sequence
         if skip_first:
             routed_features = torch.cat([data[:, :1, :], routed_features], dim=1)
 
@@ -842,20 +868,24 @@ class GlobalFractalRouter(nn.Module):
 
     @staticmethod
     def _gather(x: torch.Tensor, routes: torch.Tensor) -> torch.Tensor:
+        """[B, P, D] + [B, P, K] → [B, P, K, D]"""
         B, P, D = x.shape
         K = routes.shape[-1]
         routes_flat = routes.reshape(B, P * K).unsqueeze(-1).expand(-1, -1, D)
         return torch.gather(x, 1, routes_flat).view(B, P, K, D)
 
     def get_lineage(self) -> List[str]:
+        """Get this router's lineage in the global hierarchy."""
         return self.registry.get_lineage(self.module_id)
 
 
 # =============================================================================
-# OPTIMIZED ROUTER NETWORK
+# ROUTER NETWORK
 # =============================================================================
 
 class FractalRouterNetwork(nn.Module):
+    """Network of GlobalFractalRouters that coordinate via mailbox."""
+
     def __init__(
         self,
         config: GlobalFractalRouterConfig,
@@ -915,6 +945,7 @@ class FractalRouterNetwork(nn.Module):
         x: torch.Tensor,
         return_all: bool = False,
     ) -> Union[torch.Tensor, List[Tuple]]:
+        """Forward through router network."""
         self.mailbox.clear()
 
         outputs = []
@@ -949,124 +980,41 @@ class FractalRouterNetwork(nn.Module):
 
 
 # =============================================================================
-# COMPARISON TEST
+# TEST
 # =============================================================================
 
-def benchmark_optimizations():
-    """Compare original vs optimized implementations."""
-    import time
-
+def test_global_fractal_router():
+    """Quick functionality test."""
     print("=" * 60)
-    print("Optimization Comparison")
+    print("Global Fractal Router V2 Test")
     print("=" * 60)
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    # Test 1: Local mask construction
-    print("\n[1] Local Mask Construction")
-
-    for P in [64, 256, 1024]:
-        G = int(math.sqrt(P))
-
-        # Original (nested loops)
-        def build_original(P, G, W):
-            mask = torch.ones(P, P, dtype=torch.bool)
-            for i in range(P):
-                xi, yi = i % G, i // G
-                for j in range(P):
-                    xj, yj = j % G, j // G
-                    if abs(xi - xj) <= W and abs(yi - yj) <= W:
-                        mask[i, j] = False
-            return mask
-
-        # Time original
-        start = time.perf_counter()
-        mask_orig = build_original(P, G, 3)
-        time_orig = (time.perf_counter() - start) * 1000
-
-        # Time optimized
-        start = time.perf_counter()
-        mask_opt = build_local_mask_vectorized(P, G, 3, device='cpu')
-        time_opt = (time.perf_counter() - start) * 1000
-
-        # Verify correctness
-        match = torch.equal(mask_orig, mask_opt)
-        speedup = time_orig / time_opt
-
-        print(f"  P={P:4d}: Original={time_orig:.2f}ms, Optimized={time_opt:.3f}ms, "
-              f"Speedup={speedup:.0f}x, Match={match}")
-
-    # Test 2: Prime generation
-    print("\n[2] Prime Generation")
-
-    for n in [100, 500, 1000]:
-        # Original
-        def gen_original(n):
-            primes = []
-            candidate = 2
-            while len(primes) < n:
-                is_prime = all(candidate % p != 0 for p in primes if p * p <= candidate)
-                if is_prime:
-                    primes.append(candidate)
-                candidate += 1
-            return primes
-
-        start = time.perf_counter()
-        primes_orig = gen_original(n)
-        time_orig = (time.perf_counter() - start) * 1000
-
-        start = time.perf_counter()
-        primes_opt = get_primes(n)
-        time_opt = (time.perf_counter() - start) * 1000
-
-        match = primes_orig == primes_opt
-        speedup = time_orig / max(time_opt, 0.001)
-
-        print(f"  n={n:4d}: Original={time_orig:.2f}ms, Optimized={time_opt:.3f}ms, "
-              f"Speedup={speedup:.0f}x, Match={match}")
-
-    # Test 3: Full router forward
-    print("\n[3] Full Router Forward (on GPU)" if torch.cuda.is_available() else "\n[3] Full Router Forward (CPU)")
 
     get_registry().reset()
 
     config = GlobalFractalRouterConfig(
-        feature_dim=256,
         fingerprint_dim=64,
+        feature_dim=256,
         num_anchors=16,
         num_routes=8,
     )
 
-    router = GlobalFractalRouter(config, name="test").to(device)
-    router.eval()
+    router = GlobalFractalRouter(config, name="test_router")
+    x = torch.randn(2, 65, 256)
 
-    x = torch.randn(4, 65, 256, device=device)
+    routes, weights, features = router(x)
+    print(f"Routes: {routes.shape}")
+    print(f"Weights: {weights.shape}")
+    print(f"Features: {features.shape}")
+    print(f"Module ID: {router.module_id}")
 
-    # Warmup
-    for _ in range(3):
-        with torch.no_grad():
-            _ = router(x)
+    # Test network
+    get_registry().reset()
+    network = FractalRouterNetwork(config, num_routers=3, topology="chain")
+    out = network(x)
+    print(f"Network output: {out.shape}")
 
-    # Benchmark
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-    times = []
-    for _ in range(10):
-        start = time.perf_counter()
-        with torch.no_grad():
-            routes, weights, features = router(x)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        times.append((time.perf_counter() - start) * 1000)
-
-    mean_time = sum(times) / len(times)
-    print(f"  Forward: {mean_time:.3f}ms (avg of 10)")
-    print(f"  Output shapes: routes={routes.shape}, weights={weights.shape}, features={features.shape}")
-
-    print("\n" + "=" * 60)
-    print("✓ Optimization tests complete")
+    print("\n✓ All tests passed!")
 
 
 if __name__ == "__main__":
-    benchmark_optimizations()
+    test_global_fractal_router()

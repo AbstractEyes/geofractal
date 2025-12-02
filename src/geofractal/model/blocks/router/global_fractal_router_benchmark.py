@@ -1,12 +1,12 @@
 """
-global_fractal_router_benchmark.py - Performance analysis for GlobalFractalRouter
+global_fractal_router_benchmark_v2.py - Performance analysis for GlobalFractalRouter
 
 Benchmarks:
 1. Component-level timing (identify bottlenecks)
 2. Scaling behavior (batch, sequence, routes)
 3. Memory profiling
 4. Comparison vs baseline wormhole router
-5. For-loop hotspot analysis
+5. For-loop hotspot analysis (verifies optimizations)
 
 Author: AbstractPhil
 Date: December 2025
@@ -22,9 +22,9 @@ from dataclasses import dataclass, field
 from contextlib import contextmanager
 import math
 
-# Attempt imports
+# Attempt imports from v2
 try:
-    from geofractal.model.blocks.router.global_fractal_router import (
+    from global_fractal_router_v2 import (
         GlobalFractalRouter,
         GlobalFractalRouterConfig,
         FingerprintRegistry,
@@ -34,11 +34,12 @@ try:
         RouterMailbox,
         FractalRouterNetwork,
         ProvenanceTensor,
+        build_local_mask,
+        get_primes,
     )
-
     IMPORT_SUCCESS = True
 except ImportError as e:
-    print(f"Warning: Could not import GlobalFractalRouter: {e}")
+    print(f"Warning: Could not import from global_fractal_router_v2: {e}")
     print("Running in standalone mode with inline definitions")
     IMPORT_SUCCESS = False
 
@@ -64,24 +65,6 @@ def cuda_timer(name: str, results: Dict[str, List[float]], sync: bool = True):
     if name not in results:
         results[name] = []
     results[name].append(elapsed)
-
-
-class Timer:
-    """Simple timer for inline measurements."""
-
-    def __init__(self, sync_cuda: bool = True):
-        self.sync_cuda = sync_cuda
-        self.start_time = None
-
-    def start(self):
-        if torch.cuda.is_available() and self.sync_cuda:
-            torch.cuda.synchronize()
-        self.start_time = time.perf_counter()
-
-    def stop(self) -> float:
-        if torch.cuda.is_available() and self.sync_cuda:
-            torch.cuda.synchronize()
-        return (time.perf_counter() - self.start_time) * 1000
 
 
 def get_memory_mb() -> float:
@@ -134,7 +117,6 @@ class BaselineWormholeRouter(nn.Module):
         topk_scores, routes = torch.topk(scores / self.temperature, self.num_routes, dim=-1)
         weights = F.softmax(topk_scores, dim=-1)
 
-        # Gather
         K = self.num_routes
         routes_flat = routes.reshape(B, P * K).unsqueeze(-1).expand(-1, -1, D)
         v_gathered = torch.gather(v, 1, routes_flat).view(B, P, K, D)
@@ -145,121 +127,350 @@ class BaselineWormholeRouter(nn.Module):
 
 
 # =============================================================================
-# BENCHMARK CONFIGURATIONS
+# BENCHMARK CONFIGURATION
 # =============================================================================
 
 @dataclass
 class BenchmarkConfig:
     """Configuration for benchmark runs."""
 
-    # Scaling parameters
     batch_sizes: List[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
-    seq_lengths: List[int] = field(default_factory=lambda: [65, 129, 257, 513])  # 1 + patches
+    seq_lengths: List[int] = field(default_factory=lambda: [65, 129, 257, 513])
     feature_dims: List[int] = field(default_factory=lambda: [256, 512])
     num_routes: List[int] = field(default_factory=lambda: [4, 8, 16])
 
-    # Timing
     warmup_iterations: int = 3
     benchmark_iterations: int = 10
 
-    # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: torch.dtype = torch.float32
 
-    # What to benchmark
     run_component_breakdown: bool = True
     run_scaling_analysis: bool = True
     run_memory_profile: bool = True
     run_baseline_comparison: bool = True
     run_loop_analysis: bool = True
     run_network_benchmark: bool = True
+    run_optimization_verification: bool = True
 
 
 # =============================================================================
-# COMPONENT BREAKDOWN BENCHMARK
+# LOOP ANALYSIS (with optimization verification)
 # =============================================================================
 
-class ComponentBreakdownBenchmark:
-    """Profiles individual components of GlobalFractalRouter."""
+class LoopAnalysisBenchmark:
+    """Analyzes loop hotspots and verifies optimizations."""
 
     def __init__(self, config: BenchmarkConfig):
         self.config = config
-        self.results: Dict[str, List[float]] = {}
+        self.results: Dict[str, Dict] = {}
 
-    def run(self, router: nn.Module, x: torch.Tensor) -> Dict[str, float]:
-        """Run component-level profiling."""
-        self.results.clear()
+    def run(self) -> Dict[str, Dict]:
+        """Analyze all known loop locations."""
+        device = self.config.device
 
-        router.eval()
-        B, S, D = x.shape
-        P = S - 1  # Assuming skip_first=True
+        print("\n  Analyzing loop hotspots...")
 
-        # Warmup
-        for _ in range(self.config.warmup_iterations):
-            with torch.no_grad():
-                _ = router(x)
+        self._benchmark_prime_generation()
+        self._benchmark_basis_construction()
+        self._benchmark_potential_fields(device)
+        self._benchmark_mailbox_read(device)
+        self._benchmark_local_mask()
 
-        # Profile each component
-        for _ in range(self.config.benchmark_iterations):
-            with torch.no_grad():
-                self._profile_forward(router, x)
+        if IMPORT_SUCCESS:
+            self._verify_optimizations(device)
 
-        # Compute statistics
-        stats = {}
-        for name, times in self.results.items():
-            stats[name] = {
-                'mean_ms': sum(times) / len(times),
-                'min_ms': min(times),
-                'max_ms': max(times),
-                'std_ms': (sum((t - sum(times) / len(times)) ** 2 for t in times) / len(times)) ** 0.5,
+        return self.results
+
+    def _benchmark_prime_generation(self):
+        """Benchmark prime number generation."""
+        print("\n    Prime generation:")
+
+        # Original slow version
+        def generate_primes_slow(n: int) -> List[int]:
+            primes = []
+            candidate = 2
+            while len(primes) < n:
+                is_prime = all(candidate % p != 0 for p in primes if p * p <= candidate)
+                if is_prime:
+                    primes.append(candidate)
+                candidate += 1
+            return primes
+
+        for n in [100, 500, 1000, 2000]:
+            # Time slow version
+            times_slow = []
+            for _ in range(3):
+                start = time.perf_counter()
+                _ = generate_primes_slow(n)
+                times_slow.append((time.perf_counter() - start) * 1000)
+
+            mean_slow = sum(times_slow) / len(times_slow)
+
+            # Time optimized version (if available)
+            if IMPORT_SUCCESS:
+                times_fast = []
+                for _ in range(3):
+                    start = time.perf_counter()
+                    _ = get_primes(n)
+                    times_fast.append((time.perf_counter() - start) * 1000)
+                mean_fast = sum(times_fast) / len(times_fast)
+                speedup = mean_slow / max(mean_fast, 0.001)
+                print(f"      n={n:4d}: slow={mean_slow:.2f}ms, fast={mean_fast:.4f}ms, speedup={speedup:.0f}x")
+            else:
+                print(f"      n={n:4d}: {mean_slow:.3f} ms")
+
+            self.results[f'primes_{n}'] = {'mean_ms': mean_slow, 'complexity': 'O(n²) worst case'}
+
+    def _benchmark_basis_construction(self):
+        """Benchmark orthogonal basis construction."""
+        print("\n    Basis construction:")
+
+        # Original slow version
+        def build_basis_slow(dim: int, count: int) -> torch.Tensor:
+            basis = torch.zeros(count, dim)
+            for i in range(count):
+                t = torch.linspace(0, 2 * math.pi * (i + 2), dim)
+                basis[i] = torch.sin(t) * math.cos(i * 0.1)
+            return F.normalize(basis, dim=-1)
+
+        # Optimized version
+        def build_basis_fast(dim: int, count: int) -> torch.Tensor:
+            primes = torch.arange(2, count + 2, dtype=torch.float32)
+            t = torch.linspace(0, 2 * math.pi, dim).unsqueeze(0)
+            p = primes.unsqueeze(1)
+            i = torch.arange(count, dtype=torch.float32).unsqueeze(1)
+            basis = torch.sin(t * p) * torch.cos(i * 0.1)
+            return F.normalize(basis, dim=-1)
+
+        for count in [256, 512, 1024]:
+            times_slow = []
+            for _ in range(3):
+                start = time.perf_counter()
+                _ = build_basis_slow(64, count)
+                times_slow.append((time.perf_counter() - start) * 1000)
+
+            times_fast = []
+            for _ in range(3):
+                start = time.perf_counter()
+                _ = build_basis_fast(64, count)
+                times_fast.append((time.perf_counter() - start) * 1000)
+
+            mean_slow = sum(times_slow) / len(times_slow)
+            mean_fast = sum(times_fast) / len(times_fast)
+            speedup = mean_slow / max(mean_fast, 0.001)
+
+            print(f"      count={count:4d}: slow={mean_slow:.2f}ms, fast={mean_fast:.3f}ms, speedup={speedup:.1f}x")
+            self.results[f'basis_{count}'] = {'mean_ms': mean_fast, 'complexity': 'O(count × dim)'}
+
+    def _benchmark_potential_fields(self, device: str):
+        """Benchmark potential field computation."""
+        print("\n    Potential field computation:")
+
+        feature_dim = 256
+        fingerprint_dim = 64
+        hidden_dim = 256
+        batch_size = 64
+
+        for num_fields in [2, 4, 8, 16]:
+            # Slow: separate MLPs
+            generators = nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(feature_dim + fingerprint_dim, hidden_dim),
+                    nn.GELU(),
+                    nn.Linear(hidden_dim, 1),
+                )
+                for _ in range(num_fields)
+            ]).to(device)
+
+            # Fast: single MLP with multi-output
+            single_net = nn.Sequential(
+                nn.Linear(feature_dim + fingerprint_dim, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, num_fields),
+            ).to(device)
+
+            features = torch.randn(batch_size, feature_dim, device=device)
+            fingerprint = torch.randn(fingerprint_dim, device=device)
+            combined = torch.cat([features, fingerprint.expand(batch_size, -1)], dim=-1)
+
+            # Warmup
+            for _ in range(3):
+                potentials = []
+                for gen in generators:
+                    potentials.append(gen(combined))
+                _ = torch.cat(potentials, dim=-1)
+                _ = single_net(combined)
+
+            # Benchmark slow
+            times_slow = []
+            for _ in range(10):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
+                potentials = []
+                for gen in generators:
+                    potentials.append(gen(combined))
+                _ = torch.cat(potentials, dim=-1)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                times_slow.append((time.perf_counter() - start) * 1000)
+
+            # Benchmark fast
+            times_fast = []
+            for _ in range(10):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
+                _ = single_net(combined)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                times_fast.append((time.perf_counter() - start) * 1000)
+
+            mean_slow = sum(times_slow) / len(times_slow)
+            mean_fast = sum(times_fast) / len(times_fast)
+            speedup = mean_slow / max(mean_fast, 0.001)
+
+            print(f"      num_fields={num_fields:2d}: slow={mean_slow:.3f}ms, fast={mean_fast:.3f}ms, speedup={speedup:.1f}x")
+            self.results[f'potential_fields_{num_fields}'] = {
+                'mean_ms': mean_fast,
+                'complexity': 'O(1) batched',
             }
 
-        return stats
+            del generators, single_net
+            clear_memory()
 
-    def _profile_forward(self, router: nn.Module, x: torch.Tensor):
-        """Profile a single forward pass."""
+    def _benchmark_mailbox_read(self, device: str):
+        """Benchmark mailbox message reading."""
+        print("\n    Mailbox read operation:")
 
-        # Note: This requires access to router internals
-        # We'll time the full forward and key sub-operations
+        fingerprint_dim = 64
 
-        with cuda_timer("full_forward", self.results):
-            routes, weights, features = router(x)
+        for num_messages in [4, 16, 64, 256]:
+            fingerprints = torch.randn(num_messages, fingerprint_dim, device=device)
+            reader_fp = torch.randn(fingerprint_dim, device=device)
 
-        # Profile sub-components if accessible
-        if hasattr(router, 'query_proj'):
-            x_skip = x[:, 1:, :]
+            # Slow: loop
+            times_slow = []
+            for _ in range(10):
+                start = time.perf_counter()
+                scored = []
+                for i in range(num_messages):
+                    fp_sim = F.cosine_similarity(
+                        reader_fp.unsqueeze(0),
+                        fingerprints[i].unsqueeze(0)
+                    ).item()
+                    scored.append((fp_sim, i))
+                scored.sort(key=lambda x: -x[0])
+                _ = scored[:4]
+                times_slow.append((time.perf_counter() - start) * 1000)
 
-            with cuda_timer("query_proj", self.results):
-                q = router.query_proj(x_skip)
+            # Fast: batched
+            times_fast = []
+            for _ in range(10):
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                start = time.perf_counter()
+                sims = F.cosine_similarity(reader_fp.unsqueeze(0), fingerprints, dim=-1)
+                _, top_indices = torch.topk(sims, min(4, num_messages))
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                times_fast.append((time.perf_counter() - start) * 1000)
 
-            with cuda_timer("key_proj", self.results):
-                k = router.key_proj(x_skip)
+            mean_slow = sum(times_slow) / len(times_slow)
+            mean_fast = sum(times_fast) / len(times_fast)
+            speedup = mean_slow / max(mean_fast, 0.001)
 
-            with cuda_timer("qk_norm", self.results):
-                q = F.normalize(q, dim=-1)
-                k = F.normalize(k, dim=-1)
+            print(f"      num_messages={num_messages:3d}: slow={mean_slow:.2f}ms, fast={mean_fast:.3f}ms, speedup={speedup:.0f}x")
+            self.results[f'mailbox_read_{num_messages}'] = {
+                'mean_ms': mean_fast,
+                'complexity': 'O(1) batched',
+            }
 
-            with cuda_timer("score_bmm", self.results):
-                scores = torch.bmm(q, k.transpose(1, 2))
+    def _benchmark_local_mask(self):
+        """Benchmark local window mask construction."""
+        print("\n    Local window mask construction:")
 
-            with cuda_timer("topk", self.results):
-                _, routes = torch.topk(scores, router.config.num_routes, dim=-1)
+        # Slow: nested loops
+        def build_local_mask_slow(num_positions: int, grid_size: int, window: int) -> torch.Tensor:
+            P, G, W = num_positions, grid_size, window
+            mask = torch.ones(P, P, dtype=torch.bool)
+            for i in range(P):
+                xi, yi = i % G, i // G
+                for j in range(P):
+                    xj, yj = j % G, j // G
+                    if abs(xi - xj) <= W and abs(yi - yj) <= W:
+                        mask[i, j] = False
+            return mask
 
-        if hasattr(router, 'anchor_bank'):
-            with cuda_timer("anchor_bank", self.results):
-                _ = router.anchor_bank(x[:, 1:, :].mean(dim=1))
+        # Fast: meshgrid
+        def build_local_mask_fast(num_positions: int, grid_size: int, window: int) -> torch.Tensor:
+            pos = torch.arange(num_positions)
+            x = pos % grid_size
+            y = pos // grid_size
+            xi, xj = torch.meshgrid(x, x, indexing='ij')
+            yi, yj = torch.meshgrid(y, y, indexing='ij')
+            return ((xi - xj).abs() > window) | ((yi - yj).abs() > window)
 
-        if hasattr(router, 'adjacent_gate') and router.adjacent_gate is not None:
-            with cuda_timer("adjacent_gate", self.results):
-                flat = features[:, 1:, :].reshape(-1, features.shape[-1])
-                _ = router.adjacent_gate.compute_potential(
-                    flat[:16],  # Subset for timing
-                    router.fingerprint
-                )
+        for num_positions in [64, 256, 1024]:
+            grid_size = int(math.sqrt(num_positions))
+
+            times_slow = []
+            for _ in range(3):
+                start = time.perf_counter()
+                mask_slow = build_local_mask_slow(num_positions, grid_size, 3)
+                times_slow.append((time.perf_counter() - start) * 1000)
+
+            times_fast = []
+            for _ in range(3):
+                start = time.perf_counter()
+                mask_fast = build_local_mask_fast(num_positions, grid_size, 3)
+                times_fast.append((time.perf_counter() - start) * 1000)
+
+            mean_slow = sum(times_slow) / len(times_slow)
+            mean_fast = sum(times_fast) / len(times_fast)
+            speedup = mean_slow / max(mean_fast, 0.001)
+
+            # Verify correctness
+            match = torch.equal(mask_slow, mask_fast)
+
+            print(f"      positions={num_positions:4d}: slow={mean_slow:.1f}ms, fast={mean_fast:.3f}ms, speedup={speedup:.0f}x, match={match}")
+            self.results[f'local_mask_{num_positions}'] = {
+                'mean_ms': mean_fast,
+                'complexity': 'O(P²) vectorized',
+                'speedup': speedup,
+            }
+
+    def _verify_optimizations(self, device: str):
+        """Verify that optimized router uses all optimizations."""
+        print("\n    Verifying optimizations in GlobalFractalRouter:")
+
+        get_registry().reset()
+        config = GlobalFractalRouterConfig(
+            feature_dim=256,
+            fingerprint_dim=64,
+            num_anchors=16,
+            num_routes=8,
+        )
+
+        router = GlobalFractalRouter(config, name="verify_test").to(device)
+
+        # Check AdjacentGate uses single MLP
+        if hasattr(router.adjacent_gate, 'field_net'):
+            print("      ✓ AdjacentGate uses batched field_net")
+        else:
+            print("      ✗ AdjacentGate still uses separate generators")
+
+        # Check AnchorBank uses vectorized fingerprints
+        if router.anchor_bank.anchor_fingerprints.shape[0] == config.num_anchors:
+            print("      ✓ AnchorBank fingerprints vectorized")
+
+        del router
+        clear_memory()
 
 
 # =============================================================================
-# SCALING ANALYSIS BENCHMARK
+# SCALING ANALYSIS
 # =============================================================================
 
 class ScalingAnalysisBenchmark:
@@ -269,22 +480,14 @@ class ScalingAnalysisBenchmark:
         self.config = config
 
     def run(self, router_factory: Callable) -> Dict[str, Dict]:
-        """
-        Run scaling analysis.
-
-        Args:
-            router_factory: Callable(dim, num_positions) -> router
-        """
         results = {
             'batch_scaling': {},
             'sequence_scaling': {},
             'dimension_scaling': {},
-            'route_scaling': {},
         }
 
         device = self.config.device
 
-        # Batch scaling (fixed seq=65, dim=256)
         print("\n  Batch scaling...")
         dim, seq = 256, 65
         router = router_factory(dim, seq - 1).to(device)
@@ -299,7 +502,6 @@ class ScalingAnalysisBenchmark:
         del router
         clear_memory()
 
-        # Sequence scaling (fixed batch=4, dim=256)
         print("\n  Sequence scaling...")
         batch, dim = 4, 256
 
@@ -313,7 +515,6 @@ class ScalingAnalysisBenchmark:
             del router
             clear_memory()
 
-        # Dimension scaling (fixed batch=4, seq=65)
         print("\n  Dimension scaling...")
         batch, seq = 4, 65
 
@@ -330,22 +531,17 @@ class ScalingAnalysisBenchmark:
         return results
 
     def _time_forward(self, router: nn.Module, x: torch.Tensor) -> float:
-        """Time forward pass with warmup."""
-        # Warmup
         for _ in range(self.config.warmup_iterations):
             with torch.no_grad():
                 _ = router(x)
 
-        # Benchmark
         times = []
         for _ in range(self.config.benchmark_iterations):
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             start = time.perf_counter()
-
             with torch.no_grad():
                 _ = router(x)
-
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             times.append((time.perf_counter() - start) * 1000)
@@ -354,17 +550,16 @@ class ScalingAnalysisBenchmark:
 
 
 # =============================================================================
-# MEMORY PROFILE BENCHMARK
+# MEMORY PROFILE
 # =============================================================================
 
 class MemoryProfileBenchmark:
-    """Profiles memory usage of router components."""
+    """Profiles memory usage."""
 
     def __init__(self, config: BenchmarkConfig):
         self.config = config
 
     def run(self, router_factory: Callable) -> Dict[str, Dict]:
-        """Run memory profiling."""
         if not torch.cuda.is_available():
             print("  Memory profiling requires CUDA")
             return {}
@@ -372,7 +567,6 @@ class MemoryProfileBenchmark:
         results = {}
         device = self.config.device
 
-        # Test different configurations
         test_configs = [
             (4, 65, 256, "small"),
             (8, 129, 512, "medium"),
@@ -381,24 +575,19 @@ class MemoryProfileBenchmark:
 
         for batch, seq, dim, name in test_configs:
             clear_memory()
+            torch.cuda.reset_peak_memory_stats()
 
-            # Baseline memory
             base_mem = get_memory_mb()
-
-            # Create router
             router = router_factory(dim, seq - 1).to(device)
             router_mem = get_memory_mb()
 
-            # Create input
             x = torch.randn(batch, seq, dim, device=device, dtype=self.config.dtype)
             input_mem = get_memory_mb()
 
-            # Forward pass
             with torch.no_grad():
                 routes, weights, features = router(x)
             forward_mem = get_memory_mb()
 
-            # Peak memory
             peak_mem = torch.cuda.max_memory_allocated() / 1024 / 1024
 
             results[name] = {
@@ -415,13 +604,12 @@ class MemoryProfileBenchmark:
 
             del router, x, routes, weights, features
             clear_memory()
-            torch.cuda.reset_peak_memory_stats()
 
         return results
 
 
 # =============================================================================
-# BASELINE COMPARISON BENCHMARK
+# BASELINE COMPARISON
 # =============================================================================
 
 class BaselineComparisonBenchmark:
@@ -431,11 +619,10 @@ class BaselineComparisonBenchmark:
         self.config = config
 
     def run(
-            self,
-            global_router_factory: Callable,
-            baseline_router_factory: Callable,
+        self,
+        global_router_factory: Callable,
+        baseline_router_factory: Callable,
     ) -> Dict[str, Dict]:
-        """Compare global router vs baseline."""
         results = {}
         device = self.config.device
 
@@ -450,12 +637,10 @@ class BaselineComparisonBenchmark:
 
             x = torch.randn(batch, seq, dim, device=device, dtype=self.config.dtype)
 
-            # Baseline router
             baseline = baseline_router_factory(dim, seq - 1).to(device)
             baseline.eval()
             baseline_time = self._time_forward(baseline, x)
 
-            # Global fractal router
             global_router = global_router_factory(dim, seq - 1).to(device)
             global_router.eval()
             global_time = self._time_forward(global_router, x)
@@ -499,245 +684,16 @@ class BaselineComparisonBenchmark:
 
 
 # =============================================================================
-# LOOP ANALYSIS BENCHMARK
-# =============================================================================
-
-class LoopAnalysisBenchmark:
-    """
-    Specifically analyzes for-loop hotspots.
-
-    Known loop locations in GlobalFractalRouter:
-    1. FingerprintRegistry._generate_primes() - O(n) primes
-    2. FingerprintRegistry._build_orthogonal_basis() - O(count) basis vectors
-    3. AdjacentGate.compute_potential() - O(num_fields) field generators
-    4. AnchorBank (implicit in matmul, not a loop)
-    5. RouterMailbox.read() - O(n) messages
-    """
-
-    def __init__(self, config: BenchmarkConfig):
-        self.config = config
-        self.results: Dict[str, Dict] = {}
-
-    def run(self) -> Dict[str, Dict]:
-        """Analyze all known loop locations."""
-        device = self.config.device
-
-        print("\n  Analyzing loop hotspots...")
-
-        # 1. Prime generation (one-time cost)
-        self._benchmark_prime_generation()
-
-        # 2. Orthogonal basis construction (one-time cost)
-        self._benchmark_basis_construction()
-
-        # 3. Adjacent gate potential computation (per-forward cost)
-        self._benchmark_potential_fields(device)
-
-        # 4. Mailbox read operation
-        self._benchmark_mailbox_read(device)
-
-        # 5. Local window mask construction
-        self._benchmark_local_mask()
-
-        return self.results
-
-    def _benchmark_prime_generation(self):
-        """Benchmark prime number generation."""
-        print("\n    Prime generation:")
-
-        def generate_primes(n: int) -> List[int]:
-            primes = []
-            candidate = 2
-            while len(primes) < n:
-                is_prime = all(candidate % p != 0 for p in primes if p * p <= candidate)
-                if is_prime:
-                    primes.append(candidate)
-                candidate += 1
-            return primes
-
-        for n in [100, 500, 1000, 2000]:
-            times = []
-            for _ in range(5):
-                start = time.perf_counter()
-                _ = generate_primes(n)
-                times.append((time.perf_counter() - start) * 1000)
-
-            mean_time = sum(times) / len(times)
-            print(f"      n={n:4d}: {mean_time:.3f} ms")
-            self.results[f'primes_{n}'] = {'mean_ms': mean_time, 'complexity': 'O(n²) worst case'}
-
-    def _benchmark_basis_construction(self):
-        """Benchmark orthogonal basis construction."""
-        print("\n    Basis construction:")
-
-        def build_basis(dim: int, count: int) -> torch.Tensor:
-            # Simplified - just the loop part
-            basis = torch.zeros(count, dim)
-            for i in range(count):
-                t = torch.linspace(0, 2 * math.pi * (i + 2), dim)
-                basis[i] = torch.sin(t) * math.cos(i * 0.1)
-            return F.normalize(basis, dim=-1)
-
-        for count in [256, 512, 1024]:
-            times = []
-            for _ in range(5):
-                start = time.perf_counter()
-                _ = build_basis(64, count)
-                times.append((time.perf_counter() - start) * 1000)
-
-            mean_time = sum(times) / len(times)
-            print(f"      count={count:4d}: {mean_time:.3f} ms")
-            self.results[f'basis_{count}'] = {'mean_ms': mean_time, 'complexity': 'O(count × dim)'}
-
-    def _benchmark_potential_fields(self, device: str):
-        """Benchmark potential field computation loop."""
-        print("\n    Potential field computation:")
-
-        feature_dim = 256
-        fingerprint_dim = 64
-        hidden_dim = 256
-        batch_size = 64
-
-        for num_fields in [2, 4, 8, 16]:
-            # Create field generators
-            generators = nn.ModuleList([
-                nn.Sequential(
-                    nn.Linear(feature_dim + fingerprint_dim, hidden_dim),
-                    nn.GELU(),
-                    nn.Linear(hidden_dim, 1),
-                )
-                for _ in range(num_fields)
-            ]).to(device)
-
-            features = torch.randn(batch_size, feature_dim, device=device)
-            fingerprint = torch.randn(fingerprint_dim, device=device)
-            combined = torch.cat([features, fingerprint.expand(batch_size, -1)], dim=-1)
-
-            # Warmup
-            for _ in range(3):
-                potentials = []
-                for gen in generators:
-                    potentials.append(gen(combined))
-                _ = torch.cat(potentials, dim=-1)
-
-            # Benchmark
-            times = []
-            for _ in range(10):
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                start = time.perf_counter()
-
-                potentials = []
-                for gen in generators:
-                    potentials.append(gen(combined))
-                _ = torch.cat(potentials, dim=-1)
-
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                times.append((time.perf_counter() - start) * 1000)
-
-            mean_time = sum(times) / len(times)
-            print(f"      num_fields={num_fields:2d}: {mean_time:.3f} ms")
-            self.results[f'potential_fields_{num_fields}'] = {
-                'mean_ms': mean_time,
-                'complexity': 'O(num_fields)',
-                'note': 'HOTSPOT - consider batched forward',
-            }
-
-            del generators
-            clear_memory()
-
-    def _benchmark_mailbox_read(self, device: str):
-        """Benchmark mailbox message reading."""
-        print("\n    Mailbox read operation:")
-
-        fingerprint_dim = 64
-        comm_dim = 128
-
-        for num_messages in [4, 16, 64, 256]:
-            # Simulate messages
-            messages = {}
-            for i in range(num_messages):
-                messages[f'router_{i}'] = {
-                    'fingerprint': torch.randn(fingerprint_dim, device=device),
-                    'state': torch.randn(comm_dim, device=device),
-                }
-
-            reader_fp = torch.randn(fingerprint_dim, device=device)
-
-            # Benchmark read (fingerprint comparison loop)
-            times = []
-            for _ in range(10):
-                start = time.perf_counter()
-
-                scored = []
-                for sender_id, msg in messages.items():
-                    fp_sim = F.cosine_similarity(
-                        reader_fp.unsqueeze(0),
-                        msg['fingerprint'].unsqueeze(0)
-                    ).item()
-                    scored.append((fp_sim, sender_id))
-
-                scored.sort(key=lambda x: -x[0])
-                top_k = scored[:4]
-
-                times.append((time.perf_counter() - start) * 1000)
-
-            mean_time = sum(times) / len(times)
-            print(f"      num_messages={num_messages:3d}: {mean_time:.3f} ms")
-            self.results[f'mailbox_read_{num_messages}'] = {
-                'mean_ms': mean_time,
-                'complexity': 'O(n)',
-                'note': 'HOTSPOT - consider batched cosine sim',
-            }
-
-    def _benchmark_local_mask(self):
-        """Benchmark local window mask construction."""
-        print("\n    Local window mask construction:")
-
-        def build_local_mask(num_positions: int, grid_size: int, window: int) -> torch.Tensor:
-            P, G, W = num_positions, grid_size, window
-            mask = torch.ones(P, P, dtype=torch.bool)
-
-            for i in range(P):
-                xi, yi = i % G, i // G
-                for j in range(P):
-                    xj, yj = j % G, j // G
-                    if abs(xi - xj) <= W and abs(yi - yj) <= W:
-                        mask[i, j] = False
-
-            return mask
-
-        for num_positions in [64, 256, 1024]:
-            grid_size = int(math.sqrt(num_positions))
-
-            times = []
-            for _ in range(5):
-                start = time.perf_counter()
-                _ = build_local_mask(num_positions, grid_size, 3)
-                times.append((time.perf_counter() - start) * 1000)
-
-            mean_time = sum(times) / len(times)
-            print(f"      positions={num_positions:4d}: {mean_time:.3f} ms")
-            self.results[f'local_mask_{num_positions}'] = {
-                'mean_ms': mean_time,
-                'complexity': 'O(P²)',
-                'note': 'HOTSPOT - should vectorize with meshgrid',
-            }
-
-
-# =============================================================================
 # NETWORK BENCHMARK
 # =============================================================================
 
 class NetworkBenchmark:
-    """Benchmarks FractalRouterNetwork with different topologies."""
+    """Benchmarks FractalRouterNetwork topologies."""
 
     def __init__(self, config: BenchmarkConfig):
         self.config = config
 
     def run(self, network_factory: Callable) -> Dict[str, Dict]:
-        """Benchmark router network configurations."""
         results = {}
         device = self.config.device
 
@@ -753,12 +709,10 @@ class NetworkBenchmark:
                     network = network_factory(dim, seq - 1, num_routers, topology).to(device)
                     network.eval()
 
-                    # Warmup
                     for _ in range(self.config.warmup_iterations):
                         with torch.no_grad():
                             _ = network(x)
 
-                    # Benchmark
                     times = []
                     for _ in range(self.config.benchmark_iterations):
                         if torch.cuda.is_available():
@@ -804,19 +758,16 @@ class GlobalFractalRouterBenchmark:
         self.results: Dict[str, Dict] = {}
 
     def run_all(self) -> Dict[str, Dict]:
-        """Run all benchmarks."""
         print("=" * 70)
-        print("Global Fractal Router Benchmark Suite")
+        print("Global Fractal Router V2 Benchmark Suite")
         print("=" * 70)
         print(f"Device: {self.config.device}")
         print(f"Dtype: {self.config.dtype}")
         print(f"Warmup: {self.config.warmup_iterations}, Iterations: {self.config.benchmark_iterations}")
 
-        # Reset registry before benchmarks
         if IMPORT_SUCCESS:
             get_registry().reset()
 
-        # Factory functions
         def global_router_factory(dim: int, num_positions: int):
             if IMPORT_SUCCESS:
                 config = GlobalFractalRouterConfig(
@@ -841,10 +792,9 @@ class GlobalFractalRouterBenchmark:
             else:
                 raise RuntimeError("FractalRouterNetwork not available")
 
-        # Run benchmarks
         if self.config.run_loop_analysis:
             print("\n" + "-" * 70)
-            print("LOOP ANALYSIS (identify Python loop hotspots)")
+            print("LOOP ANALYSIS & OPTIMIZATION VERIFICATION")
             print("-" * 70)
             bench = LoopAnalysisBenchmark(self.config)
             self.results['loop_analysis'] = bench.run()
@@ -883,34 +833,23 @@ class GlobalFractalRouterBenchmark:
             bench = NetworkBenchmark(self.config)
             self.results['network'] = bench.run(network_factory)
 
-        # Summary
         self._print_summary()
 
         return self.results
 
     def _print_summary(self):
-        """Print benchmark summary with actionable insights."""
         print("\n" + "=" * 70)
         print("SUMMARY & RECOMMENDATIONS")
         print("=" * 70)
 
-        # Loop hotspots
         if 'loop_analysis' in self.results:
-            print("\n[Loop Hotspots]")
-            hotspots = []
+            print("\n[Optimization Status]")
             for key, data in self.results['loop_analysis'].items():
-                if isinstance(data, dict) and 'mean_ms' in data:
-                    if data.get('note', '').startswith('HOTSPOT'):
-                        hotspots.append((key, data['mean_ms'], data.get('note', '')))
+                if isinstance(data, dict) and 'speedup' in data:
+                    speedup = data['speedup']
+                    status = "✓" if speedup > 10 else "⚠" if speedup > 2 else "✗"
+                    print(f"  {status} {key}: {speedup:.0f}x speedup")
 
-            if hotspots:
-                hotspots.sort(key=lambda x: -x[1])
-                for name, time_ms, note in hotspots:
-                    print(f"  ⚠ {name}: {time_ms:.3f} ms - {note}")
-            else:
-                print("  ✓ No major loop hotspots detected")
-
-        # Overhead analysis
         if 'baseline_comparison' in self.results:
             print("\n[Overhead Analysis]")
             for config, data in self.results['baseline_comparison'].items():
@@ -919,7 +858,6 @@ class GlobalFractalRouterBenchmark:
                     status = "✓" if overhead < 50 else "⚠" if overhead < 100 else "✗"
                     print(f"  {status} {config}: {overhead:+.1f}% overhead")
 
-        # Memory efficiency
         if 'memory_profile' in self.results:
             print("\n[Memory Efficiency]")
             for config, data in self.results['memory_profile'].items():
@@ -934,51 +872,41 @@ class GlobalFractalRouterBenchmark:
 # =============================================================================
 
 def run_benchmark(
-        device: str = None,
-        iterations: int = 10,
-        warmup: int = 3,
-        quick: bool = False,
-        loops_only: bool = False,
-        scaling_only: bool = False,
-        memory_only: bool = False,
-        comparison_only: bool = False,
-        network_only: bool = False,
+    device: str = None,
+    iterations: int = 10,
+    warmup: int = 3,
+    quick: bool = False,
+    loops_only: bool = False,
+    scaling_only: bool = False,
+    memory_only: bool = False,
+    comparison_only: bool = False,
+    network_only: bool = False,
 ) -> Dict[str, Dict]:
     """
-    Run GlobalFractalRouter benchmarks with inline configuration.
+    Run GlobalFractalRouter benchmarks.
 
     Args:
         device: "cuda" or "cpu" (auto-detected if None)
-        iterations: Number of benchmark iterations
-        warmup: Number of warmup iterations
-        quick: Use reduced iterations and smaller configs
-        loops_only: Only run loop hotspot analysis
+        iterations: Benchmark iterations per test
+        warmup: Warmup iterations
+        quick: Reduced test suite
+        loops_only: Only run loop analysis
         scaling_only: Only run scaling analysis
         memory_only: Only run memory profiling
         comparison_only: Only run baseline comparison
-        network_only: Only run network topology benchmark
+        network_only: Only run network benchmark
 
     Returns:
         Dict of benchmark results
 
-    Example (Colab):
-        ```python
-        from global_fractal_router_benchmark import run_benchmark
-
-        # Quick test
+    Example:
         results = run_benchmark(quick=True)
-
-        # Full benchmark on GPU
         results = run_benchmark(device="cuda", iterations=20)
-
-        # Just check loop hotspots
         results = run_benchmark(loops_only=True)
-        ```
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Build config
     config = BenchmarkConfig(
         device=device,
         benchmark_iterations=3 if quick else iterations,
@@ -989,7 +917,6 @@ def run_benchmark(
         num_routes=[4, 8] if quick else [4, 8, 16],
     )
 
-    # Handle selective benchmarks
     if loops_only:
         config.run_component_breakdown = False
         config.run_scaling_analysis = False
@@ -1027,27 +954,25 @@ def run_benchmark(
         config.run_network_benchmark = True
 
     benchmark = GlobalFractalRouterBenchmark(config)
-    results = benchmark.run_all()
-
-    return results
+    return benchmark.run_all()
 
 
 if __name__ == "__main__":
     # =========================================================================
-    # INLINE CONFIGURATION - EDIT THESE FOR YOUR RUN
+    # INLINE CONFIGURATION
     # =========================================================================
 
-    DEVICE = None  # None = auto-detect, or "cuda" / "cpu"
-    ITERATIONS = 10  # Benchmark iterations per test
-    WARMUP = 3  # Warmup iterations
-    QUICK = True  # Reduced test suite for fast iteration
+    DEVICE = None          # None = auto-detect
+    ITERATIONS = 10
+    WARMUP = 3
+    QUICK = True           # Fast iteration mode
 
-    # Select which benchmarks to run (set one to True, others False for focused testing)
-    LOOPS_ONLY = False  # Just analyze Python for-loop hotspots
-    SCALING_ONLY = False  # Just analyze batch/seq/dim scaling
-    MEMORY_ONLY = False  # Just analyze GPU memory usage
-    COMPARISON_ONLY = False  # Just compare vs baseline router
-    NETWORK_ONLY = False  # Just benchmark router network topologies
+    # Selective benchmarks (all False = run everything)
+    LOOPS_ONLY = False
+    SCALING_ONLY = False
+    MEMORY_ONLY = False
+    COMPARISON_ONLY = False
+    NETWORK_ONLY = False
 
     # =========================================================================
 
@@ -1063,5 +988,4 @@ if __name__ == "__main__":
         network_only=NETWORK_ONLY,
     )
 
-    # Results are now in `results` dict for further analysis
     print("\nResults keys:", list(results.keys()))
