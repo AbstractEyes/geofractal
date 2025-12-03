@@ -1,64 +1,20 @@
 """
 geofractal.router.config
 ========================
-Configuration classes for routers and collectives.
+Configuration classes for collectives and streams.
+
+Copyright 2025 AbstractPhil
+Licensed under the Apache License, Version 2.0
+
+Note: GlobalFractalRouterConfig is defined in core.py
 """
 
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, Dict
 import torch
 
-
-@dataclass
-class GlobalFractalRouterConfig:
-    """
-    Configuration for GlobalFractalRouter.
-
-    Core Dimensions:
-        feature_dim: Internal routing dimension (default: 512)
-        fingerprint_dim: Identity/divergence dimension (default: 64)
-
-    Routing:
-        num_anchors: Shared behavioral modes (default: 16)
-        num_routes: Top-K routes per position (default: 4)
-        temperature: Softmax temperature (default: 1.0)
-
-    Coordination:
-        use_adjacent_gating: Enable parent→child fingerprint gating
-        use_cantor_prior: Enable Cantor diagonal structure in attention
-        grid_size: Spatial structure for Cantor pairing (H, W)
-
-    Proven Settings:
-        - ImageNet: feature_dim=512, num_anchors=16, num_routes=8
-        - FashionMNIST: feature_dim=128, num_anchors=8, num_routes=4
-    """
-
-    # Core dimensions
-    feature_dim: int = 512
-    fingerprint_dim: int = 64
-
-    # Routing
-    num_anchors: int = 16
-    num_routes: int = 4
-    num_heads: int = 8
-    temperature: float = 1.0
-
-    # Sequence structure
-    num_slots: int = 16  # Sequence length for routing
-    grid_size: Tuple[int, int] = (16, 1)  # For Cantor pairing
-
-    # Coordination features
-    use_adjacent_gating: bool = True
-    use_cantor_prior: bool = True
-    use_mailbox: bool = True
-
-    # Regularization
-    dropout: float = 0.1
-
-    def __post_init__(self):
-        # Ensure grid_size matches num_slots
-        if self.grid_size[0] * self.grid_size[1] != self.num_slots:
-            self.grid_size = (self.num_slots, 1)
+# Import router config from core
+from geofractal.router.core import GlobalFractalRouterConfig
 
 
 @dataclass
