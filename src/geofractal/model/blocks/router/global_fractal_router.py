@@ -10,6 +10,7 @@ Vectorized implementation with all hotspots addressed:
 
 Author: AbstractPhil
 Date: December 2025
+License: Apache 2.0
 """
 
 import torch
