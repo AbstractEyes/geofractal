@@ -87,8 +87,8 @@ from .components import (
     FFNRefinement,
     MixtureOfExpertsRefinement,
     # Utilities
-    cantor_pair,
-    build_cantor_bias,
+    #cantor_pair,
+    #build_cantor_bias,
 )
 
 from .builder import (
