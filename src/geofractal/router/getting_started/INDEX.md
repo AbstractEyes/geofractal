@@ -29,6 +29,12 @@
 |----------|-------------|----------|
 | [FUSION.md](FUSION.md) | Fusion strategies and selection guide | Engineers, Researchers |
 
+### Factory System
+
+| Document | Description | Audience |
+|----------|-------------|----------|
+| [FACTORY.md](FACTORY.md) | Prototype building guide | Everyone |
+
 ---
 
 ## Quick Reference
