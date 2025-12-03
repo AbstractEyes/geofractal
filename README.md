@@ -13,6 +13,8 @@ A multitude of experimental models, training paradigms, and routing strategies.
 If something is outside the router directory and not licensed separately, it probably is MIT.
 If you are concerned about the MIT licensing for the experimental models, please contact AbstractPhil.
 
+Everything within the router substructure is covered by the Apache 2.0 license specified at the bottom of this README.
+
 ## Proven Results
 
 | Experiment | Individual Accuracy | Collective Accuracy |
