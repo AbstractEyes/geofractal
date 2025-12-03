@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from contextlib import contextmanager
 import math
 
-from geofractal.router.global_fractal_router import (
+from geofractal.model.blocks.router.global_fractal_router import (
     GlobalFractalRouter,
     GlobalFractalRouterConfig,
     get_registry,
