@@ -329,14 +329,12 @@ class HeadBuilder:
             self._gate_kwargs, FingerprintGate
         )
 
-        # Combiner - FIX: pass config properly
+        # Combiner - pass only config (combiners accept **kwargs for compatibility)
         combiner_cls = self._combiner_cls or LearnableWeightCombiner
-        combiner_kwargs = self._combiner_kwargs.copy()
-
         if self._combiner_instance is not None:
             combiner = self._combiner_instance
         else:
-            combiner = combiner_cls(self.config, **combiner_kwargs)
+            combiner = combiner_cls(self.config)
 
         refinement = self._build_component(
             self._refinement_cls, self._refinement_instance,
@@ -352,7 +350,6 @@ class HeadBuilder:
             combiner=combiner,
             refinement=refinement,
         )
-
 # =============================================================================
 # COMPOSED HEAD
 # =============================================================================

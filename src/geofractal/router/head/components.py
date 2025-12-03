@@ -441,7 +441,7 @@ class ChannelGate(BaseGate):
 class LearnableWeightCombiner(BaseCombiner):
     """Combine signals with learnable softmax weights."""
 
-    def __init__(self, config: HeadConfig):
+    def __init__(self, config: HeadConfig, **kwargs):
         super().__init__()
         self.config = config
         self.weights = nn.Parameter(torch.tensor([1.0, 1.0, 0.1]))
@@ -449,16 +449,16 @@ class LearnableWeightCombiner(BaseCombiner):
     def forward(self, signals: Dict[str, torch.Tensor]) -> torch.Tensor:
         weights = F.softmax(self.weights, dim=0)
         return (
-            weights[0] * signals['attention'] +
-            weights[1] * signals['routing'] +
-            weights[2] * signals['anchors']
+                weights[0] * signals['attention'] +
+                weights[1] * signals['routing'] +
+                weights[2] * signals['anchors']
         )
 
 
 class GatedCombiner(BaseCombiner):
     """Combine signals with input-dependent gating."""
 
-    def __init__(self, config: HeadConfig):
+    def __init__(self, config: HeadConfig, **kwargs):
         super().__init__()
         self.config = config
 
@@ -473,9 +473,9 @@ class GatedCombiner(BaseCombiner):
         concat = torch.cat([signals['attention'], signals['routing'], signals['anchors']], dim=-1)
         gates = self.gate_net(concat)
         return (
-            gates[..., 0:1] * signals['attention'] +
-            gates[..., 1:2] * signals['routing'] +
-            gates[..., 2:3] * signals['anchors']
+                gates[..., 0:1] * signals['attention'] +
+                gates[..., 1:2] * signals['routing'] +
+                gates[..., 2:3] * signals['anchors']
         )
 
 
