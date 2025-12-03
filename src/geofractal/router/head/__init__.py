@@ -152,7 +152,7 @@ __all__ = [
     'build_lightweight_head',
     'build_custom_head',
     # Utilities
-    'cantor_pair',
-    'build_cantor_bias',
+    #'cantor_pair',
+    #'build_cantor_bias',
     'HeadComponents',
 ]
