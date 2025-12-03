@@ -23,6 +23,12 @@
 | [RATIONALITY.md](RATIONALITY.md) | **Why** each component exists | Everyone |
 | [INIT_BREAKDOWN.md](INIT_BREAKDOWN.md) | Detailed init decomposition | Engineers, Hackers |
 
+### Fusion Layer
+
+| Document | Description | Audience |
+|----------|-------------|----------|
+| [FUSION.md](FUSION.md) | Fusion strategies and selection guide | Engineers, Researchers |
+
 ---
 
 ## Quick Reference
