@@ -22,17 +22,11 @@ from dataclasses import dataclass, field
 from contextlib import contextmanager
 import math
 
-from geofractal.model.blocks.router.global_fractal_router import (
+from geofractal.router.global_fractal_router import (
     GlobalFractalRouter,
     GlobalFractalRouterConfig,
-    FingerprintRegistry,
     get_registry,
-    AnchorBank,
-    AdjacentGate,
-    RouterMailbox,
     FractalRouterNetwork,
-    ProvenanceTensor,
-    build_local_mask,
     get_primes,
 )
 IMPORT_SUCCESS = True
