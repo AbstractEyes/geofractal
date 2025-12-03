@@ -6,6 +6,8 @@
 
 ## Documentation Index
 
+### Core Documentation
+
 | Document | Description | Audience |
 |----------|-------------|----------|
 | [PROTOCOL.md](PROTOCOL.md) | Complete protocol specification | Implementers, Researchers |
@@ -13,6 +15,13 @@
 | [MATHEMATICS.md](MATHEMATICS.md) | Formal mathematical foundations | Researchers, Theorists |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Roadmap and expansion paths | Contributors, Planners |
 | [METRICS.md](METRICS.md) | Evaluation methodology | Evaluators, Benchmarkers |
+
+### Head Decomposition
+
+| Document | Description | Audience |
+|----------|-------------|----------|
+| [RATIONALITY.md](RATIONALITY.md) | **Why** each component exists | Everyone |
+| [INIT_BREAKDOWN.md](INIT_BREAKDOWN.md) | Detailed init decomposition | Engineers, Hackers |
 
 ---
 
