@@ -122,50 +122,38 @@ class RouterCollective(nn.Module):
             return_individual: bool = False,
             return_emergence: bool = False,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """
-        Forward pass through collective.
-
-        Args:
-            x: Input tensor [B, ...] or dict of inputs per stream
-            return_individual: Return per-stream predictions
-            return_emergence: Compute emergence metrics (requires labels)
-
-        Returns:
-            logits: [B, num_classes] collective prediction
-            info: Dict with routing metrics, individual predictions, emergence
-        """
-        # Clear mailbox at start of forward pass
+        """Forward pass through collective."""
         self.mailbox.clear()
 
         stream_outputs = {}
         stream_infos = {}
 
         for i, name in enumerate(self.stream_names):
-            # Get input for this stream
             if isinstance(x, dict):
                 stream_input = x[name]
             else:
                 stream_input = x
 
-            # Encode through stream
+            # Stream outputs [B, num_slots, feature_dim] - no unsqueeze needed
             encoded = self.streams[name](stream_input)
 
-            # Get target fingerprint for adjacent gating
+            # Get target fingerprint for adjacent gating (circular)
             if i < len(self.stream_names) - 1:
                 next_name = self.stream_names[i + 1]
-                target_fp = self.heads[next_name].fingerprint
             else:
-                target_fp = None
+                next_name = self.stream_names[0]
+            target_fp = self.heads[next_name].fingerprint
 
             # Route through head
             head = self.heads[name]
-            routed, info = head(encoded, target_fingerprint=target_fp)
+            routed, head_info = head(encoded, target_fingerprint=target_fp, return_info=True)
 
-            # Post to mailbox (detached - no gradient flow)
+            # Post to mailbox
+            routing_state = head_info.get('route_weights', routed).mean(dim=1) if head_info else routed.mean(dim=1)
             self.mailbox.post(
-                module_id=id(head),
-                name=name,
-                content=info.get('routing_state', routed.mean(dim=1)).detach(),
+                sender_id=str(id(head)),
+                sender_name=name,
+                content=routing_state.detach(),
             )
 
             # Pool and project
@@ -173,28 +161,26 @@ class RouterCollective(nn.Module):
             projected = self.projections[name](pooled)
 
             stream_outputs[name] = projected
-            stream_infos[name] = info
+            stream_infos[name] = head_info or {}
 
-        # Fuse all streams
-        fused = self.fusion(stream_outputs)
+        # Fuse
+        fused, fusion_info = self.fusion(stream_outputs)
 
         # Classify
         logits = self.classifier(fused)
 
-        # Build info dict
         info = {
             'stream_infos': stream_infos,
+            'fusion_info': fusion_info,
             'mailbox_messages': len(self.mailbox.messages),
         }
 
-        # Aggregate routing metrics
         route_entropies = [
-            i.get('route_entropy', 0) for i in stream_infos.values()
+            si.get('route_entropy', 0) for si in stream_infos.values() if si
         ]
         if route_entropies:
             info['mean_route_entropy'] = np.mean(route_entropies)
 
-        # Individual predictions
         if return_individual:
             individual_logits = {
                 name: self.stream_classifiers[name](stream_outputs[name])
@@ -206,13 +192,10 @@ class RouterCollective(nn.Module):
 
     def _pool(self, x: torch.Tensor, stream_name: str) -> torch.Tensor:
         """Pool stream output to [B, D]."""
-        input_shape = self._stream_input_shapes.get(stream_name, 'vector')
-
-        if input_shape == 'vector' or x.dim() == 2:
-            return x
+        if x.dim() == 2:
+            return x  # Already [B, D]
         elif x.dim() == 3:
-            # [B, S, D] -> [B, D] via mean pooling
-            return x.mean(dim=1)
+            return x.mean(dim=1)  # [B, S, D] -> [B, D]
         else:
             raise ValueError(f"Unexpected tensor shape: {x.shape}")
 
@@ -541,6 +524,7 @@ class RouterCollective(nn.Module):
     # =========================================================================
 
     @classmethod
+    @classmethod
     def from_specs(
             cls,
             stream_specs: List[StreamSpec],
@@ -548,45 +532,25 @@ class RouterCollective(nn.Module):
             head_spec: Optional[HeadSpec] = None,
             fusion_spec: Optional[FusionSpec] = None,
     ) -> "RouterCollective":
-        """
-        Create collective from stream specifications.
-
-        This is the recommended way to build a collective.
-
-        Args:
-            stream_specs: List of StreamSpec defining each stream
-            config: Collective configuration
-            head_spec: Head specification (default: standard)
-            fusion_spec: Fusion specification (default: gated)
-
-        Example:
-            collective = RouterCollective.from_specs(
-                stream_specs=[
-                    StreamSpec.feature_vector("clip_b32", input_dim=512),
-                    StreamSpec.feature_vector("clip_l14", input_dim=768),
-                    StreamSpec.sequence("t5", input_dim=768),
-                ],
-                config=CollectiveConfig(feature_dim=512, num_classes=1000),
-            )
-        """
+        """Create collective from stream specifications."""
         head_spec = head_spec or HeadSpec.standard(feature_dim=config.feature_dim)
         fusion_spec = fusion_spec or FusionSpec.gated(output_dim=config.feature_dim)
 
-        # Reset registry
         get_registry().reset()
 
-        # Build streams
+        num_slots = getattr(config, 'num_slots', 16)
+
+        # Build streams with proper slot expansion
         streams = nn.ModuleDict()
         stream_dims = {}
         stream_input_shapes = {}
 
         for spec in stream_specs:
-            stream = cls._build_stream_from_spec(spec)
-            streams[spec.name] = stream
+            streams[spec.name] = cls._build_stream_from_spec(spec, num_slots)
             stream_dims[spec.name] = spec.feature_dim
             stream_input_shapes[spec.name] = spec.input_shape
 
-        # Build heads (one per stream, each with unique fingerprint)
+        # Build heads (one per stream)
         heads = nn.ModuleDict()
         for spec in stream_specs:
             head_config = HeadConfig(
@@ -597,12 +561,11 @@ class RouterCollective(nn.Module):
                 num_routes=head_spec.num_routes,
                 use_cantor=head_spec.use_cantor,
             )
-            head = HeadBuilder(head_config).build()
-            heads[spec.name] = head
+            heads[spec.name] = HeadBuilder(head_config).build()
 
-        # Build fusion
+        # Fusion
         stream_dims_for_fusion = {
-            spec.name: config.feature_dim  # After projection
+            spec.name: config.feature_dim
             for spec in stream_specs
         }
         fusion = cls._build_fusion_from_spec(fusion_spec, stream_dims_for_fusion)
@@ -714,57 +677,22 @@ class RouterCollective(nn.Module):
         )
 
     @staticmethod
-    def _build_stream_from_spec(spec: StreamSpec) -> nn.Module:
+    @staticmethod
+    def _build_stream_from_spec(spec: StreamSpec, num_slots: int) -> nn.Module:
         """Build stream module from specification."""
-        stream_type = spec.stream_type
+        from geofractal.router.streams.vector import StreamBuilder
 
-        if stream_type in ('feature', 'feature_vector'):
-            if spec.input_dim != spec.feature_dim:
-                return nn.Sequential(
-                    nn.Linear(spec.input_dim, spec.feature_dim),
-                    nn.LayerNorm(spec.feature_dim),
-                    nn.GELU(),
-                )
-            return nn.Identity()
+        return StreamBuilder.build(
+            stream_type=spec.stream_type,
+            input_dim=spec.input_dim,
+            feature_dim=spec.feature_dim,
+            num_slots=num_slots,
+            name=spec.name,
+            num_layers=getattr(spec, 'num_layers', 2),
+            num_heads=getattr(spec, 'num_heads', 8),
+            kernel_sizes=getattr(spec, 'kernel_sizes', (3, 5, 7)),
+        )
 
-        elif stream_type == 'trainable_vector':
-            return nn.Sequential(
-                nn.Linear(spec.input_dim, spec.feature_dim),
-                nn.LayerNorm(spec.feature_dim),
-                nn.GELU(),
-                nn.Linear(spec.feature_dim, spec.feature_dim),
-                nn.LayerNorm(spec.feature_dim),
-            )
-
-        elif stream_type in ('sequence', 'frozen'):
-            if spec.input_dim != spec.feature_dim:
-                return nn.Linear(spec.input_dim, spec.feature_dim)
-            return nn.Identity()
-
-        elif stream_type == 'transformer_sequence':
-            layers = []
-            if spec.input_dim != spec.feature_dim:
-                layers.append(nn.Linear(spec.input_dim, spec.feature_dim))
-
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=spec.feature_dim,
-                nhead=getattr(spec, 'num_heads', 8),
-                dim_feedforward=spec.feature_dim * 4,
-                dropout=0.1,
-                activation='gelu',
-                batch_first=True,
-            )
-            num_layers = getattr(spec, 'num_layers', 2)
-            layers.append(nn.TransformerEncoder(encoder_layer, num_layers))
-
-            return nn.Sequential(*layers) if layers else nn.Identity()
-
-        elif stream_type == 'conv_sequence':
-            kernel_sizes = getattr(spec, 'kernel_sizes', [3, 5, 7])
-            return MultiScaleConv1d(spec.input_dim, spec.feature_dim, kernel_sizes)
-
-        else:
-            raise ValueError(f"Unknown stream type: {stream_type}")
 
     @staticmethod
     def _build_fusion_from_spec(

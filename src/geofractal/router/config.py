@@ -14,7 +14,7 @@ from typing import Optional, Tuple
 import torch
 
 # Import router config from core
-from geofractal.router.deprecated.core import GlobalFractalRouterConfig
+#from geofractal.router.deprecated.core import GlobalFractalRouterConfig
 
 # =============================================================================
 # CONFIGURATION
