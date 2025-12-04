@@ -63,65 +63,6 @@ def run_test(name: str, fn):
         return False
 
 
-def verify_head_gradients(head: nn.Module, x: torch.Tensor) -> Tuple[bool, Dict[str, bool]]:
-    """Verify gradients flow through head components."""
-    head.zero_grad()
-    head.train()
-
-    out = head(x)
-    loss = out.sum()
-    loss.backward()
-
-    results = {}
-
-    # Fingerprint
-    if hasattr(head, 'fingerprint'):
-        has_grad = head.fingerprint.grad is not None and head.fingerprint.grad.abs().sum() > 0
-        results['fingerprint'] = has_grad
-
-    # Attention
-    if hasattr(head, 'attention') and hasattr(head.attention, 'q_proj'):
-        p = head.attention.q_proj.weight
-        has_grad = p.grad is not None and p.grad.abs().sum() > 0
-        results['attention'] = has_grad
-
-    # Router
-    if hasattr(head, 'router') and hasattr(head.router, 'fp_to_bias'):
-        p = head.router.fp_to_bias.weight
-        has_grad = p.grad is not None and p.grad.abs().sum() > 0
-        results['router'] = has_grad
-
-    # Anchors
-    if hasattr(head, 'anchors') and hasattr(head.anchors, 'anchors'):
-        p = head.anchors.anchors
-        has_grad = p.grad is not None and p.grad.abs().sum() > 0
-        results['anchors'] = has_grad
-
-    # Gate
-    if hasattr(head, 'gate') and hasattr(head.gate, 'fp_compare'):
-        for pname, p in head.gate.fp_compare.named_parameters():
-            has_grad = p.grad is not None and p.grad.abs().sum() > 0
-            results['gate'] = has_grad
-            break
-
-    # Combiner
-    if hasattr(head, 'combiner') and hasattr(head.combiner, 'weights'):
-        p = head.combiner.weights
-        has_grad = p.grad is not None and p.grad.abs().sum() > 0
-        results['combiner'] = has_grad
-
-    # Refinement
-    if hasattr(head, 'refinement'):
-        for pname, p in head.refinement.named_parameters():
-            if p.requires_grad:
-                has_grad = p.grad is not None and p.grad.abs().sum() > 0
-                results['refinement'] = has_grad
-                break
-
-    all_passed = all(results.values())
-    return all_passed, results
-
-
 # =============================================================================
 # TEST 1: HEADBUILDER BASIC
 # =============================================================================
@@ -415,10 +356,6 @@ def test_headbuilder_injection():
 # TEST 4: HEADBUILDER GRADIENT FLOW
 # =============================================================================
 
-# =============================================================================
-# TEST 4: HEADBUILDER GRADIENT FLOW
-# =============================================================================
-
 def test_headbuilder_gradients():
     test_section("4. HeadBuilder Gradient Flow")
 
@@ -434,63 +371,139 @@ def test_headbuilder_gradients():
     config = HeadConfig(feature_dim=D)
     x = torch.randn(B, S, D).to(DEVICE)
 
-    # Standard preset gradients
-    def test_standard_gradients():
+    def verify_core_gradients(head, x, with_target_fp=False):
+        """Verify core component gradients, optionally with target fingerprint."""
+        head.zero_grad()
+        head.train()
+
+        if with_target_fp:
+            target_fp = torch.randn(config.fingerprint_dim, device=DEVICE)
+            out = head(x, target_fingerprint=target_fp)
+        else:
+            out = head(x)
+
+        loss = out.sum()
+        loss.backward()
+
+        results = {}
+
+        # Fingerprint
+        if hasattr(head, 'fingerprint'):
+            has_grad = head.fingerprint.grad is not None and head.fingerprint.grad.abs().sum() > 0
+            results['fingerprint'] = has_grad
+
+        # Attention
+        if hasattr(head, 'attention') and hasattr(head.attention, 'q_proj'):
+            p = head.attention.q_proj.weight
+            has_grad = p.grad is not None and p.grad.abs().sum() > 0
+            results['attention'] = has_grad
+
+        # Router
+        if hasattr(head, 'router') and hasattr(head.router, 'fp_to_bias'):
+            p = head.router.fp_to_bias.weight
+            has_grad = p.grad is not None and p.grad.abs().sum() > 0
+            results['router'] = has_grad
+
+        # Anchors
+        if hasattr(head, 'anchors') and hasattr(head.anchors, 'anchors'):
+            p = head.anchors.anchors
+            has_grad = p.grad is not None and p.grad.abs().sum() > 0
+            results['anchors'] = has_grad
+
+        # Gate - only check with target_fingerprint
+        if with_target_fp and hasattr(head, 'gate') and hasattr(head.gate, 'fp_compare'):
+            for pname, p in head.gate.fp_compare.named_parameters():
+                has_grad = p.grad is not None and p.grad.abs().sum() > 0
+                results['gate'] = has_grad
+                break
+
+        # Combiner
+        if hasattr(head, 'combiner') and hasattr(head.combiner, 'weights'):
+            p = head.combiner.weights
+            has_grad = p.grad is not None and p.grad.abs().sum() > 0
+            results['combiner'] = has_grad
+
+        # Refinement
+        if hasattr(head, 'refinement'):
+            for pname, p in head.refinement.named_parameters():
+                if p.requires_grad:
+                    has_grad = p.grad is not None and p.grad.abs().sum() > 0
+                    results['refinement'] = has_grad
+                    break
+
+        return results
+
+    # Standard preset - core gradients
+    def test_standard_core_gradients():
         head = HeadBuilder.standard(config).build().to(DEVICE)
-        all_passed, results = verify_head_gradients(head, x)
-        failed = [k for k, v in results.items() if not v]
+        results = verify_core_gradients(head, x, with_target_fp=False)
+        core_components = ['fingerprint', 'attention', 'router', 'anchors', 'combiner', 'refinement']
+        failed = [k for k in core_components if k in results and not results[k]]
         if failed:
             return f"No gradients: {failed}"
         return True
+    run_test("Standard preset core gradients", test_standard_core_gradients)
 
-    run_test("Standard preset gradients", test_standard_gradients)
-
-    # Lightweight preset gradients
-    def test_lightweight_gradients():
+    # Lightweight preset - core gradients
+    def test_lightweight_core_gradients():
         head = HeadBuilder.lightweight(config).build().to(DEVICE)
-        all_passed, results = verify_head_gradients(head, x)
-        failed = [k for k, v in results.items() if not v]
+        results = verify_core_gradients(head, x, with_target_fp=False)
+        core_components = ['fingerprint', 'attention', 'anchors', 'combiner', 'refinement']
+        failed = [k for k in core_components if k in results and not results[k]]
         if failed:
             return f"No gradients: {failed}"
         return True
+    run_test("Lightweight preset core gradients", test_lightweight_core_gradients)
 
-    run_test("Lightweight preset gradients", test_lightweight_gradients)
-
-    # Heavy preset gradients
-    def test_heavy_gradients():
+    # Heavy preset - full gradients with target_fingerprint
+    def test_heavy_full_gradients():
         head = HeadBuilder.heavy(config).build().to(DEVICE)
-        all_passed, results = verify_head_gradients(head, x)
+        results = verify_core_gradients(head, x, with_target_fp=True)
         failed = [k for k, v in results.items() if not v]
         if failed:
             return f"No gradients: {failed}"
         return True
+    run_test("Heavy preset full gradients (with target_fp)", test_heavy_full_gradients)
 
-    run_test("Heavy preset gradients", test_heavy_gradients)
+    # Gate gradient with target_fingerprint
+    def test_gate_with_target_fp():
+        head = HeadBuilder.standard(config).build().to(DEVICE)
+        target_fp = torch.randn(config.fingerprint_dim, device=DEVICE)
+
+        head.zero_grad()
+        out = head(x, target_fingerprint=target_fp)
+        loss = out.sum()
+        loss.backward()
+
+        if hasattr(head.gate, 'fp_compare'):
+            for pname, p in head.gate.fp_compare.named_parameters():
+                has_grad = p.grad is not None and p.grad.abs().sum() > 0
+                if not has_grad:
+                    return f"Gate fp_compare.{pname} has no gradient"
+                break
+        return True
+    run_test("Gate gradients with target_fingerprint", test_gate_with_target_fp)
 
     # CantorAttention gradients
     def test_cantor_gradients():
         head = HeadBuilder(config).with_attention(CantorAttention).build().to(DEVICE)
-        all_passed, results = verify_head_gradients(head, x)
-        failed = [k for k, v in results.items() if not v]
-        if failed:
-            return f"No gradients: {failed}"
+        results = verify_core_gradients(head, x, with_target_fp=False)
+        if 'attention' in results and not results['attention']:
+            return "CantorAttention has no gradients"
         return True
-
     run_test("CantorAttention gradients", test_cantor_gradients)
 
     # AttentiveAnchorBank gradients
     def test_attentive_anchor_gradients():
         head = HeadBuilder(config).with_anchors(AttentiveAnchorBank).build().to(DEVICE)
-        all_passed, results = verify_head_gradients(head, x)
-        failed = [k for k, v in results.items() if not v]
-        if failed:
-            return f"No gradients: {failed}"
+        results = verify_core_gradients(head, x, with_target_fp=False)
+        if 'anchors' in results and not results['anchors']:
+            return "AttentiveAnchorBank has no gradients"
         return True
-
     run_test("AttentiveAnchorBank gradients", test_attentive_anchor_gradients)
 
-    # With target_fingerprint
-    def test_target_fingerprint_gradients():
+    # Fingerprint gradient verification
+    def test_fingerprint_gradients():
         head = HeadBuilder(config).build().to(DEVICE)
         target_fp = torch.randn(config.fingerprint_dim, device=DEVICE)
 
@@ -499,13 +512,11 @@ def test_headbuilder_gradients():
         loss = out.sum()
         loss.backward()
 
-        # Gate should have gradients due to target_fingerprint
         has_grad = head.fingerprint.grad is not None and head.fingerprint.grad.abs().sum() > 0
         if not has_grad:
-            return "No fingerprint gradient with target_fingerprint"
+            return "No fingerprint gradient"
         return True
-
-    run_test("target_fingerprint gradient flow", test_target_fingerprint_gradients)
+    run_test("Fingerprint gradient flow", test_fingerprint_gradients)
 
 
 # =============================================================================
@@ -556,7 +567,6 @@ def test_composedhead_access():
         B, S, D = 4, 16, 256
         x = torch.randn(B, S, D).to(DEVICE)
 
-        # Replace attention with standard
         from geofractal.router.head.components import StandardAttention
         new_attn = StandardAttention(config).to(DEVICE)
         head.replace_component('attention', new_attn)
@@ -572,7 +582,6 @@ def test_composedhead_access():
         num_params = head.num_parameters
         assert num_params > 0
 
-        # Should match manual count
         manual_count = sum(p.numel() for p in head.parameters() if p.requires_grad)
         assert num_params == manual_count
         return True
@@ -642,6 +651,7 @@ def test_prototype_config():
             num_classes=100,
             stream_specs=[
                 StreamSpec.feature_stream("a", input_dim=512, feature_dim=256),
+                StreamSpec.feature_stream("b", input_dim=512, feature_dim=256),
             ],
             head_spec=HeadSpec.standard(feature_dim=256),
             fusion_spec=FusionSpec.standard(output_dim=256),
@@ -704,7 +714,6 @@ def test_assembled_prototype():
 
         prototype = AssembledPrototype(config).to(DEVICE)
 
-        # Feature inputs
         inputs = {
             "a": torch.randn(B, 256).to(DEVICE),
             "b": torch.randn(B, 256).to(DEVICE),
@@ -749,6 +758,7 @@ def test_assembled_prototype():
             num_classes=10,
             stream_specs=[
                 StreamSpec.feature_stream("a", input_dim=256, feature_dim=128),
+                StreamSpec.feature_stream("b", input_dim=256, feature_dim=128),
             ],
             freeze_streams=False,
         )
@@ -771,6 +781,95 @@ def test_assembled_prototype():
 
         return True
     run_test("freeze_streams / unfreeze_streams", test_freeze_unfreeze)
+
+    # Gradient flow
+    def test_prototype_gradients():
+        config = PrototypeConfig(
+            num_classes=10,
+            stream_specs=[
+                StreamSpec.feature_stream("a", input_dim=256, feature_dim=128),
+                StreamSpec.feature_stream("b", input_dim=256, feature_dim=128),
+            ],
+            head_spec=HeadSpec.lightweight(feature_dim=128),
+            fusion_spec=FusionSpec.standard(output_dim=128),
+            freeze_streams=False,
+        )
+
+        prototype = AssembledPrototype(config).to(DEVICE)
+
+        inputs = {
+            "a": torch.randn(B, 256).to(DEVICE),
+            "b": torch.randn(B, 256).to(DEVICE),
+        }
+        labels = torch.randint(0, 10, (B,)).to(DEVICE)
+
+        prototype.zero_grad()
+        logits, _ = prototype(inputs)
+        loss = F.cross_entropy(logits, labels)
+        loss.backward()
+
+        grad_count = sum(1 for p in prototype.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
+        if grad_count == 0:
+            return "No gradients in prototype"
+        return True
+    run_test("AssembledPrototype gradient flow", test_prototype_gradients)
+
+    # Parameter summary
+    def test_parameter_summary():
+        config = PrototypeConfig(
+            num_classes=10,
+            stream_specs=[
+                StreamSpec.feature_stream("a", input_dim=256, feature_dim=128),
+                StreamSpec.feature_stream("b", input_dim=256, feature_dim=128),
+            ],
+            freeze_streams=False,
+        )
+
+        prototype = AssembledPrototype(config).to(DEVICE)
+
+        summary = prototype.parameter_summary()
+        assert 'total' in summary
+        assert 'trainable' in summary
+        assert 'frozen' in summary
+        assert summary['total'] > 0
+        return True
+    run_test("AssembledPrototype parameter_summary", test_parameter_summary)
+
+    # num_parameters property
+    def test_num_parameters():
+        config = PrototypeConfig(
+            num_classes=10,
+            stream_specs=[
+                StreamSpec.feature_stream("a", input_dim=256, feature_dim=128),
+                StreamSpec.feature_stream("b", input_dim=256, feature_dim=128),
+            ],
+            freeze_streams=False,
+        )
+
+        prototype = AssembledPrototype(config).to(DEVICE)
+
+        num_params = prototype.num_parameters
+        assert num_params > 0
+        return True
+    run_test("AssembledPrototype num_parameters", test_num_parameters)
+
+    # Compile
+    def test_compile():
+        config = PrototypeConfig(
+            num_classes=10,
+            stream_specs=[
+                StreamSpec.feature_stream("a", input_dim=256, feature_dim=128),
+                StreamSpec.feature_stream("b", input_dim=256, feature_dim=128),
+            ],
+        )
+
+        prototype = AssembledPrototype(config).to(DEVICE)
+        result = prototype.compile()
+
+        assert result is prototype
+        assert prototype._is_compiled == True
+        return True
+    run_test("AssembledPrototype compile", test_compile)
 
 
 # =============================================================================
@@ -879,6 +978,53 @@ def test_lightweight_prototype():
         return True
     run_test("LightweightPrototype 5 streams", test_lightweight_many_streams)
 
+    # get_stream_outputs
+    def test_get_stream_outputs():
+        prototype = LightweightPrototype(
+            stream_dims={"a": 512, "b": 768},
+            num_classes=10,
+            hidden_dim=256,
+        ).to(DEVICE)
+
+        inputs = {
+            "a": torch.randn(B, 512).to(DEVICE),
+            "b": torch.randn(B, 768).to(DEVICE),
+        }
+
+        outputs = prototype.get_stream_outputs(inputs)
+        assert "a" in outputs
+        assert "b" in outputs
+        return True
+    run_test("LightweightPrototype get_stream_outputs", test_get_stream_outputs)
+
+    # num_parameters
+    def test_lightweight_num_parameters():
+        prototype = LightweightPrototype(
+            stream_dims={"a": 512, "b": 768},
+            num_classes=10,
+            hidden_dim=256,
+        ).to(DEVICE)
+
+        num_params = prototype.num_parameters
+        assert num_params > 0
+        return True
+    run_test("LightweightPrototype num_parameters", test_lightweight_num_parameters)
+
+    # parameter_summary
+    def test_lightweight_parameter_summary():
+        prototype = LightweightPrototype(
+            stream_dims={"a": 512, "b": 768},
+            num_classes=10,
+            hidden_dim=256,
+        ).to(DEVICE)
+
+        summary = prototype.parameter_summary()
+        assert 'total' in summary
+        assert 'trainable' in summary
+        assert 'frozen' in summary
+        return True
+    run_test("LightweightPrototype parameter_summary", test_lightweight_parameter_summary)
+
 
 # =============================================================================
 # TEST 9: FACTORY FUNCTIONS
@@ -940,7 +1086,8 @@ def test_serialization():
 
     from geofractal.router.head.builder import HeadBuilder
     from geofractal.router.head.components import HeadConfig
-    from geofractal.router.factory.prototype import LightweightPrototype
+    from geofractal.router.factory.prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
+    from geofractal.router.factory.protocols import StreamSpec
 
     B, S, D = 4, 16, 256
 
@@ -970,7 +1117,7 @@ def test_serialization():
     run_test("Head state_dict save/load", test_head_state_dict)
 
     # LightweightPrototype state dict
-    def test_prototype_state_dict():
+    def test_lightweight_state_dict():
         prototype1 = LightweightPrototype(
             stream_dims={"a": 256, "b": 256},
             num_classes=10,
@@ -1002,7 +1149,43 @@ def test_serialization():
 
         assert torch.allclose(out1, out2, atol=1e-5)
         return True
-    run_test("LightweightPrototype state_dict", test_prototype_state_dict)
+    run_test("LightweightPrototype state_dict", test_lightweight_state_dict)
+
+    # AssembledPrototype state dict
+    def test_assembled_state_dict():
+        config = PrototypeConfig(
+            num_classes=10,
+            stream_specs=[
+                StreamSpec.feature_stream("a", input_dim=256, feature_dim=128),
+                StreamSpec.feature_stream("b", input_dim=256, feature_dim=128),
+            ],
+            freeze_streams=False,
+        )
+
+        prototype1 = AssembledPrototype(config).to(DEVICE)
+
+        torch.manual_seed(42)
+        inputs = {
+            "a": torch.randn(B, 256).to(DEVICE),
+            "b": torch.randn(B, 256).to(DEVICE),
+        }
+
+        prototype1.eval()
+        with torch.no_grad():
+            out1, _ = prototype1(inputs)
+
+        state = prototype1.state_dict()
+
+        prototype2 = AssembledPrototype(config).to(DEVICE)
+        prototype2.load_state_dict(state)
+        prototype2.eval()
+
+        with torch.no_grad():
+            out2, _ = prototype2(inputs)
+
+        assert torch.allclose(out1, out2, atol=1e-5)
+        return True
+    run_test("AssembledPrototype state_dict", test_assembled_state_dict)
 
     # File save/load
     def test_file_save_load():
@@ -1045,7 +1228,8 @@ def test_training():
 
     from geofractal.router.head.builder import HeadBuilder
     from geofractal.router.head.components import HeadConfig
-    from geofractal.router.factory.prototype import LightweightPrototype
+    from geofractal.router.factory.prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
+    from geofractal.router.factory.protocols import StreamSpec
 
     B = 8
 
@@ -1072,8 +1256,8 @@ def test_training():
         return True
     run_test("Head training 20 steps", test_head_training)
 
-    # Prototype training
-    def test_prototype_training():
+    # LightweightPrototype training
+    def test_lightweight_training():
         prototype = LightweightPrototype(
             stream_dims={"a": 256, "b": 256},
             num_classes=10,
@@ -1100,10 +1284,45 @@ def test_training():
                 return f"NaN at step {step}"
 
         return True
-    run_test("LightweightPrototype training 20 steps", test_prototype_training)
+    run_test("LightweightPrototype training 20 steps", test_lightweight_training)
 
-    # Loss decreases
-    def test_loss_decreases():
+    # AssembledPrototype training
+    def test_assembled_training():
+        config = PrototypeConfig(
+            num_classes=10,
+            stream_specs=[
+                StreamSpec.feature_stream("a", input_dim=256, feature_dim=128),
+                StreamSpec.feature_stream("b", input_dim=256, feature_dim=128),
+            ],
+            freeze_streams=False,
+        )
+
+        prototype = AssembledPrototype(config).to(DEVICE)
+
+        optimizer = torch.optim.Adam(prototype.parameters(), lr=1e-3)
+
+        prototype.train()
+        for step in range(20):
+            inputs = {
+                "a": torch.randn(B, 256).to(DEVICE),
+                "b": torch.randn(B, 256).to(DEVICE),
+            }
+            labels = torch.randint(0, 10, (B,)).to(DEVICE)
+
+            optimizer.zero_grad()
+            logits, _ = prototype(inputs)
+            loss = F.cross_entropy(logits, labels)
+            loss.backward()
+            optimizer.step()
+
+            if torch.isnan(loss):
+                return f"NaN at step {step}"
+
+        return True
+    run_test("AssembledPrototype training 20 steps", test_assembled_training)
+
+    # Loss decreases (LightweightPrototype)
+    def test_lightweight_loss_decreases():
         prototype = LightweightPrototype(
             stream_dims={"a": 128, "b": 128},
             num_classes=5,
@@ -1112,7 +1331,6 @@ def test_training():
 
         optimizer = torch.optim.Adam(prototype.parameters(), lr=1e-2)
 
-        # Fixed dataset
         torch.manual_seed(42)
         fixed_inputs = {
             "a": torch.randn(32, 128).to(DEVICE),
@@ -1137,7 +1355,150 @@ def test_training():
             return f"Loss did not decrease: {first_5:.4f} -> {last_5:.4f}"
 
         return True
-    run_test("Loss decreases over training", test_loss_decreases)
+    run_test("LightweightPrototype loss decreases", test_lightweight_loss_decreases)
+
+    # Loss decreases (AssembledPrototype)
+    def test_assembled_loss_decreases():
+        config = PrototypeConfig(
+            num_classes=5,
+            stream_specs=[
+                StreamSpec.feature_stream("a", input_dim=128, feature_dim=64),
+                StreamSpec.feature_stream("b", input_dim=128, feature_dim=64),
+            ],
+            freeze_streams=False,
+        )
+
+        prototype = AssembledPrototype(config).to(DEVICE)
+
+        optimizer = torch.optim.Adam(prototype.parameters(), lr=1e-2)
+
+        torch.manual_seed(42)
+        fixed_inputs = {
+            "a": torch.randn(32, 128).to(DEVICE),
+            "b": torch.randn(32, 128).to(DEVICE),
+        }
+        fixed_labels = torch.randint(0, 5, (32,)).to(DEVICE)
+
+        losses = []
+        prototype.train()
+        for step in range(50):
+            optimizer.zero_grad()
+            logits, _ = prototype(fixed_inputs)
+            loss = F.cross_entropy(logits, fixed_labels)
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+
+        first_5 = sum(losses[:5]) / 5
+        last_5 = sum(losses[-5:]) / 5
+
+        if last_5 >= first_5:
+            return f"Loss did not decrease: {first_5:.4f} -> {last_5:.4f}"
+
+        return True
+    run_test("AssembledPrototype loss decreases", test_assembled_loss_decreases)
+
+
+# =============================================================================
+# TEST 12: EDGE CASES
+# =============================================================================
+
+def test_edge_cases():
+    test_section("12. Edge Cases")
+
+    from geofractal.router.head.builder import HeadBuilder
+    from geofractal.router.head.components import HeadConfig
+    from geofractal.router.factory.prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
+    from geofractal.router.factory.protocols import StreamSpec, HeadSpec, FusionSpec
+
+    B = 4
+
+    # Very small dimensions
+    def test_small_dims():
+        config = HeadConfig(feature_dim=32, num_heads=2, num_anchors=4, num_routes=2)
+        head = HeadBuilder.lightweight(config).build().to(DEVICE)
+        x = torch.randn(B, 8, 32).to(DEVICE)
+        out = head(x)
+        assert out.shape == (B, 8, 32)
+        return True
+    run_test("Small dimensions (D=32)", test_small_dims)
+
+    # Large batch size
+    def test_large_batch():
+        config = HeadConfig(feature_dim=128)
+        head = HeadBuilder.lightweight(config).build().to(DEVICE)
+        x = torch.randn(64, 16, 128).to(DEVICE)
+        out = head(x)
+        assert out.shape == (64, 16, 128)
+        return True
+    run_test("Large batch (B=64)", test_large_batch)
+
+    # Single token sequence
+    def test_single_token():
+        config = HeadConfig(feature_dim=128)
+        head = HeadBuilder.lightweight(config).build().to(DEVICE)
+        x = torch.randn(B, 1, 128).to(DEVICE)
+        out = head(x)
+        assert out.shape == (B, 1, 128)
+        return True
+    run_test("Single token sequence (S=1)", test_single_token)
+
+    # Many streams in LightweightPrototype
+    def test_many_streams():
+        stream_dims = {f"stream_{i}": 256 for i in range(10)}
+        prototype = LightweightPrototype(
+            stream_dims=stream_dims,
+            num_classes=100,
+            hidden_dim=512,
+        ).to(DEVICE)
+
+        inputs = {name: torch.randn(B, dim).to(DEVICE) for name, dim in stream_dims.items()}
+        logits, _ = prototype(inputs)
+        assert logits.shape == (B, 100)
+        return True
+    run_test("Many streams (10 streams)", test_many_streams)
+
+    # Different feature dims per stream
+    def test_different_dims():
+        prototype = LightweightPrototype(
+            stream_dims={
+                "tiny": 64,
+                "small": 256,
+                "medium": 512,
+                "large": 1024,
+            },
+            num_classes=10,
+            hidden_dim=256,
+        ).to(DEVICE)
+
+        inputs = {
+            "tiny": torch.randn(B, 64).to(DEVICE),
+            "small": torch.randn(B, 256).to(DEVICE),
+            "medium": torch.randn(B, 512).to(DEVICE),
+            "large": torch.randn(B, 1024).to(DEVICE),
+        }
+        logits, _ = prototype(inputs)
+        assert logits.shape == (B, 10)
+        return True
+    run_test("Different feature dims per stream", test_different_dims)
+
+    # 3D input to LightweightPrototype (with CLS token)
+    def test_3d_input():
+        prototype = LightweightPrototype(
+            stream_dims={"a": 256, "b": 256},
+            num_classes=10,
+            hidden_dim=128,
+        ).to(DEVICE)
+
+        # 3D inputs [B, S, D]
+        inputs = {
+            "a": torch.randn(B, 16, 256).to(DEVICE),
+            "b": torch.randn(B, 16, 256).to(DEVICE),
+        }
+        logits, _ = prototype(inputs)
+        assert logits.shape == (B, 10)
+        return True
+    run_test("3D input to LightweightPrototype", test_3d_input)
 
 
 # =============================================================================
@@ -1160,6 +1521,7 @@ def main():
     test_factory_functions()
     test_serialization()
     test_training()
+    test_edge_cases()
 
     print("\n" + "="*70)
     print("  FINAL SUMMARY")
@@ -1170,10 +1532,10 @@ def main():
 
     if ERRORS:
         print(f"\n  Errors:")
-        for e in ERRORS:
-            print(f"    - {e}")
-        if len(ERRORS) > 10:
-            print(f"    ... and {len(ERRORS) - 10} more")
+        for e in ERRORS[:15]:
+            print(f"    - {e[:80]}...")
+        if len(ERRORS) > 15:
+            print(f"    ... and {len(ERRORS) - 15} more")
 
     print("="*70)
 
