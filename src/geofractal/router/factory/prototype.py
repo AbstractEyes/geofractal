@@ -418,9 +418,88 @@ class ConvSequenceBackbone(nn.Module):
 # =============================================================================
 
 class LightweightPrototype(BasePrototype):
-    """Lightweight prototype for fast experimentation."""
-    # ... (same as before)
+    """
+    Lightweight prototype for fast experimentation.
 
+    Simpler architecture with minimal routing overhead.
+    Good for quick iteration and baseline comparisons.
+    """
+
+    def __init__(
+            self,
+            stream_dims: Dict[str, int],
+            num_classes: int,
+            hidden_dim: int = 512,
+            dropout: float = 0.1,
+    ):
+        super().__init__(num_classes, "lightweight")
+
+        self.stream_dims = stream_dims
+        self.stream_names = list(stream_dims.keys())
+        self.hidden_dim = hidden_dim
+
+        # Simple projections per stream
+        self.projections = nn.ModuleDict({
+            name: nn.Sequential(
+                nn.Linear(dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.GELU(),
+            )
+            for name, dim in stream_dims.items()
+        })
+
+        # Learnable stream weights
+        self.stream_weights = nn.Parameter(torch.ones(len(stream_dims)))
+
+        # Classifier
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def get_stream_outputs(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        # x should be dict of stream features
+        if isinstance(x, dict):
+            return x
+        # Otherwise return empty (streams handled externally)
+        return {}
+
+    def forward(
+            self,
+            stream_features: Dict[str, torch.Tensor],
+            return_info: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[PrototypeInfo]]:
+        """
+        Args:
+            stream_features: {name: [B, D]} features from each stream
+        """
+        # Project each stream
+        projected = {}
+        for name in self.stream_names:
+            feat = stream_features[name]
+            if feat.dim() == 3:
+                feat = feat[:, 0]  # Take CLS
+            projected[name] = self.projections[name](feat)
+
+        # Weighted combination
+        weights = F.softmax(self.stream_weights, dim=0)
+
+        fused = None
+        for i, name in enumerate(self.stream_names):
+            weighted = weights[i] * projected[name]
+            fused = weighted if fused is None else fused + weighted
+
+        # Classify
+        logits = self.classifier(fused)
+
+        info = None
+        if return_info:
+            info = PrototypeInfo(
+                head_outputs=projected,
+                fusion_weights=weights.detach(),
+            )
+
+        return logits, info
 
 # =============================================================================
 # EXPORTS
