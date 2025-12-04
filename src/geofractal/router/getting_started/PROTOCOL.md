@@ -1,6 +1,6 @@
 # GlobalFractalRouter Protocol Specification
 
-**Version:** 1.0.0  
+**Version:** 2.0.0  
 **Author:** AbstractPhil  
 **Date:** December 2025  
 **License:** Apache 2.0 with Attribution
@@ -38,14 +38,12 @@ The GlobalFractalRouter (GFR) is a coordination infrastructure that enables emer
 ### 1.1 The Divergence Principle
 
 Traditional machine learning optimizes individual model accuracy:
-
 ```
 Model_i → max P(correct | input)
 Ensemble = average(Model_1, Model_2, ..., Model_n)
 ```
 
 GFR inverts this paradigm:
-
 ```
 Stream_i → max Divergence(Stream_i, Stream_j) for all j ≠ i
 Collective = Route(Stream_1, Stream_2, ..., Stream_n)
@@ -56,7 +54,6 @@ Collective = Route(Stream_1, Stream_2, ..., Stream_n)
 ### 1.2 The Fingerprint Axiom
 
 Every stream in a GFR collective MUST possess a unique fingerprint:
-
 ```
 ∀ Stream_i, Stream_j where i ≠ j:
     Fingerprint_i ≢ Fingerprint_j
@@ -70,7 +67,6 @@ Fingerprints serve three functions:
 ### 1.3 The Coordination Imperative
 
 Streams MUST be able to observe and respond to collective state:
-
 ```
 Output_i = f(Input_i, Fingerprint_i, CollectiveState)
 ```
@@ -80,7 +76,6 @@ This is achieved through the Mailbox mechanism, where streams post their routing
 ### 1.4 The Constitutive Requirement
 
 All learned components MUST contribute constitutively to the output, not merely additively to attention scores:
-
 ```
 WRONG:  attention_scores = scores + learned_bias  (gradients die)
 RIGHT:  output = f(input) + g(learned_component)  (gradients flow)
@@ -93,13 +88,18 @@ This requirement emerged from experimental failure: additive-only components bec
 ## 2. Protocol Overview
 
 ### 2.1 System Architecture
-
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                      RouterCollective                            │
+│                    AssembledPrototype                            │
 ├─────────────────────────────────────────────────────────────────┤
 │  ┌─────────┐  ┌─────────┐  ┌─────────┐       ┌─────────┐       │
 │  │ Stream  │  │ Stream  │  │ Stream  │  ...  │ Stream  │       │
+│  │    0    │  │    1    │  │    2    │       │    N    │       │
+│  └────┬────┘  └────┬────┘  └────┬────┘       └────┬────┘       │
+│       │            │            │                  │            │
+│       ▼            ▼            ▼                  ▼            │
+│  ┌─────────┐  ┌─────────┐  ┌─────────┐       ┌─────────┐       │
+│  │  Head   │  │  Head   │  │  Head   │  ...  │  Head   │       │
 │  │    0    │  │    1    │  │    2    │       │    N    │       │
 │  └────┬────┘  └────┬────┘  └────┬────┘       └────┬────┘       │
 │       │            │            │                  │            │
@@ -112,7 +112,7 @@ This requirement emerged from experimental failure: additive-only components bec
 │       ▼            ▼            ▼                  ▼            │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │                   Fusion Layer                           │   │
-│  │  (Concatenate + Project pooled stream outputs)           │   │
+│  │  (Gated / Attention / MoE / Concat+Project)              │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                              │                                  │
 │                              ▼                                  │
@@ -122,30 +122,29 @@ This requirement emerged from experimental failure: additive-only components bec
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 Stream Architecture
-
+### 2.2 Stream + Head Architecture
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         Stream                                   │
+│                      Stream + Head                               │
 ├─────────────────────────────────────────────────────────────────┤
-│  Input ──► [Encoder] ──► [Translation] ──► [Slots + Embed]      │
-│                                                   │              │
-│                                                   ▼              │
+│  Input ──► [Encoder] ──► [Prepare for Head]                     │
+│                               │                                  │
+│                               ▼                                  │
 │  ┌─────────────────────────────────────────────────────────┐   │
-│  │                GlobalFractalRouter                       │   │
+│  │                    ComposedHead                          │   │
 │  │  ┌───────────┐  ┌───────────┐  ┌───────────┐            │   │
-│  │  │Fingerprint│  │  Cantor   │  │  Anchor   │            │   │
-│  │  │   [F]     │  │ Attention │  │   Bank    │            │   │
+│  │  │Fingerprint│  │  Cantor   │  │Constitutive│           │   │
+│  │  │   [F]     │  │ Attention │  │AnchorBank  │           │   │
 │  │  └─────┬─────┘  └─────┬─────┘  └─────┬─────┘            │   │
 │  │        │              │              │                   │   │
 │  │        ▼              ▼              ▼                   │   │
 │  │  ┌─────────────────────────────────────────────────┐    │   │
-│  │  │              Combination Layer                   │    │   │
+│  │  │         LearnableWeightCombiner              │    │   │
 │  │  │  w₀·Attention + w₁·Routing + w₂·Anchors         │    │   │
 │  │  └─────────────────────────────────────────────────┘    │   │
 │  │                         │                                │   │
 │  │                         ▼                                │   │
-│  │                    [FFN + Residual]                      │   │
+│  │                  [FFNRefinement]                         │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │                              │                                  │
 │                              ▼                                  │
@@ -169,6 +168,8 @@ The GFR protocol defines the following message types:
 ## 3. Component Specification
 
 ### 3.1 Fingerprint
+
+**Location:** `head/builder.py` (ComposedHead.fingerprint)
 
 **Purpose:** Create unique identity that induces divergent behavior.
 
@@ -194,6 +195,8 @@ The fingerprint creates divergence through three pathways:
 
 ### 3.2 Cantor Pairing
 
+**Location:** `head/components.py` (CantorAttention, cantor_pair, build_cantor_bias)
+
 **Purpose:** Encode self-similar geometric structure in attention patterns.
 
 **Definition:**
@@ -217,6 +220,8 @@ bias = 1.0 - (diff / max_diff)  # Normalized similarity
 - Enables reasoning about spatial hierarchies
 
 ### 3.3 Anchor Bank
+
+**Location:** `head/components.py` (ConstitutiveAnchorBank)
 
 **Purpose:** Shared behavioral modes that streams align to.
 
@@ -248,6 +253,8 @@ Anchors can be understood as:
 
 ### 3.4 TopK Router
 
+**Location:** `head/components.py` (TopKRouter)
+
 **Purpose:** Sparse routing that selects relevant positions.
 
 **Specification:**
@@ -271,7 +278,42 @@ output = sum(weights * gather(v, routes))
 - Temperature SHOULD be 1.0 unless tuning for specific behavior
 - Fingerprint bias MUST be small (0.1 scale) to not dominate
 
-### 3.5 Mailbox
+### 3.5 FingerprintGate
+
+**Location:** `head/components.py` (FingerprintGate)
+
+**Purpose:** Create unique perspective per stream via identity-based modulation.
+
+**Value Gating:**
+```python
+gate = sigmoid(linear(fingerprint))  # [D]
+gated_v = v * gate  # Different view per fingerprint
+```
+
+**Adjacent Gating:**
+```python
+similarity = sigmoid(mlp(cat([fp_self, fp_target])))
+routed_out = routed_out * similarity
+```
+
+### 3.6 Combiner
+
+**Location:** `head/components.py` (LearnableWeightCombiner)
+
+**Purpose:** Combine attention, routing, and anchor outputs.
+
+**Specification:**
+```python
+combine_weights = nn.Parameter(torch.tensor([1.0, 1.0, 0.1]))
+weights = F.softmax(combine_weights, dim=0)
+combined = weights[0]*attn + weights[1]*routed + weights[2]*anchor
+```
+
+Empirically converges to ~0.45 attention, ~0.45 routing, ~0.1 anchors.
+
+### 3.7 Mailbox
+
+**Location:** `registry.py` (RouterMailbox)
 
 **Purpose:** Inter-router communication for collective coordination.
 
@@ -300,14 +342,9 @@ peer_states = mailbox.read_all(exclude=module_id)
 - Mailbox MUST be cleared at start of each collective forward pass
 - Timestamps MUST be monotonically increasing within a forward pass
 
-**Design Rationale:**
+### 3.8 Registry
 
-The mailbox enables coordination without explicit supervision:
-- Streams can observe what others are doing
-- Specialization emerges from mutual observation
-- No gradient flow prevents collapse to trivial solutions
-
-### 3.6 Registry
+**Location:** `registry.py` (RouterRegistry)
 
 **Purpose:** Track all routers and their relationships.
 
@@ -327,12 +364,6 @@ RouterInfo:
     children: Set[str]
 ```
 
-**Operations:**
-- `register(name, parent_id, group, fp_dim, feat_dim) → module_id`
-- `get_children(module_id) → List[module_id]`
-- `get_siblings(module_id) → List[module_id]`
-- `get_hierarchy(module_id) → Dict`
-
 **Requirements:**
 - Registry MUST be singleton (one per process)
 - Registry SHOULD be reset before building new collective
@@ -343,57 +374,48 @@ RouterInfo:
 ## 4. Information Flow
 
 ### 4.1 Forward Pass Sequence
-
 ```
-1. Collective.forward(inputs)
+1. Prototype.forward(inputs)
    │
    ├─► mailbox.clear()
    │
-   ├─► for i, stream in enumerate(streams):
+   ├─► for name in stream_names:
    │       │
-   │       ├─► features = stream.encode(inputs[i])
+   │       ├─► encoded = streams[name](inputs[name])
    │       │
-   │       ├─► slots = stream.translation(features)
+   │       ├─► head_out = heads[name](encoded)
    │       │
-   │       ├─► target_fp = streams[i+1].fingerprint if i < N-1 else None
+   │       ├─► projected = projections[name](head_out)
    │       │
-   │       ├─► routed, info = stream.router(slots, mailbox, target_fp)
-   │       │
-   │       └─► pooled[i] = stream.pool(routed)
+   │       └─► stream_outputs[name] = projected.mean(dim=1)  # pool
    │
-   ├─► fused = fusion(concatenate(pooled))
+   ├─► fused = fusion(stream_outputs)
    │
    └─► logits = classifier(fused)
 ```
 
-### 4.2 Router Internal Flow
-
+### 4.2 Head Internal Flow
 ```
-router.forward(x, mailbox, target_fingerprint)
+ComposedHead.forward(x)
    │
    ├─► x_norm = input_norm(x)
    │
-   ├─► attn_out = cantor_attention(x_norm)
+   ├─► attn_out = attention(x_norm)  # CantorAttention
    │
-   ├─► v_gated = fingerprint_gate.gate_values(x_norm, fingerprint)
+   ├─► v_gated = gate.gate_values(x_norm, fingerprint)
    │
-   ├─► routes, weights, routed = topk_router(attn_out, x_norm, v_gated)
+   ├─► routed = router(attn_out, x_norm, v_gated, fingerprint)
    │
-   ├─► anchor_out, affinities = anchor_bank(x_norm, fingerprint)
+   ├─► anchor_out, affinities = anchors(x_norm, fingerprint)
    │
-   ├─► if target_fingerprint:
-   │       gate = fingerprint_gate.similarity(fingerprint, target_fingerprint)
-   │       routed = routed * gate
+   ├─► combined = combiner(attn_out, routed, anchor_out)
    │
-   ├─► combined = w[0]*attn_out + w[1]*routed + w[2]*anchor_out
+   ├─► output = x + combined
    │
-   ├─► output = x + combined + ffn(output_norm(x + combined))
-   │
-   └─► mailbox.post(module_id, name, [weights.mean(), affinities])
+   └─► output = output + refinement(output)
 ```
 
 ### 4.3 Gradient Flow
-
 ```
 Loss
   │
@@ -405,17 +427,14 @@ Fusion ◄────── gradients flow
   │
   ├─────────────────────────────────┐
   ▼                                 ▼
-Stream[0].router              Stream[N].router
+Head[0]                        Head[N]
   │                                 │
   ├─► fingerprint ◄─ gradients     ├─► fingerprint ◄─ gradients
   ├─► anchors ◄──── gradients      ├─► anchors ◄──── gradients
   ├─► attention ◄── gradients      ├─► attention ◄── gradients
   │                                 │
   ▼                                 ▼
-Stream[0].translation         Stream[N].translation
-  │                                 │
-  ▼                                 ▼
-Stream[0].encoder             Stream[N].encoder
+Stream[0]                      Stream[N]
   │                                 │
   ▼                                 ▼
 (frozen or trainable)         (frozen or trainable)
@@ -433,7 +452,7 @@ NOTE: Mailbox content is DETACHED - no gradients flow through mailbox
 
 **Mechanism:**
 ```python
-# In router forward, when target_fingerprint is provided:
+# In head forward, when target_fingerprint is provided:
 gate = sigmoid(MLP(cat([self.fingerprint, target_fingerprint])))
 routed_output = routed_output * gate
 ```
@@ -443,32 +462,9 @@ routed_output = routed_output * gate
 - Creates implicit curriculum: earlier streams condition later ones
 - Enables hierarchical specialization
 
-**Topology:**
-```
-Stream[0] ──parent──► Stream[1] ──parent──► Stream[2] ──► ...
-    │                     │                     │
-    └──target_fp──────────┘                     │
-                          └──target_fp──────────┘
-```
-
 ### 5.2 Mailbox Coordination
 
 **Purpose:** Enable streams to observe and respond to collective state.
-
-**Mechanism:**
-```python
-# Stream i posts after routing:
-mailbox.post(id_i, name_i, routing_state_i)
-
-# Stream j reads before/during routing:
-peer_states = mailbox.read_all(exclude=id_j)
-# Can influence routing decisions (future extension)
-```
-
-**Current Implementation:**
-- Posts routing state after each stream forward
-- Reading is available but not actively used in routing
-- Future: Use peer states to modulate attention/routing
 
 **Emergent Specialization:**
 
@@ -488,7 +484,7 @@ similarity = sigmoid(MLP(cat([fp_self, fp_target])))
 
 **Applications:**
 1. **Adjacent gating:** Modulate output based on next stream
-2. **Routing influence:** (future) Route based on stream similarity
+2. **Routing influence:** Route based on stream similarity
 3. **Analysis:** Visualize stream relationships post-training
 
 ---
@@ -580,7 +576,7 @@ $$\text{Acc}_{\text{collective}} \gg \max_i \text{Acc}_i$$
 
 A conformant GFR implementation MUST include:
 
-1. **Fingerprint:** Learnable parameter [fingerprint_dim]
+1. **Fingerprint:** Learnable parameter [fingerprint_dim] in ComposedHead
 2. **Cantor Attention:** Multi-head attention with Cantor bias
 3. **Anchor Bank:** Constitutive contribution from weighted anchors
 4. **TopK Router:** Sparse routing with fingerprint modulation
@@ -603,7 +599,7 @@ For large collectives:
 
 ### 7.4 Computational Complexity
 
-Per stream, per forward pass:
+Per head, per forward pass:
 - Attention: $O(S^2 \cdot D)$
 - TopK Routing: $O(S^2 \cdot D + S \cdot K \cdot \log S)$
 - Anchor Bank: $O(A \cdot D + F \cdot A)$
@@ -617,7 +613,7 @@ Per stream, per forward pass:
 
 A GFR implementation is CONFORMANT if:
 
-1. ✓ Each stream has a unique, learnable fingerprint
+1. ✓ Each head has a unique, learnable fingerprint
 2. ✓ Attention includes Cantor pairing bias (can be disabled)
 3. ✓ Anchor bank contributes constitutively to output
 4. ✓ TopK routing uses fingerprint modulation
@@ -646,10 +642,12 @@ That is, collective accuracy exceeds twice the best individual.
 
 | Term | Definition |
 |------|------------|
-| **Stream** | An expert in the collective (frozen or trainable encoder + router) |
+| **Prototype** | Assembled multi-stream model via factory |
+| **Stream** | Input processor (VectorStream or SequenceStream) |
+| **ComposedHead** | Assembled routing head with fingerprint and all components |
 | **Fingerprint** | Unique learnable vector that creates divergent behavior |
 | **Cantor Pairing** | Bijection ℕ² → ℕ with diagonal structure |
-| **Anchor** | Shared behavioral prototype in anchor bank |
+| **Anchor** | Shared behavioral prototype in ConstitutiveAnchorBank |
 | **Mailbox** | Message-passing infrastructure for coordination |
 | **Registry** | Singleton tracking all routers and relationships |
 | **Adjacent Gating** | Parent-child fingerprint-based modulation |
@@ -661,23 +659,52 @@ That is, collective accuracy exceeds twice the best individual.
 ## Appendix B: Reference Implementation
 
 See `geofractal.router` package:
-
 ```python
 from geofractal.router import (
-    GlobalFractalRouter,      # Core router
+    # Config
     GlobalFractalRouterConfig,
-    RouterCollective,          # High-level API
-    CollectiveConfig,
-    FrozenStream,              # Frozen pretrained models
-    FeatureStream,             # Pre-extracted features
-    TrainableStream,           # Learnable backbones
+    
+    # Streams
+    FeatureVectorStream,
+    TrainableVectorStream,
+    SequenceStream,
+    TransformerSequenceStream,
+    StreamBuilder,
+    
+    # Head
+    HeadBuilder,
+    HeadConfig,
+    ComposedHead,
+    CantorAttention,
+    TopKRouter,
+    FingerprintGate,
+    ConstitutiveAnchorBank,
+    
+    # Fusion
+    FusionBuilder,
+    FusionStrategy,
+    
+    # Factory
+    PrototypeBuilder,
+    StreamSpec,
+    HeadSpec,
+    FusionSpec,
+    AssembledPrototype,
 )
+
+# Build a prototype
+prototype = (PrototypeBuilder("dual_clip")
+    .add_stream(StreamSpec.feature_vector("clip_b32", input_dim=512))
+    .add_stream(StreamSpec.feature_vector("clip_l14", input_dim=768))
+    .with_head(HeadSpec.standard(feature_dim=512))
+    .with_fusion(FusionSpec.gated(output_dim=512))
+    .with_classifier(num_classes=1000)
+    .build())
 ```
 
 ---
 
 ## Appendix C: Citation
-
 ```bibtex
 @software{globalfractalrouter2025,
   author       = {AbstractPhil},

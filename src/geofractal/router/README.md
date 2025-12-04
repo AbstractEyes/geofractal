@@ -1,210 +1,294 @@
-# geofractal.router
+# GeoFractal Router
 
-**Collective intelligence through geometric routing.**
+**Collective Intelligence through Geometric Routing**
 
-## Overview
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-The GlobalFractalRouter is infrastructure for coordinating multiple models/experts via fingerprint-based divergence and mailbox communication.
+---
 
-**Key Insight:** Individual streams don't need to be accurate classifiers. They need to provide *divergent perspectives* that the collective can triangulate into accurate predictions.
+## What Is This?
 
-## Proven Results
+GeoFractal Router is a coordination architecture for **collective intelligence**. Instead of building one smart model, you build multiple *different* models that communicate and triangulate truth together.
 
-| Experiment | Individual Accuracy | Collective Accuracy |
-|------------|---------------------|---------------------|
-| ImageNet (5 CLIP variants) | 0.1% each | **84.68%** |
-| FashionMNIST (CLIP + 2 Conv) | 10% + 10% + 10% | **93.4%** |
-| Dual Frozen CLIP | 98.6% frozen | **92.6%** |
-| Math Collective (5 models) | Random | **+30%** over baseline |
+**The key insight:** Individual models don't need to be accurate. They need to *see differently*. The collective triangulates from divergent perspectives.
+```
+Traditional Ensemble:    Smart Model + Smart Model + Smart Model → Average
+GeoFractal Collective:   Different View + Different View + Different View → Triangulate
+```
+
+**Proven emergence:**
+
+| Experiment | Individual Accuracy | Collective Accuracy | Multiplier |
+|------------|---------------------|---------------------|------------|
+| ImageNet (5 CLIP streams) | 0.1% each | 84.68% | **847×** |
+| FashionMNIST (3 streams) | 10% each | 93.4% | **9.34×** |
+| Dual CLIP (frozen) | 7-18% | 92.6% | **5-13×** |
+
+The collective achieves what no individual can.
+
+---
+
+## How It Works
+
+### The Collective
+
+A GeoFractal collective consists of multiple **streams** that process inputs through **heads**, coordinate through a **mailbox**, and fuse their perspectives:
+```
+                    ┌─────────────────────────────────────┐
+                    │           Collective                 │
+                    ├─────────────────────────────────────┤
+   Input A ────────►│  Stream A ──► Head A ──┐            │
+                    │                        │            │
+   Input B ────────►│  Stream B ──► Head B ──┼──► Fusion ──► Output
+                    │                        │            │
+   Input C ────────►│  Stream C ──► Head C ──┘            │
+                    │         ▲      │                    │
+                    │         └──────┴─── Mailbox ◄───────│
+                    └─────────────────────────────────────┘
+```
+
+Each stream sees the same problem from a different angle. The mailbox lets them observe each other's routing decisions. The fusion layer triangulates their divergent views into a unified answer.
+
+### Why Divergence Matters
+
+Traditional ensembles train each model to be accurate, then average their predictions. This works, but you're limited by what each model can learn individually.
+
+GeoFractal inverts this: each stream is trained to be **different**, not accurate. When streams provide orthogonal projections of the input space, the routing fabric can recover the true answer even when no single stream knows it.
+
+This is how sensor fusion works: multiple imperfect measurements → accurate state estimation.
+
+### The Fingerprint
+
+Every head has a unique **fingerprint** - a learnable identity vector that makes it see differently:
+```python
+# Each head's fingerprint creates divergent behavior through:
+anchor_affinities = sigmoid(W @ fingerprint)      # Different behavioral modes
+value_gating = v * sigmoid(W @ fingerprint)       # Different attention patterns  
+score_bias = scores + (q @ W @ fingerprint) * 0.1 # Different routing decisions
+```
+
+Fingerprints don't encode "what to look for" - they encode "how to look."
+
+### The Mailbox
+
+Streams coordinate through a shared mailbox where they post their routing states:
+```python
+# After each head processes its input:
+mailbox.post(head_id, routing_state.detach())
+
+# Other heads can observe (content is detached - no gradient flow):
+peer_states = mailbox.read_all(exclude=my_id)
+```
+
+**Critical:** Mailbox content is detached. Gradients don't flow through coordination. This prevents collapse to trivial solutions - specialization must emerge from observation, not optimization.
+
+### Constitutive Contribution
+
+All components must contribute **constitutively** to the output:
+```python
+# WRONG - gradients die:
+attention_scores = scores + learned_bias
+
+# RIGHT - gradients flow:
+output = w0*attention + w1*routing + w2*anchor_contribution
+```
+
+This emerged from experimental failure. Additive-only biases become ignorable noise.
+
+---
 
 ## Quick Start
 
+### Installation
+```bash
+pip install geofractal
+```
+
+Or from source:
+```bash
+git clone https://github.com/AbstractPhil/geofractal.git
+cd geofractal
+pip install -e .
+```
+
+### Build a Collective
 ```python
 from geofractal.router import (
-    RouterCollective,
-    CollectiveConfig,
-    FrozenStream,
-    FeatureStream,
+    PrototypeBuilder,
+    StreamSpec,
+    HeadSpec,
+    FusionSpec,
 )
 
-# Configuration
-config = CollectiveConfig(
-    feature_dim=512,
-    num_classes=1000,
-    epochs=20,
-)
+# Define streams with different input sources
+prototype = (PrototypeBuilder("vision_collective")
+    .add_stream(StreamSpec.feature_vector("clip_b32", input_dim=512))
+    .add_stream(StreamSpec.feature_vector("clip_l14", input_dim=768))
+    .add_stream(StreamSpec.feature_vector("dino_b16", input_dim=768))
+    .with_head(HeadSpec.standard(feature_dim=512))
+    .with_fusion(FusionSpec.gated(output_dim=512))
+    .with_classifier(num_classes=1000)
+    .build())
 
-# From pretrained models (frozen)
-collective = RouterCollective.from_pretrained_models([
-    "openai/clip-vit-base-patch32",
-    "openai/clip-vit-large-patch14",
-], config)
-
-# Train (only routing learns)
-history = collective.fit(train_loader, val_loader)
-
-# Inference
-logits, info = collective(batch)
+# Forward pass with dict of features
+logits = prototype({
+    "clip_b32": clip_b32_features,   # [B, 512]
+    "clip_l14": clip_l14_features,   # [B, 768]  
+    "dino_b16": dino_features,       # [B, 768]
+})
 ```
 
-## For Pre-extracted Features
+### Stream Types
 
+**Vector Streams** - for pooled embeddings `[B, D]`:
 ```python
-# Fastest - no model inference
-collective = RouterCollective.from_feature_dims({
-    'clip_vit_b32': 512,
-    'clip_vit_b16': 512,
-    'clip_vit_l14': 768,
-    'dinov2_base': 768,
-}, config)
-
-# features: Dict[str, Tensor] mapping name to [B, dim]
-logits, info = collective(features)
+StreamSpec.feature_vector("name", input_dim=512)      # Pre-extracted
+StreamSpec.trainable_vector("name", input_dim=512)    # Learnable backbone
 ```
+
+**Sequence Streams** - for token sequences `[B, S, D]`:
+```python
+StreamSpec.sequence("name", input_dim=768)                    # Pass-through
+StreamSpec.transformer_sequence("name", input_dim=768)        # +Transformer layers
+StreamSpec.conv_sequence("name", input_dim=768)               # +Conv layers
+```
+
+### Head Presets
+```python
+HeadSpec.lightweight(feature_dim=512)  # Minimal params
+HeadSpec.standard(feature_dim=512)     # Balanced
+HeadSpec.heavy(feature_dim=512)        # Maximum capacity
+```
+
+### Fusion Strategies
+```python
+FusionSpec.concat(output_dim=512)       # Concatenate + project
+FusionSpec.gated(output_dim=512)        # Input-adaptive gates
+FusionSpec.attention(output_dim=512)    # Cross-stream attention
+FusionSpec.moe(output_dim=512)          # Mixture of experts
+```
+
+---
 
 ## Architecture
 
-```
-Stream 0 ──┐
-           │    Fingerprint (divergence)
-Stream 1 ──┼──▶ Router ──▶ Mailbox ──┐
-           │                         │
-Stream 2 ──┤                         ├──▶ Fusion ──▶ Classifier
-           │    Shared Anchors       │
-Stream N ──┘    (behavioral modes)   ┘
-```
-
-### Core Components
-
-| Component | Role |
-|-----------|------|
-| **Fingerprint** | Unique identity per stream → creates divergent behavior |
-| **Mailbox** | Inter-stream communication → enables coordination |
-| **Anchors** | Shared behavioral modes → collective alignment |
-| **Cantor Prior** | Self-similar attention structure → geometric routing |
-
-## Stream Types
-
-### FrozenStream
-Wraps frozen pretrained models (CLIP, DINO, etc.)
-```python
-stream = FrozenStream.from_pretrained(
-    "openai/clip-vit-large-patch14",
-    config=config,
-)
-```
-
-### FeatureStream
-For pre-extracted features (fastest throughput)
-```python
-stream = FeatureStream(
-    config=config,
-    name="clip_features",
-    input_dim=768,
-)
-```
-
-### TrainableStream
-Fully learnable backbone + router
-```python
-stream = TrainableStream.conv_stream(
-    config=config,
-    name="conv_expert",
-    channels=[32, 64],
-)
-```
-
-## Configuration
-
-### CollectiveConfig
-```python
-config = CollectiveConfig(
-    # Architecture
-    feature_dim=512,      # Internal routing dimension
-    fingerprint_dim=64,   # Identity dimension
-    num_classes=1000,     # Output classes
-    
-    # Router
-    num_anchors=16,       # Behavioral modes
-    num_routes=8,         # Top-K routes per position
-    num_slots=16,         # Sequence length
-    
-    # Training
-    batch_size=256,
-    epochs=20,
-    lr=3e-4,
-    use_amp=True,         # Mixed precision
-    
-    # DataLoader (A100 optimized)
-    num_workers=8,
-    pin_memory=True,
-    persistent_workers=True,
-)
-```
-
-### Preset Configs
-```python
-from geofractal.router.config import (
-    IMAGENET_COLLECTIVE_CONFIG,
-    FASHIONMNIST_COLLECTIVE_CONFIG,
-    CIFAR_COLLECTIVE_CONFIG,
-)
-```
-
-## Package Structure
-
+### Package Structure
 ```
 geofractal/router/
-├── __init__.py          # Main exports
-├── config.py            # Configuration classes
-├── core.py              # GlobalFractalRouter
-├── registry.py          # RouterRegistry, RouterMailbox
-├── collective.py        # RouterCollective (high-level API)
-└── streams/
-    ├── __init__.py
-    ├── base.py          # BaseStream (abstract)
-    ├── frozen.py        # FrozenStream
-    ├── feature.py       # FeatureStream
-    └── trainable.py     # TrainableStream
+├── config.py              # GlobalFractalRouterConfig
+├── registry.py            # RouterRegistry, RouterMailbox
+├── head/
+│   ├── components.py      # CantorAttention, TopKRouter, Anchors, Gates
+│   └── builder.py         # HeadBuilder, ComposedHead
+├── fusion/
+│   ├── methods.py         # Concat, Gated, Attention, MoE
+│   └── builder.py         # FusionBuilder
+├── streams/
+│   ├── vector.py          # VectorStream, FeatureVectorStream
+│   ├── sequence.py        # SequenceStream, TransformerSequenceStream
+│   └── builder.py         # StreamBuilder
+└── factory/
+    ├── protocols.py       # StreamSpec, HeadSpec, FusionSpec
+    ├── prototype.py       # AssembledPrototype
+    └── builder.py         # PrototypeBuilder
 ```
 
-## The Paradigm
+### Head Components
 
-**Old thinking:**
-- Make each model accurate
-- Ensemble averages predictions
-- More parameters = better
+| Component | Purpose |
+|-----------|---------|
+| **Fingerprint** | Unique identity that creates divergent behavior |
+| **CantorAttention** | Geometric attention via Cantor pairing |
+| **TopKRouter** | Sparse routing with fingerprint modulation |
+| **ConstitutiveAnchorBank** | Shared behavioral modes (gradients flow) |
+| **FingerprintGate** | Identity-based value gating |
+| **LearnableWeightCombiner** | Weighted combination of pathways |
+| **FFNRefinement** | Post-combination refinement |
 
-**What this proves:**
-- Make each model *different*
-- Router fuses *perspectives*, not predictions
-- Coordination > capacity
+### The Cantor Prior
 
+Attention includes a geometric bias from Cantor pairing - a bijection ℕ² → ℕ where diagonal positions receive consecutive indices:
 ```
-0.1% + 0.1% + 0.1% + 0.1% + 0.1% = 84.68%
+Position:     Cantor Index:
+(0,0) (0,1)     0   2
+(1,0) (1,1)     1   4
 ```
 
-That's not math. That's emergence.
+This encodes self-similar spatial relationships without learned parameters.
 
-## License
+---
 
-Apache License 2.0
+## Documentation
 
-**Attribution Required:** If you use this architecture in research or production, please cite:
+Detailed documentation is in `getting_started/`:
 
+| Document | Description |
+|----------|-------------|
+| [INDEX.md](getting_started/INDEX.md) | Documentation overview and quick reference |
+| [PROTOCOL.md](getting_started/PROTOCOL.md) | Complete protocol specification |
+| [ARCHITECTURE.md](getting_started/ARCHITECTURE.md) | Component deep dive |
+| [MATHEMATICS.md](getting_started/MATHEMATICS.md) | Formal foundations |
+| [RATIONALITY.md](getting_started/RATIONALITY.md) | Why each component exists |
+| [FUSION.md](getting_started/FUSION.md) | Fusion strategy guide |
+| [FACTORY.md](getting_started/FACTORY.md) | Prototype building guide |
+
+---
+
+## Key Principles
+
+### 1. Divergence Over Accuracy
+
+Don't optimize individual streams for accuracy. Optimize the collective for emergence.
+
+### 2. Coordination Without Gradients
+
+Mailbox content is detached. Streams learn to coordinate through observation, not backpropagation. This prevents collapse.
+
+### 3. Constitutive Contribution
+
+Every learned component must contribute directly to output. Additive biases die.
+
+### 4. Fingerprint Identity
+
+Each head's fingerprint creates its unique perspective. Same architecture, different identity, different behavior.
+
+---
+
+## When to Use GeoFractal
+
+**Good fit:**
+- Multiple pre-trained models available (CLIP, DINO, BERT, T5, etc.)
+- Task benefits from diverse perspectives
+- Individual models underperform but see different things
+- You want emergence, not just averaging
+
+**Not ideal:**
+- Single model already solves the task well
+- Inputs are homogeneous (no diversity to exploit)
+- Latency-critical inference (collective adds overhead)
+
+---
+
+## Citation
 ```bibtex
-@software{globalfractalrouter2025,
+@software{geofractalrouter2025,
   author       = {AbstractPhil},
-  title        = {GlobalFractalRouter: Collective Intelligence through 
+  title        = {GeoFractal Router: Collective Intelligence through 
                   Geometric Routing},
   year         = {2025},
   url          = {https://github.com/AbstractPhil/geofractal}
 }
 ```
 
-See [NOTICE](NOTICE) for full attribution requirements.
+---
 
-## Author
+## License
 
-AbstractPhil  
-December 2025
+Apache License 2.0 with Attribution
+
+See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
+
+---
+
+*"Individual streams don't need to classify accurately. They need to see differently. The routing fabric triangulates truth from divergent viewpoints."*

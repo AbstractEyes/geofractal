@@ -40,7 +40,6 @@
 ## Quick Reference
 
 ### Core Concept
-
 ```
 Traditional: Make each model accurate → ensemble averages predictions
 GFR:        Make each model DIFFERENT → router fuses perspectives
@@ -56,47 +55,99 @@ GFR:        Make each model DIFFERENT → router fuses perspectives
 
 ### Key Components
 
-| Component | Purpose | Key Insight |
-|-----------|---------|-------------|
-| **Fingerprint** | Unique identity | Creates divergence, not accuracy |
-| **Cantor Attention** | Geometric structure | Self-similar spatial relationships |
-| **Anchor Bank** | Behavioral modes | MUST be constitutive, not additive |
-| **TopK Router** | Sparse routing | Specialization through selection |
-| **Mailbox** | Coordination | Detached to prevent collapse |
+| Component | Location | Purpose |
+|-----------|----------|---------|
+| **ComposedHead** | `head/builder.py` | Assembled routing head with fingerprint |
+| **CantorAttention** | `head/components.py` | Geometric attention via Cantor pairing |
+| **ConstitutiveAnchorBank** | `head/components.py` | Behavioral modes (constitutive, not additive) |
+| **TopKRouter** | `head/components.py` | Sparse routing through selection |
+| **FingerprintGate** | `head/components.py` | Identity-based gating |
+| **Fusion** | `fusion/` | Multi-stream combination strategies |
+| **Streams** | `streams/` | Vector and sequence input handling |
+| **Factory** | `factory/` | Prototype assembly system |
 
-### Minimum Viable Collective
-
-```python
-from geofractal.router import (
-    RouterCollective,
-    CollectiveConfig,
-    FeatureStream,
-)
-
-# Configuration
-config = CollectiveConfig(
-    feature_dim=512,
-    num_classes=1000,
-)
-
-# Create streams
-streams = [
-    FeatureStream(config, "clip_b32", input_dim=512),
-    FeatureStream(config, "clip_l14", input_dim=768),
-]
-
-# Build collective
-collective = RouterCollective(streams, config)
-
-# Train
-history = collective.fit(train_loader, val_loader)
-
-# Inference
-logits, info = collective(batch)
+### Package Structure
+```
+geofractal/router/
+├── __init__.py
+├── factory/
+│   ├── __init__.py
+│   ├── builder.py
+│   ├── protocols.py
+│   ├── prototype.py
+│   └── registry.py
+├── fusion/
+│   ├── __init__.py
+│   ├── builder.py
+│   ├── methods.py
+│   └── protocols.py
+├── getting_started/
+│   ├── ARCHITECTURE.md
+│   ├── DEVELOPMENT.md
+│   ├── INDEX.md
+│   ├── MATHEMATICS.md
+│   └── PROTOCOL.md
+├── head/
+│   ├── __init__.py
+│   ├── builder.py
+│   ├── components.py
+│   └── protocols.py
+├── streams/
+│   ├── __init__.py
+│   ├── base.py
+│   ├── builder.py
+│   ├── feature.py
+│   ├── frozen.py
+│   ├── protocols.py
+│   ├── sequence.py
+│   ├── trainable.py
+│   └── vector.py
 ```
 
-### Configuration Presets
+### Minimum Viable Prototype
+```python
+from geofractal.router.factory import (
+    PrototypeBuilder,
+    StreamSpec,
+    HeadSpec,
+    FusionSpec,
+)
 
+# Build a dual-stream prototype
+prototype = (PrototypeBuilder("dual_clip")
+    .add_stream(StreamSpec.feature_vector("clip_b32", input_dim=512, feature_dim=512))
+    .add_stream(StreamSpec.feature_vector("clip_l14", input_dim=768, feature_dim=512))
+    .with_head(HeadSpec.standard(feature_dim=512))
+    .with_fusion(FusionSpec.gated(output_dim=512))
+    .with_classifier(num_classes=1000)
+    .build())
+
+# Forward pass
+logits = prototype({"clip_b32": features_b32, "clip_l14": features_l14})
+```
+
+### Stream Types
+
+| Type | Input Shape | Use Case |
+|------|-------------|----------|
+| `FeatureVectorStream` | `[B, D]` | Pre-extracted features (CLIP, DINO) |
+| `TrainableVectorStream` | `[B, D]` | Learnable backbone |
+| `SequenceStream` | `[B, S, D]` | Token sequences (pass-through) |
+| `TransformerSequenceStream` | `[B, S, D]` | Adds transformer layers |
+| `ConvSequenceStream` | `[B, S, D]` | Multi-scale convolutions |
+
+### Fusion Strategies
+
+| Strategy | When to Use |
+|----------|-------------|
+| `concat` | Baseline, maximum information |
+| `weighted` | Known stream quality differences |
+| `gated` | Input-adaptive combination |
+| `attention` | Cross-stream relationships matter |
+| `fingerprint` | Identity-guided fusion |
+| `moe` | Sparse expert selection |
+
+### Configuration Presets
 ```python
 from geofractal.router.config import (
     IMAGENET_COLLECTIVE_CONFIG,      # 512D, 16 anchors, 8 routes
@@ -150,6 +201,12 @@ Creates self-similar attention structure that encodes geometric relationships. P
 
 Early experiments with additive anchors (biasing attention) failed because gradients died. Constitutive contribution ensures gradients flow.
 
+### VectorStream vs SequenceStream?
+
+**VectorStream** `[B, D]`: Single vector per sample (pooled CLIP, CLS token). Artificially expands to slots for routing.
+
+**SequenceStream** `[B, S, D]`: Token sequence (T5 hidden states). Routes each token directly without artificial expansion.
+
 ### How many streams are optimal?
 
 Depends on task complexity. Empirically:
@@ -175,21 +232,22 @@ Same architecture trained differently often works well.
 
 | Term | Definition |
 |------|------------|
-| **Collective** | Group of streams coordinated by router |
-| **Stream** | Expert model + translation + router |
-| **Fingerprint** | Unique learnable identity vector |
+| **Prototype** | Assembled multi-stream model via factory |
+| **Stream** | Input processor (vector or sequence) + head |
+| **ComposedHead** | Assembled routing head with all components |
+| **Fingerprint** | Unique learnable identity vector (in head) |
 | **Anchor** | Shared behavioral prototype |
 | **Mailbox** | Inter-router message passing |
 | **Registry** | Singleton tracking all routers |
 | **Emergence** | Collective >> max(individuals) |
 | **Constitutive** | Directly contributing to output |
-| **Adjacent Gating** | Parent-child fingerprint modulation |
 | **Cantor Pairing** | Bijection ℕ² → ℕ with diagonal structure |
+| **VectorStream** | Handles `[B, D]` inputs |
+| **SequenceStream** | Handles `[B, S, D]` inputs |
 
 ---
 
 ## Citation
-
 ```bibtex
 @software{globalfractalrouter2025,
   author       = {AbstractPhil},
@@ -211,4 +269,4 @@ See [LICENSE](../LICENSE) and [NOTICE](../NOTICE) for details.
 
 ---
 
-*GlobalFractalRouter Documentation v1.0.0*
+*GlobalFractalRouter Documentation v2.0.0*
