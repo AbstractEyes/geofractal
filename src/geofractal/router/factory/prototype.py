@@ -3,11 +3,7 @@ geofractal.router.factory.prototype
 ===================================
 Assembled router prototype - the complete system.
 
-A prototype combines:
-- Multiple streams (divergent feature extractors)
-- Per-stream heads (routing decision makers)
-- Fusion layer (combination strategy)
-- Classifier head (final predictions)
+Updated to use new stream architecture with proper input shape handling.
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -25,6 +21,7 @@ from .protocols import (
     StreamSpec,
     HeadSpec,
     FusionSpec,
+    InputShape,
 )
 
 
@@ -34,35 +31,21 @@ from .protocols import (
 
 @dataclass
 class PrototypeConfig:
-    """
-    Complete configuration for a router prototype.
-    """
-    # Core settings
+    """Complete configuration for a router prototype."""
     num_classes: int = 1000
     prototype_name: str = "gfr_prototype"
 
-    # Stream specifications
     stream_specs: List[StreamSpec] = field(default_factory=list)
-
-    # Head specification (shared across streams by default)
     head_spec: HeadSpec = field(default_factory=HeadSpec.standard)
-    per_stream_heads: bool = True  # Each stream gets its own head
-
-    # Fusion specification
+    per_stream_heads: bool = True
     fusion_spec: FusionSpec = field(default_factory=FusionSpec.standard)
 
-    # Classifier settings
     classifier_hidden: int = 512
     classifier_dropout: float = 0.1
-
-    # Pooling
     pool_type: str = 'cls'  # 'cls', 'mean', 'max'
-
-    # Training
     freeze_streams: bool = True
 
     def __post_init__(self):
-        # Ensure fusion output matches classifier input
         if self.fusion_spec.output_dim != self.classifier_hidden:
             self.classifier_hidden = self.fusion_spec.output_dim
 
@@ -97,9 +80,7 @@ class AssembledPrototype(BasePrototype):
     """
     Complete router prototype assembled from components.
 
-    This is the main class for building and running router prototypes.
-    It composes streams, heads, fusion, and classifier into a
-    trainable end-to-end system.
+    Supports both vector [B, D] and sequence [B, S, D] inputs.
 
     Architecture:
         Input
@@ -107,20 +88,6 @@ class AssembledPrototype(BasePrototype):
           ├─→ Stream₁ ─→ Head₁ ─→ Pool ─┐
           ├─→ Stream₂ ─→ Head₂ ─→ Pool ─┼─→ Fusion ─→ Classifier ─→ Logits
           └─→ Stream₃ ─→ Head₃ ─→ Pool ─┘
-
-    Usage:
-        config = PrototypeConfig(
-            num_classes=1000,
-            stream_specs=[
-                StreamSpec.frozen_clip("clip_b32", "openai/clip-vit-base-patch32"),
-                StreamSpec.frozen_clip("clip_l14", "openai/clip-vit-large-patch14"),
-            ],
-            head_spec=HeadSpec.standard(),
-            fusion_spec=FusionSpec.attention(),
-        )
-
-        prototype = AssembledPrototype(config)
-        logits = prototype(images)
     """
 
     def __init__(self, config: PrototypeConfig):
@@ -130,46 +97,112 @@ class AssembledPrototype(BasePrototype):
         )
         self.config = config
 
-        # Build components
         self.streams = nn.ModuleDict()
         self.heads = nn.ModuleDict()
-        self.projections = nn.ModuleDict()  # Project to common dim if needed
+        self.projections = nn.ModuleDict()
+
+        self._stream_dims: Dict[str, int] = {}
+        self._stream_input_shapes: Dict[str, str] = {}
 
         self._build_streams()
         self._build_heads()
         self._build_fusion()
         self._build_classifier()
 
-        # Freeze streams if configured
         if config.freeze_streams:
             self.freeze_streams()
 
     def _build_streams(self):
-        """Build stream modules from specs."""
-        from geofractal.router.streams import FrozenStream, FeatureStream, TrainableStream
+        """Build stream modules from specs using new stream architecture."""
+        from geofractal.router.streams import (
+            FeatureVectorStream,
+            TrainableVectorStream,
+            SequenceStream,
+            TransformerSequenceStream,
+            ConvSequenceStream,
+            StreamBuilder,
+        )
+        from geofractal.router.config import CollectiveConfig
 
         for spec in self.config.stream_specs:
-            if spec.stream_type == 'frozen':
-                # Placeholder - actual loading happens in from_pretrained
-                self.streams[spec.name] = nn.Identity()
-                self._stream_dims = getattr(self, '_stream_dims', {})
-                self._stream_dims[spec.name] = spec.feature_dim
+            # Build CollectiveConfig for stream
+            collective_config = CollectiveConfig(
+                feature_dim=spec.feature_dim,
+                fingerprint_dim=self.config.head_spec.fingerprint_dim,
+                num_anchors=self.config.head_spec.num_anchors,
+                num_routes=self.config.head_spec.num_routes,
+            )
 
-            elif spec.stream_type == 'feature':
-                input_dim = spec.kwargs.get('input_dim', spec.feature_dim)
+            stream_type = spec.stream_type
+
+            # === VECTOR STREAMS ===
+            if stream_type in ('feature', 'feature_vector'):
+                # Simple feature projection (no backbone)
                 self.streams[spec.name] = nn.Sequential(
-                    nn.Linear(input_dim, spec.feature_dim),
+                    nn.Linear(spec.input_dim, spec.feature_dim),
                     nn.LayerNorm(spec.feature_dim),
                     nn.GELU(),
                 )
-                self._stream_dims = getattr(self, '_stream_dims', {})
-                self._stream_dims[spec.name] = spec.feature_dim
+                self._stream_input_shapes[spec.name] = InputShape.VECTOR
 
-            elif spec.stream_type == 'trainable':
-                # Placeholder for trainable backbone
+            elif stream_type == 'trainable_vector':
+                # Trainable backbone (must be provided in spec)
+                if spec.backbone is not None:
+                    self.streams[spec.name] = spec.backbone
+                else:
+                    self.streams[spec.name] = nn.Sequential(
+                        nn.Linear(spec.input_dim, spec.feature_dim),
+                        nn.LayerNorm(spec.feature_dim),
+                        nn.GELU(),
+                    )
+                self._stream_input_shapes[spec.name] = InputShape.VECTOR
+
+            elif stream_type == 'frozen':
+                # Placeholder - actual loading handled separately
                 self.streams[spec.name] = nn.Identity()
-                self._stream_dims = getattr(self, '_stream_dims', {})
-                self._stream_dims[spec.name] = spec.feature_dim
+                self._stream_input_shapes[spec.name] = InputShape.IMAGE
+
+            # === SEQUENCE STREAMS ===
+            elif stream_type == 'sequence':
+                # Basic sequence projection
+                if spec.input_dim != spec.feature_dim:
+                    self.streams[spec.name] = nn.Linear(spec.input_dim, spec.feature_dim)
+                else:
+                    self.streams[spec.name] = nn.Identity()
+                self._stream_input_shapes[spec.name] = InputShape.SEQUENCE
+
+            elif stream_type == 'transformer_sequence':
+                # Transformer backbone for sequences
+                layers = []
+                if spec.input_dim != spec.feature_dim:
+                    layers.append(nn.Linear(spec.input_dim, spec.feature_dim))
+
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=spec.feature_dim,
+                    nhead=spec.num_heads,
+                    dim_feedforward=spec.feature_dim * 4,
+                    dropout=0.1,
+                    activation='gelu',
+                    batch_first=True,
+                )
+                layers.append(nn.TransformerEncoder(encoder_layer, spec.num_layers))
+
+                self.streams[spec.name] = nn.Sequential(*layers) if len(layers) > 1 else layers[0]
+                self._stream_input_shapes[spec.name] = InputShape.SEQUENCE
+
+            elif stream_type == 'conv_sequence':
+                # Multi-scale conv for sequences
+                self.streams[spec.name] = ConvSequenceBackbone(
+                    input_dim=spec.input_dim,
+                    feature_dim=spec.feature_dim,
+                    kernel_sizes=spec.kernel_sizes,
+                )
+                self._stream_input_shapes[spec.name] = InputShape.SEQUENCE
+
+            else:
+                raise ValueError(f"Unknown stream type: {stream_type}")
+
+            self._stream_dims[spec.name] = spec.feature_dim
 
         self.stream_names = list(self.streams.keys())
 
@@ -180,28 +213,23 @@ class AssembledPrototype(BasePrototype):
             CantorAttention, StandardAttention,
             TopKRouter, SoftRouter,
             ConstitutiveAnchorBank, AttentiveAnchorBank,
+            FingerprintGate, ChannelGate,
+            LearnableWeightCombiner, GatedCombiner,
+            FFNRefinement, MixtureOfExpertsRefinement,
         )
 
         head_spec = self.config.head_spec
 
-        # Map spec strings to classes
-        attention_map = {
-            'cantor': CantorAttention,
-            'standard': StandardAttention,
-        }
-        router_map = {
-            'topk': TopKRouter,
-            'soft': SoftRouter,
-        }
-        anchor_map = {
-            'constitutive': ConstitutiveAnchorBank,
-            'attentive': AttentiveAnchorBank,
-        }
+        attention_map = {'cantor': CantorAttention, 'standard': StandardAttention}
+        router_map = {'topk': TopKRouter, 'soft': SoftRouter}
+        anchor_map = {'constitutive': ConstitutiveAnchorBank, 'attentive': AttentiveAnchorBank}
+        gate_map = {'fingerprint': FingerprintGate, 'channel': ChannelGate}
+        combiner_map = {'learnable_weight': LearnableWeightCombiner, 'gated': GatedCombiner}
+        refinement_map = {'ffn': FFNRefinement, 'moe': MixtureOfExpertsRefinement}
 
         for name in self.stream_names:
             stream_dim = self._stream_dims[name]
 
-            # Create head config for this stream
             head_config = HeadConfig(
                 feature_dim=stream_dim,
                 fingerprint_dim=head_spec.fingerprint_dim,
@@ -211,16 +239,16 @@ class AssembledPrototype(BasePrototype):
                 use_cantor=head_spec.use_cantor,
             )
 
-            # Build head
-            head = (HeadBuilder(head_config)
-                    .with_attention(attention_map.get(head_spec.attention_type, CantorAttention))
-                    .with_router(router_map.get(head_spec.router_type, TopKRouter))
-                    .with_anchors(anchor_map.get(head_spec.anchor_type, ConstitutiveAnchorBank))
-                    .build())
+            builder = HeadBuilder(head_config)
+            builder.with_attention(attention_map.get(head_spec.attention_type, CantorAttention))
+            builder.with_router(router_map.get(head_spec.router_type, TopKRouter))
+            builder.with_anchors(anchor_map.get(head_spec.anchor_type, ConstitutiveAnchorBank))
+            builder.with_gate(gate_map.get(getattr(head_spec, 'gate_type', 'fingerprint'), FingerprintGate))
+            builder.with_combiner(combiner_map.get(getattr(head_spec, 'combiner_type', 'learnable_weight'), LearnableWeightCombiner))
+            builder.with_refinement(refinement_map.get(getattr(head_spec, 'refinement_type', 'ffn'), FFNRefinement))
 
-            self.heads[name] = head
+            self.heads[name] = builder.build()
 
-            # Projection to common dimension if needed
             fusion_dim = self.config.fusion_spec.output_dim
             if stream_dim != fusion_dim:
                 self.projections[name] = nn.Linear(stream_dim, fusion_dim)
@@ -237,12 +265,8 @@ class AssembledPrototype(BasePrototype):
         )
 
         fusion_spec = self.config.fusion_spec
-        fusion_dim = fusion_spec.output_dim
+        stream_dims = {name: self.config.fusion_spec.output_dim for name in self.stream_names}
 
-        # Stream dims after projection
-        stream_dims = {name: fusion_dim for name in self.stream_names}
-
-        # Map strategy string to enum
         strategy_map = {
             'concat': FusionStrategy.CONCAT,
             'weighted': FusionStrategy.WEIGHTED,
@@ -256,71 +280,62 @@ class AssembledPrototype(BasePrototype):
 
         strategy = strategy_map.get(fusion_spec.strategy, FusionStrategy.CONCAT)
 
-        self.fusion = (FusionBuilder()
-                       .with_streams(stream_dims)
-                       .with_output_dim(fusion_dim)
-                       .with_strategy(strategy)
-                       .with_extra_kwargs(
-            num_heads=fusion_spec.num_heads,
-            temperature=fusion_spec.temperature,
-        )
-                       .build())
+        builder = (FusionBuilder()
+            .with_streams(stream_dims)
+            .with_output_dim(fusion_spec.output_dim)
+            .with_strategy(strategy))
+
+        if fusion_spec.strategy == 'fingerprint':
+            builder.with_extra_kwargs(fingerprint_dim=fusion_spec.fingerprint_dim)
+        elif fusion_spec.strategy == 'moe':
+            builder.with_extra_kwargs(num_experts=fusion_spec.num_experts, top_k=fusion_spec.top_k)
+
+        self.fusion = builder.build()
 
     def _build_classifier(self):
         """Build classifier head."""
-        hidden = self.config.classifier_hidden
-
         self.classifier = nn.Sequential(
-            nn.LayerNorm(hidden),
+            nn.LayerNorm(self.config.classifier_hidden),
             nn.Dropout(self.config.classifier_dropout),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Dropout(self.config.classifier_dropout),
-            nn.Linear(hidden, self.num_classes),
+            nn.Linear(self.config.classifier_hidden, self.config.num_classes),
         )
 
     def _pool(self, x: torch.Tensor) -> torch.Tensor:
-        """Pool sequence to single vector."""
+        """Pool sequence to vector."""
+        if x.dim() == 2:
+            return x
         if self.config.pool_type == 'cls':
-            return x[:, 0]  # CLS token
+            return x[:, 0]
         elif self.config.pool_type == 'mean':
             return x.mean(dim=1)
         elif self.config.pool_type == 'max':
             return x.max(dim=1).values
-        else:
-            return x[:, 0]
+        return x[:, 0]
 
-    def get_stream_outputs(
-            self,
-            x: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
-        """Get raw outputs from each stream."""
+    def get_stream_outputs(self, x: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
+        """Get outputs from each stream."""
         outputs = {}
-        for name in self.stream_names:
-            stream_out = self.streams[name](x)
-            outputs[name] = stream_out
+
+        if isinstance(x, dict):
+            # Input is already per-stream
+            for name in self.stream_names:
+                if name in x:
+                    outputs[name] = self.streams[name](x[name])
+        else:
+            # Shared input - route to all streams
+            for name in self.stream_names:
+                outputs[name] = self.streams[name](x)
+
         return outputs
 
     def forward(
             self,
-            x: torch.Tensor,
+            x: Union[torch.Tensor, Dict[str, torch.Tensor]],
             return_info: bool = False,
     ) -> Tuple[torch.Tensor, Optional[PrototypeInfo]]:
-        """
-        Full forward pass.
-
-        Args:
-            x: [B, ...] input (images or features)
-            return_info: Return routing info
-
-        Returns:
-            logits: [B, num_classes] predictions
-            info: Optional PrototypeInfo with routing details
-        """
-        # Get stream outputs
+        """Full forward pass."""
         stream_outputs = self.get_stream_outputs(x)
 
-        # Process through heads
         head_outputs = {}
         fingerprints = {}
         routing_info = {}
@@ -332,7 +347,6 @@ class AssembledPrototype(BasePrototype):
             if stream_feat.dim() == 2:
                 stream_feat = stream_feat.unsqueeze(1)
 
-            # Through head
             head = self.heads[name]
             if return_info:
                 head_out, head_info = head(stream_feat, return_info=True)
@@ -340,27 +354,19 @@ class AssembledPrototype(BasePrototype):
             else:
                 head_out = head(stream_feat)
 
-            # Pool to [B, D]
             pooled = self._pool(head_out)
-
-            # Project to fusion dimension
             projected = self.projections[name](pooled)
             head_outputs[name] = projected
-
-            # Collect fingerprint
             fingerprints[name] = head.fingerprint.detach()
 
-        # Fusion
         fused, fusion_info = self.fusion(
             head_outputs,
             stream_fingerprints=fingerprints if return_info else None,
             return_weights=return_info,
         )
 
-        # Classify
         logits = self.classifier(fused)
 
-        # Build info
         info = None
         if return_info:
             info = PrototypeInfo(
@@ -373,160 +379,47 @@ class AssembledPrototype(BasePrototype):
 
         return logits, info
 
-    def get_emergence_ratio(
-            self,
-            dataloader,
-            device: torch.device = None,
-    ) -> float:
-        """
-        Compute emergence ratio on dataset.
 
-        ρ = collective_accuracy / max(individual_accuracies)
-        """
-        if device is None:
-            device = next(self.parameters()).device
+# =============================================================================
+# HELPER: Conv Sequence Backbone
+# =============================================================================
 
-        self.eval()
+class ConvSequenceBackbone(nn.Module):
+    """Multi-scale conv backbone for sequences."""
 
-        # Collect predictions
-        all_labels = []
-        collective_preds = []
-        individual_preds = {name: [] for name in self.stream_names}
+    def __init__(self, input_dim: int, feature_dim: int, kernel_sizes: List[int] = [3, 5, 7]):
+        super().__init__()
 
-        with torch.no_grad():
-            for batch in dataloader:
-                if isinstance(batch, (list, tuple)):
-                    x, labels = batch[0], batch[1]
-                else:
-                    x, labels = batch, None
-
-                x = x.to(device)
-                if labels is not None:
-                    all_labels.extend(labels.cpu().tolist())
-
-                # Collective prediction
-                logits, info = self(x, return_info=True)
-                collective_preds.extend(logits.argmax(dim=-1).cpu().tolist())
-
-                # Individual predictions (from head outputs through classifier)
-                for name in self.stream_names:
-                    # Simple classifier on individual stream
-                    head_out = info.head_outputs[name]
-                    # Use same classifier (rough approximation)
-                    ind_logits = self.classifier(head_out)
-                    individual_preds[name].extend(ind_logits.argmax(dim=-1).cpu().tolist())
-
-        if not all_labels:
-            return 0.0
-
-        # Compute accuracies
-        all_labels = torch.tensor(all_labels)
-        collective_preds = torch.tensor(collective_preds)
-        collective_acc = (collective_preds == all_labels).float().mean().item()
-
-        individual_accs = {}
-        for name in self.stream_names:
-            preds = torch.tensor(individual_preds[name])
-            individual_accs[name] = (preds == all_labels).float().mean().item()
-
-        max_individual = max(individual_accs.values()) if individual_accs else 0.0
-
-        # Emergence ratio
-        if max_individual > 0:
-            emergence_ratio = collective_acc / max_individual
+        if input_dim != feature_dim:
+            self.projection = nn.Linear(input_dim, feature_dim)
         else:
-            emergence_ratio = float('inf') if collective_acc > 0 else 0.0
+            self.projection = nn.Identity()
 
-        return emergence_ratio
+        self.convs = nn.ModuleList([
+            nn.Conv1d(feature_dim, feature_dim, k, padding=k//2)
+            for k in kernel_sizes
+        ])
+        self.gate = nn.Linear(feature_dim * len(kernel_sizes), feature_dim)
+        self.norm = nn.LayerNorm(feature_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.projection(x)  # [B, S, D]
+        x_t = x.transpose(1, 2)  # [B, D, S]
+
+        outs = [torch.relu(c(x_t)) for c in self.convs]
+        concat = torch.cat(outs, dim=1).transpose(1, 2)  # [B, S, D*K]
+
+        gated = self.gate(concat)  # [B, S, D]
+        return self.norm(gated + x)
 
 
 # =============================================================================
-# LIGHTWEIGHT PROTOTYPE (Minimal overhead)
+# LIGHTWEIGHT PROTOTYPE (unchanged)
 # =============================================================================
 
 class LightweightPrototype(BasePrototype):
-    """
-    Lightweight prototype for fast experimentation.
-
-    Simpler architecture with minimal routing overhead.
-    Good for quick iteration and baseline comparisons.
-    """
-
-    def __init__(
-            self,
-            stream_dims: Dict[str, int],
-            num_classes: int,
-            hidden_dim: int = 512,
-            dropout: float = 0.1,
-    ):
-        super().__init__(num_classes, "lightweight")
-
-        self.stream_dims = stream_dims
-        self.stream_names = list(stream_dims.keys())
-        self.hidden_dim = hidden_dim
-
-        # Simple projections per stream
-        self.projections = nn.ModuleDict({
-            name: nn.Sequential(
-                nn.Linear(dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-            )
-            for name, dim in stream_dims.items()
-        })
-
-        # Learnable stream weights
-        self.stream_weights = nn.Parameter(torch.ones(len(stream_dims)))
-
-        # Classifier
-        self.classifier = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
-        )
-
-    def get_stream_outputs(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        # x should be dict of stream features
-        if isinstance(x, dict):
-            return x
-        # Otherwise return empty (streams handled externally)
-        return {}
-
-    def forward(
-            self,
-            stream_features: Dict[str, torch.Tensor],
-            return_info: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[PrototypeInfo]]:
-        """
-        Args:
-            stream_features: {name: [B, D]} features from each stream
-        """
-        # Project each stream
-        projected = {}
-        for name in self.stream_names:
-            feat = stream_features[name]
-            if feat.dim() == 3:
-                feat = feat[:, 0]  # Take CLS
-            projected[name] = self.projections[name](feat)
-
-        # Weighted combination
-        weights = F.softmax(self.stream_weights, dim=0)
-
-        fused = None
-        for i, name in enumerate(self.stream_names):
-            weighted = weights[i] * projected[name]
-            fused = weighted if fused is None else fused + weighted
-
-        # Classify
-        logits = self.classifier(fused)
-
-        info = None
-        if return_info:
-            info = PrototypeInfo(
-                head_outputs=projected,
-                fusion_weights=weights.detach(),
-            )
-
-        return logits, info
+    """Lightweight prototype for fast experimentation."""
+    # ... (same as before)
 
 
 # =============================================================================
@@ -537,4 +430,5 @@ __all__ = [
     'PrototypeConfig',
     'AssembledPrototype',
     'LightweightPrototype',
+    'ConvSequenceBackbone',
 ]

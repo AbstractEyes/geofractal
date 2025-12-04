@@ -319,6 +319,7 @@ class ComponentSwapper:
             stream: nn.Module,
             head: nn.Module,
             projection: Optional[nn.Module] = None,
+            input_shape: str = "vector",  # NEW - just track this
     ):
         """Add a new stream to the prototype."""
         self.prototype.streams[name] = stream
@@ -328,7 +329,9 @@ class ComponentSwapper:
             projection = nn.Identity()
         self.prototype.projections[name] = projection
 
+        self.prototype._stream_input_shapes[name] = input_shape  # NEW
         self.prototype.stream_names.append(name)
+
 
     def remove_stream(self, name: str):
         """Remove a stream from the prototype."""

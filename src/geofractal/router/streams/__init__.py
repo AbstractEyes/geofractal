@@ -5,25 +5,62 @@ Stream types for router collectives.
 
 Streams are the "experts" that get coordinated by the router.
 Each stream has:
-- A unique fingerprint (for divergence)
-- A translation head (to common feature space)
-- A router (for coordination)
+- A backbone (optional - encodes input)
+- A head (ComposedHead from head/builder.py)
+- Access to fingerprint via head
+
+Input Shapes:
+- VectorStream: [B, D] - expands to slots
+- SequenceStream: [B, S, D] - routes tokens directly
+- ImageStream: [B, C, H, W] - (future)
 
 Types:
 - BaseStream: Abstract base class
+- VectorStream: For [B, D] vector inputs
+  - FeatureVectorStream: Pre-extracted features
+  - TrainableVectorStream: Trainable backbone
+- SequenceStream: For [B, S, D] sequence inputs
+  - TransformerSequenceStream: Transformer backbone
+  - ConvSequenceStream: Multi-scale conv backbone
 - FrozenStream: Wraps frozen pretrained models (CLIP, DINO, etc.)
-- FeatureStream: For pre-extracted features (fastest)
-- TrainableStream: Fully trainable backbone + router
+
+Factory:
+- StreamBuilder: Factory for building streams with consistent config
 """
 
+from geofractal.router.streams.protocols import StreamProtocol, InputShape
 from geofractal.router.streams.base import BaseStream
-from geofractal.router.streams.frozen import FrozenStream
-from geofractal.router.streams.feature import FeatureStream
-from geofractal.router.streams.trainable import TrainableStream
+from geofractal.router.streams.vector import (
+    VectorStream,
+    FeatureVectorStream,
+    TrainableVectorStream,
+)
+from geofractal.router.streams.sequence import (
+    SequenceStream,
+    TransformerSequenceStream,
+    ConvSequenceStream,
+)
+from geofractal.router.streams.builder import StreamBuilder
+
+# Legacy imports (deprecated - will be removed)
+# from geofractal.router.streams.frozen import FrozenStream
+# from geofractal.router.streams.feature import FeatureStream
+# from geofractal.router.streams.trainable import TrainableStream
 
 __all__ = [
+    # Protocols
+    "StreamProtocol",
+    "InputShape",
+    # Base
     "BaseStream",
-    "FrozenStream",
-    "FeatureStream",
-    "TrainableStream",
+    # Vector streams
+    "VectorStream",
+    "FeatureVectorStream",
+    "TrainableVectorStream",
+    # Sequence streams
+    "SequenceStream",
+    "TransformerSequenceStream",
+    "ConvSequenceStream",
+    # Factory
+    "StreamBuilder",
 ]
