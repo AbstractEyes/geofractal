@@ -177,6 +177,12 @@ FusionSpec.moe(output_dim=512)          # Mixture of experts
 ```
 geofractal/router/
 ├── __init__.py
+├── collective.py
+├── registry.py
+├── config.py
+├── run_tst_full.py
+├── run_tst_gradient.py
+├── run_tst_seq.py
 ├── factory/
 │   ├── __init__.py
 │   ├── builder.py
