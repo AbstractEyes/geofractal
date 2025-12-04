@@ -176,22 +176,39 @@ FusionSpec.moe(output_dim=512)          # Mixture of experts
 ### Package Structure
 ```
 geofractal/router/
-├── config.py              # GlobalFractalRouterConfig
-├── registry.py            # RouterRegistry, RouterMailbox
-├── head/
-│   ├── components.py      # CantorAttention, TopKRouter, Anchors, Gates
-│   └── builder.py         # HeadBuilder, ComposedHead
+├── __init__.py
+├── factory/
+│   ├── __init__.py
+│   ├── builder.py
+│   ├── protocols.py
+│   ├── prototype.py
+│   └── registry.py
 ├── fusion/
-│   ├── methods.py         # Concat, Gated, Attention, MoE
-│   └── builder.py         # FusionBuilder
+│   ├── __init__.py
+│   ├── builder.py
+│   ├── methods.py
+│   └── protocols.py
+├── getting_started/
+│   ├── ARCHITECTURE.md
+│   ├── DEVELOPMENT.md
+│   ├── INDEX.md
+│   ├── MATHEMATICS.md
+│   └── PROTOCOL.md
+├── head/
+│   ├── __init__.py
+│   ├── builder.py
+│   ├── components.py
+│   └── protocols.py
 ├── streams/
-│   ├── vector.py          # VectorStream, FeatureVectorStream
-│   ├── sequence.py        # SequenceStream, TransformerSequenceStream
-│   └── builder.py         # StreamBuilder
-└── factory/
-    ├── protocols.py       # StreamSpec, HeadSpec, FusionSpec
-    ├── prototype.py       # AssembledPrototype
-    └── builder.py         # PrototypeBuilder
+│   ├── __init__.py
+│   ├── base.py
+│   ├── builder.py
+│   ├── feature.py
+│   ├── frozen.py
+│   ├── protocols.py
+│   ├── sequence.py
+│   ├── trainable.py
+│   └── vector.py
 ```
 
 ### Head Components

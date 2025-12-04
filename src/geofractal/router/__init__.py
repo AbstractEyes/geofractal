@@ -17,53 +17,38 @@ Proven Results:
 
 Usage:
     from geofractal.router import (
-        GlobalFractalRouter,
         RouterCollective,
-        FrozenStream,
-        FeatureStream,
+        CollectiveConfig,
+        StreamSpec,
+        HeadSpec,
+        FusionSpec,
     )
 
-    # Quick collective
-    collective = RouterCollective.from_streams([
-        FrozenStream.from_pretrained("openai/clip-vit-base-patch32"),
-        FrozenStream.from_pretrained("openai/clip-vit-large-patch14"),
-    ])
+    # Build collective from specs
+    collective = RouterCollective.from_specs(
+        stream_specs=[
+            StreamSpec.feature_vector("clip_b32", input_dim=512),
+            StreamSpec.feature_vector("clip_l14", input_dim=768),
+        ],
+        config=CollectiveConfig(feature_dim=512, num_classes=1000),
+    )
 
     # Train routing only
-    collective.fit(train_loader, epochs=20)
+    history = collective.fit(train_loader, val_loader, epochs=20)
 
 Subpackages:
     geofractal.router.head    - Decomposed head components
     geofractal.router.fusion  - Fusion layer implementations
+    geofractal.router.streams - Stream types (vector, sequence)
+    geofractal.router.factory - Prototype assembly
 
 Author: AbstractPhil
-Architecture: GlobalFractalRouter
 Date: December 2025
 """
 
-from geofractal.router.core import (
-    GlobalFractalRouter,
-    GlobalFractalRouterConfig,
-    CantorMultiHeadAttention,
-    AnchorBank,
-    FingerprintGate,
-    TopKRouter,
-    cantor_pair,
-    cantor_unpair,
-    build_cantor_bias,
-)
-
-from geofractal.router.registry import (
-    RouterRegistry,
-    RouterMailbox,
-    get_registry,
-)
-
-from geofractal.router.collective import (
-    RouterCollective,
-)
-
+# Config
 from geofractal.router.config import (
+    GlobalFractalRouterConfig,
     CollectiveConfig,
     StreamConfig,
     IMAGENET_COLLECTIVE_CONFIG,
@@ -71,20 +56,55 @@ from geofractal.router.config import (
     CIFAR_COLLECTIVE_CONFIG,
 )
 
+# Registry
+from geofractal.router.registry import (
+    RouterRegistry,
+    RouterMailbox,
+    get_registry,
+)
+
+# Collective
+from geofractal.router.collective import (
+    RouterCollective,
+)
+
+# Streams
 from geofractal.router.streams import (
+    StreamProtocol,
+    InputShape,
     BaseStream,
+    VectorStream,
+    FeatureVectorStream,
+    TrainableVectorStream,
+    SequenceStream,
+    TransformerSequenceStream,
+    ConvSequenceStream,
+    StreamBuilder,
+    # Legacy aliases
     FrozenStream,
     FeatureStream,
     TrainableStream,
 )
 
-# Head components (decomposed)
+# Head components
 from geofractal.router.head import (
     HeadBuilder,
     HeadConfig,
     ComposedHead,
     build_standard_head,
     STANDARD_HEAD,
+    # Components
+    CantorAttention,
+    TopKRouter,
+    FingerprintGate,
+    ConstitutiveAnchorBank,
+    AttentiveAnchorBank,
+    LearnableWeightCombiner,
+    FFNRefinement,
+    # Cantor utilities
+    cantor_pair,
+    cantor_unpair,
+    build_cantor_bias,
 )
 
 # Fusion strategies
@@ -99,7 +119,7 @@ from geofractal.router.fusion import (
     STANDARD_FUSION,
 )
 
-# Factory (prototype assembly)
+# Factory
 from geofractal.router.factory import (
     PrototypeBuilder,
     PrototypeConfig,
@@ -115,41 +135,52 @@ from geofractal.router.factory import (
 )
 
 __all__ = [
-    # Core Router
-    "GlobalFractalRouter",
+    # Config
     "GlobalFractalRouterConfig",
-    # Core Components
-    "CantorMultiHeadAttention",
-    "AnchorBank",
-    "FingerprintGate",
-    "TopKRouter",
-    # Cantor Functions
-    "cantor_pair",
-    "cantor_unpair",
-    "build_cantor_bias",
+    "CollectiveConfig",
+    "StreamConfig",
+    "IMAGENET_COLLECTIVE_CONFIG",
+    "FASHIONMNIST_COLLECTIVE_CONFIG",
+    "CIFAR_COLLECTIVE_CONFIG",
     # Registry
     "RouterRegistry",
     "RouterMailbox",
     "get_registry",
     # Collective
     "RouterCollective",
-    "CollectiveConfig",
-    "StreamConfig",
-    # Presets
-    "IMAGENET_COLLECTIVE_CONFIG",
-    "FASHIONMNIST_COLLECTIVE_CONFIG",
-    "CIFAR_COLLECTIVE_CONFIG",
-    # Streams
+    # Streams (new)
+    "StreamProtocol",
+    "InputShape",
     "BaseStream",
+    "VectorStream",
+    "FeatureVectorStream",
+    "TrainableVectorStream",
+    "SequenceStream",
+    "TransformerSequenceStream",
+    "ConvSequenceStream",
+    "StreamBuilder",
+    # Streams (legacy)
     "FrozenStream",
     "FeatureStream",
     "TrainableStream",
-    # Head (decomposed)
+    # Head
     "HeadBuilder",
     "HeadConfig",
     "ComposedHead",
     "build_standard_head",
     "STANDARD_HEAD",
+    # Head components
+    "CantorAttention",
+    "TopKRouter",
+    "FingerprintGate",
+    "ConstitutiveAnchorBank",
+    "AttentiveAnchorBank",
+    "LearnableWeightCombiner",
+    "FFNRefinement",
+    # Cantor utilities
+    "cantor_pair",
+    "cantor_unpair",
+    "build_cantor_bias",
     # Fusion
     "FusionBuilder",
     "FusionStrategy",
@@ -159,7 +190,7 @@ __all__ = [
     "GatedFusion",
     "AttentionFusion",
     "STANDARD_FUSION",
-    # Factory (prototype assembly)
+    # Factory
     "PrototypeBuilder",
     "PrototypeConfig",
     "AssembledPrototype",
@@ -173,4 +204,4 @@ __all__ = [
     "build_feature_prototype",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -87,8 +87,9 @@ from .components import (
     FFNRefinement,
     MixtureOfExpertsRefinement,
     # Utilities
-    #cantor_pair,
-    #build_cantor_bias,
+    cantor_pair,
+    cantor_unpair,
+    build_cantor_bias,
 )
 
 from .builder import (
@@ -152,7 +153,8 @@ __all__ = [
     'build_lightweight_head',
     'build_custom_head',
     # Utilities
-    #'cantor_pair',
-    #'build_cantor_bias',
+    'cantor_pair',
+    'cantor_unpair',
+    'build_cantor_bias',
     'HeadComponents',
 ]

@@ -542,6 +542,90 @@ class MixtureOfExpertsRefinement(BaseRefinement):
 
         return x + output
 
+# =============================================================================
+# CANTOR PAIRING FUNCTIONS
+# =============================================================================
+
+def cantor_pair(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Cantor pairing function - maps 2D coordinates to unique 1D index.
+
+    The Cantor pairing creates a self-similar diagonal structure
+    that encodes spatial relationships geometrically.
+
+    Args:
+        x, y: Coordinate tensors (same shape)
+
+    Returns:
+        z: Paired indices with same shape
+    """
+    return ((x + y) * (x + y + 1)) // 2 + y
+
+
+def cantor_unpair(z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Inverse Cantor pairing - recovers coordinates from paired index.
+
+    Args:
+        z: Paired indices
+
+    Returns:
+        x, y: Original coordinates
+    """
+    w = torch.floor((torch.sqrt(8 * z.float() + 1) - 1) / 2)
+    t = (w * w + w) / 2
+    y = (z.float() - t).long()
+    x = (w - y.float()).long()
+    return x, y
+
+
+def build_cantor_bias(
+    height: int,
+    width: int,
+    device: torch.device,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Build Cantor pairing bias matrix for attention.
+
+    Creates a self-similar structure where positions along
+    diagonals have related attention patterns.
+
+    Args:
+        height, width: Grid dimensions
+        device: Target device
+        normalize: Whether to normalize to [0, 1]
+
+    Returns:
+        bias: [height * width, height * width] attention bias
+    """
+    # Create coordinate grids
+    y_coords = torch.arange(height, device=device)
+    x_coords = torch.arange(width, device=device)
+
+    # Meshgrid for all positions
+    yy, xx = torch.meshgrid(y_coords, x_coords, indexing='ij')
+    positions = torch.stack([yy.flatten(), xx.flatten()], dim=-1)  # [S, 2]
+
+    S = height * width
+
+    # Compute Cantor pair for each position
+    cantor_indices = cantor_pair(positions[:, 0], positions[:, 1])  # [S]
+
+    # Build pairwise relationship matrix
+    # Positions with similar Cantor indices attend to each other
+    diff = torch.abs(
+        cantor_indices.unsqueeze(0) - cantor_indices.unsqueeze(1)
+    ).float()  # [S, S]
+
+    # Convert to similarity (closer Cantor indices = higher attention)
+    if normalize:
+        max_diff = diff.max() + 1
+        bias = 1.0 - (diff / max_diff)
+    else:
+        bias = -diff
+
+    return bias
 
 # =============================================================================
 # EXPORTS
@@ -561,4 +645,7 @@ __all__ = [
     'GatedCombiner',
     'FFNRefinement',
     'MixtureOfExpertsRefinement',
+    'cantor_pair',
+    'cantor_unpair',
+    'build_cantor_bias',
 ]
