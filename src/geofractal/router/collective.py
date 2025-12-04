@@ -3,14 +3,28 @@ geofractal.router.collective
 ============================
 High-level API for router collectives with training utilities.
 
+This is based on the original prototype so it doesn't contain the entire implementation of the new builder paradigm.
+
+Alone this functions similarly to the original prototype, but it is recommended to use the builder pattern for more complex use cases.
+
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
 
 RouterCollective provides:
+- API example for building router collectives from builder specs partially hardcoded
 - Building multi-stream architectures
 - Training with coordination
 - Inference with emergent specialization
 - Emergence metrics (ρ = collective / max individual)
+
+Do Nots:
+- DO NOT expect this to work out of the box for complex use cases
+- DO NOT expect this to be efficient
+- DO NOT expect this to be the final API
+
+This is a rough blueprint for future development. The builder pattern is far more robust and flexible.
+
+Thank you for reading and understanding as I build the implementation out.
 
 Usage:
     # From specs (recommended)
@@ -524,7 +538,6 @@ class RouterCollective(nn.Module):
     # =========================================================================
 
     @classmethod
-    @classmethod
     def from_specs(
             cls,
             stream_specs: List[StreamSpec],
@@ -676,7 +689,6 @@ class RouterCollective(nn.Module):
             stream_input_shapes=stream_input_shapes,
         )
 
-    @staticmethod
     @staticmethod
     def _build_stream_from_spec(spec: StreamSpec, num_slots: int) -> nn.Module:
         """Build stream module from specification."""
