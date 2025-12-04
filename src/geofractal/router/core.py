@@ -26,72 +26,9 @@ import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, List, Any
 
+from geofractal.router.config import GlobalFractalRouterConfig
 from geofractal.router.registry import RouterMailbox, get_registry
 
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-@dataclass
-class GlobalFractalRouterConfig:
-    """
-    Configuration for GlobalFractalRouter.
-
-    Core Dimensions:
-        feature_dim: Internal routing dimension (default: 512)
-        fingerprint_dim: Identity/divergence dimension (default: 64)
-
-    Routing:
-        num_anchors: Shared behavioral modes (default: 16)
-        num_routes: Top-K routes per position (default: 4)
-        num_heads: Attention heads (default: 8)
-        temperature: Softmax temperature (default: 1.0)
-
-    Coordination:
-        use_adjacent_gating: Enable parent→child fingerprint gating
-        use_cantor_prior: Enable Cantor diagonal structure
-        use_mailbox: Enable inter-router communication
-        grid_size: Spatial structure for Cantor pairing (H, W)
-
-    Proven Settings:
-        - ImageNet: feature_dim=512, num_anchors=16, num_routes=8
-        - FashionMNIST: feature_dim=128, num_anchors=8, num_routes=4
-    """
-
-    # Core dimensions
-    feature_dim: int = 512
-    fingerprint_dim: int = 64
-
-    # Routing
-    num_anchors: int = 16
-    num_routes: int = 4
-    num_heads: int = 8
-    head_dim: Optional[int] = None  # Computed if None
-    temperature: float = 1.0
-
-    # Sequence structure
-    num_slots: int = 16
-    grid_size: Tuple[int, int] = (16, 1)
-
-    # Coordination features
-    use_adjacent_gating: bool = True
-    use_cantor_prior: bool = True
-    use_mailbox: bool = True
-
-    # Regularization
-    dropout: float = 0.1
-
-    # Anchor contribution weight
-    anchor_weight: float = 0.1
-
-    def __post_init__(self):
-        if self.head_dim is None:
-            self.head_dim = self.feature_dim // self.num_heads
-
-        # Ensure grid matches slots
-        if self.grid_size[0] * self.grid_size[1] != self.num_slots:
-            self.grid_size = (self.num_slots, 1)
 
 
 # =============================================================================

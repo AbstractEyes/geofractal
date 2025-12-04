@@ -12,7 +12,6 @@ Each stream has:
 Input Shapes:
 - VectorStream: [B, D] - expands to slots
 - SequenceStream: [B, S, D] - routes tokens directly
-- ImageStream: [B, C, H, W] - (future)
 
 Types:
 - BaseStream: Abstract base class
@@ -22,7 +21,6 @@ Types:
 - SequenceStream: For [B, S, D] sequence inputs
   - TransformerSequenceStream: Transformer backbone
   - ConvSequenceStream: Multi-scale conv backbone
-- FrozenStream: Wraps frozen pretrained models (CLIP, DINO, etc.)
 
 Factory:
 - StreamBuilder: Factory for building streams with consistent config
@@ -42,10 +40,10 @@ from geofractal.router.streams.sequence import (
 )
 from geofractal.router.streams.builder import StreamBuilder
 
-# Legacy imports (deprecated - will be removed)
-# from geofractal.router.streams.frozen import FrozenStream
-# from geofractal.router.streams.feature import FeatureStream
-# from geofractal.router.streams.trainable import TrainableStream
+# Legacy aliases (deprecated - use new names)
+FrozenStream = FeatureVectorStream
+FeatureStream = FeatureVectorStream
+TrainableStream = TrainableVectorStream
 
 __all__ = [
     # Protocols
@@ -63,4 +61,8 @@ __all__ = [
     "ConvSequenceStream",
     # Factory
     "StreamBuilder",
+    # Legacy (deprecated)
+    "FrozenStream",
+    "FeatureStream",
+    "TrainableStream",
 ]
