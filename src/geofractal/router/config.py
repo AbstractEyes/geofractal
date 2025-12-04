@@ -9,12 +9,12 @@ Licensed under the Apache License, Version 2.0
 Note: GlobalFractalRouterConfig is defined in core.py
 """
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Dict
+from dataclasses import dataclass
+from typing import Optional, Tuple
 import torch
 
 # Import router config from core
-from geofractal.router.core import GlobalFractalRouterConfig
+from geofractal.router.deprecated.core import GlobalFractalRouterConfig
 
 # =============================================================================
 # CONFIGURATION
