@@ -8,6 +8,7 @@ Just routes pre-computed feature vectors.
 
 Used in the ImageNet experiment with pre-extracted CLIP features.
 """
+from typing_extensions import deprecated
 
 import torch
 from typing import Dict, Tuple, Optional, Any
@@ -16,7 +17,7 @@ from geofractal.router.streams.base import BaseStream
 from geofractal.router.config import CollectiveConfig
 from geofractal.router.registry import RouterMailbox
 
-
+@deprecated
 class FeatureStream(BaseStream):
     """
     Stream for pre-extracted features.
