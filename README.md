@@ -9,6 +9,17 @@
 
 ## What Is This?
 
+!!!CURRENTLY!!! this architecture is under active development. Expect a lot of changes.
+
+Primarily, what you want is geofractal.model.blocks.router.global_fractal_router.py
+This structure is the primary blueprint implementation of the GeoFractal Router architecture and
+is to be used as a module within larger models.
+
+I'm currently implementing a higher-level factory interface to build complete models around this router.
+The process is ongoing.
+
+## Overview
+
 GeoFractal Router is a coordination architecture for **collective intelligence**. Instead of building one smart model, you build multiple *different* models that communicate and triangulate truth together.
 
 **The key insight:** Individual models don't need to be accurate. They need to *see differently*. The collective triangulates from divergent perspectives.
