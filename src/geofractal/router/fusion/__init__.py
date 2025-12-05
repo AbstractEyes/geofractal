@@ -54,7 +54,7 @@ Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
 
-from .protocols import (
+from .fusion_protocols import (
     # Protocols
     StreamFusion,
     AdaptiveFusion,
@@ -66,7 +66,7 @@ from .protocols import (
     FusionInfo,
 )
 
-from .methods import (
+from .fusion_methods import (
     FusionConfig,
     ConcatFusion,
     WeightedFusion,
@@ -78,7 +78,7 @@ from .methods import (
     HierarchicalTreeFusion,
 )
 
-from .builder import (
+from .fusion_builder import (
     # Enums
     FusionStrategy,
     # Presets

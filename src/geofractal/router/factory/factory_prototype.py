@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional, Tuple, Any, Union
 from dataclasses import dataclass, field
 
-from .protocols import (
+from .factory_protocols import (
     BasePrototype,
     PrototypeInfo,
     StreamSpec,

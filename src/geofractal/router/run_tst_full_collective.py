@@ -72,7 +72,7 @@ def test_imports():
     run_test("registry", import_registry)
 
     def import_head_components():
-        from geofractal.router.head.components import (
+        from geofractal.router.head.head_components import (
             HeadConfig,
             cantor_pair, cantor_unpair, build_cantor_bias,
             StandardAttention, CantorAttention,
@@ -86,7 +86,7 @@ def test_imports():
     run_test("head.components", import_head_components)
 
     def import_head_builder():
-        from geofractal.router.head.builder import (
+        from geofractal.router.head.head_builder import (
             HeadBuilder, HeadPreset, ComposedHead,
             STANDARD_HEAD, LIGHTWEIGHT_HEAD, HEAVY_HEAD,
             build_standard_head, build_lightweight_head,
@@ -95,7 +95,7 @@ def test_imports():
     run_test("head.builder", import_head_builder)
 
     def import_head_protocols():
-        from geofractal.router.head.protocols import (
+        from geofractal.router.head.head_protocols import (
             BaseAttention, BaseRouter, BaseAnchorBank,
             BaseGate, BaseCombiner, BaseRefinement,
         )
@@ -103,7 +103,7 @@ def test_imports():
     run_test("head.protocols", import_head_protocols)
 
     def import_streams():
-        from geofractal.router.streams.vector import (
+        from geofractal.router.streams.stream_vector import (
             InputShape,
             FeatureVectorStream, TrainableVectorStream,
             SequenceStream, TransformerSequenceStream, ConvSequenceStream,
@@ -113,7 +113,7 @@ def test_imports():
     run_test("streams.vector", import_streams)
 
     def import_fusion_methods():
-        from geofractal.router.fusion.methods import (
+        from geofractal.router.fusion.fusion_methods import (
             FusionConfig,
             ConcatFusion, WeightedFusion, GatedFusion,
             AttentionFusion, FingerprintGuidedFusion,
@@ -128,7 +128,7 @@ def test_imports():
     run_test("fusion.builder", import_fusion_builder)
 
     def import_factory():
-        from geofractal.router.factory.protocols import (
+        from geofractal.router.factory.factory_protocols import (
             StreamSpec, HeadSpec, FusionSpec,
         )
         return True
@@ -147,7 +147,7 @@ def test_imports():
 def test_cantor_functions():
     test_section("2. Cantor Functions")
 
-    from geofractal.router.head.components import cantor_pair, cantor_unpair, build_cantor_bias
+    from geofractal.router.head.head_components import cantor_pair, cantor_unpair, build_cantor_bias
 
     def test_pair_bijection():
         x = torch.tensor([0, 1, 2, 3, 0, 1, 2])
@@ -189,7 +189,7 @@ def test_cantor_functions():
 def test_head_components():
     test_section("3. Head Components")
 
-    from geofractal.router.head.components import (
+    from geofractal.router.head.head_components import (
         HeadConfig,
         StandardAttention, CantorAttention,
         TopKRouter, SoftRouter,
@@ -300,11 +300,11 @@ def test_head_components():
 def test_head_builder():
     test_section("4. HeadBuilder and ComposedHead")
 
-    from geofractal.router.head.builder import (
+    from geofractal.router.head.head_builder import (
         HeadBuilder, ComposedHead,
         build_standard_head, build_lightweight_head,
     )
-    from geofractal.router.head.components import HeadConfig
+    from geofractal.router.head.head_components import HeadConfig
 
     B, S, D = 4, 16, 512
     x = torch.randn(B, S, D).to(DEVICE)
@@ -363,7 +363,7 @@ def test_head_builder():
 def test_streams():
     test_section("5. Stream Types")
 
-    from geofractal.router.streams.vector import (
+    from geofractal.router.streams.stream_vector import (
         InputShape,
         FeatureVectorStream, TrainableVectorStream,
         SequenceStream, TransformerSequenceStream, ConvSequenceStream,
@@ -563,7 +563,7 @@ def test_fusion():
 def test_factory_specs():
     test_section("7. Factory Specs")
 
-    from geofractal.router.factory.protocols import StreamSpec, HeadSpec, FusionSpec
+    from geofractal.router.factory.factory_protocols import StreamSpec, HeadSpec, FusionSpec
 
     # StreamSpec - using actual API
     def test_stream_spec_feature():
@@ -726,7 +726,7 @@ def test_collective():
 
     from geofractal.router.collective import RouterCollective
     from geofractal.router.config import CollectiveConfig
-    from geofractal.router.factory.protocols import StreamSpec, HeadSpec, FusionSpec
+    from geofractal.router.factory.factory_protocols import StreamSpec, HeadSpec, FusionSpec
     from geofractal.router.registry import get_registry
 
     B = 4

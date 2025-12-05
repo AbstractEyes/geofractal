@@ -16,8 +16,8 @@ from typing import Type, Dict, List, Optional, Any, Union
 from dataclasses import dataclass, field
 from copy import deepcopy
 
-from .protocols import StreamSpec, HeadSpec, FusionSpec
-from .prototype import PrototypeConfig, AssembledPrototype, LightweightPrototype
+from .factory_protocols import StreamSpec, HeadSpec, FusionSpec
+from .factory_prototype import PrototypeConfig, AssembledPrototype, LightweightPrototype
 
 
 # =============================================================================

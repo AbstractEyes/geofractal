@@ -27,7 +27,7 @@ import math
 from typing import Dict, Optional, Tuple, List, Any
 from dataclasses import dataclass
 
-from .protocols import BaseFusion, BaseAdaptiveFusion, FusionInfo
+from .fusion_protocols import BaseFusion, BaseAdaptiveFusion, FusionInfo
 
 
 # =============================================================================

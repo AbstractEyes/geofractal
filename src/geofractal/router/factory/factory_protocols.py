@@ -4,6 +4,7 @@ geofractal.router.factory.protocols
 Abstract protocols for router prototypes.
 
 Updated to support new stream architecture with input shapes.
+FIXED: Removed dead num_slots config.
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -171,6 +172,7 @@ class StreamSpec:
     Specification for a stream in the prototype.
 
     Supports both vector [B, D] and sequence [B, S, D] inputs.
+    Streams are simple projections - no artificial structure manufacturing.
     """
 
     def __init__(
@@ -182,7 +184,6 @@ class StreamSpec:
             feature_dim: int = 512,
             model_name: Optional[str] = None,
             frozen: bool = False,
-            num_slots: int = 4,  # For vector streams
             num_layers: int = 2,  # For transformer streams
             num_heads: int = 8,   # For transformer streams
             kernel_sizes: List[int] = None,  # For conv streams
@@ -196,7 +197,6 @@ class StreamSpec:
         self.feature_dim = feature_dim
         self.model_name = model_name
         self.frozen = frozen
-        self.num_slots = num_slots
         self.num_layers = num_layers
         self.num_heads = num_heads
         self.kernel_sizes = kernel_sizes or [3, 5, 7]
@@ -212,7 +212,6 @@ class StreamSpec:
             'feature_dim': self.feature_dim,
             'model_name': self.model_name,
             'frozen': self.frozen,
-            'num_slots': self.num_slots,
             'num_layers': self.num_layers,
             'num_heads': self.num_heads,
             'kernel_sizes': self.kernel_sizes,
@@ -232,58 +231,49 @@ class StreamSpec:
         name: str,
         input_dim: int,
         feature_dim: int = 512,
-        num_slots: int = 4,
     ) -> 'StreamSpec':
-        """Pre-extracted features, no backbone."""
+        """Pre-extracted features, no backbone. Simple projection."""
         return cls(
             name=name,
             stream_type='feature_vector',
             input_shape=InputShape.VECTOR,
             input_dim=input_dim,
             feature_dim=feature_dim,
-            num_slots=num_slots,
         )
 
     @classmethod
     def trainable_vector(
         cls,
         name: str,
-        backbone: nn.Module,
         input_dim: int,
         feature_dim: int = 512,
-        num_slots: int = 4,
+        backbone: Optional[nn.Module] = None,
     ) -> 'StreamSpec':
-        """Trainable backbone with vector output."""
+        """Trainable backbone for vector features."""
         return cls(
             name=name,
             stream_type='trainable_vector',
             input_shape=InputShape.VECTOR,
             input_dim=input_dim,
             feature_dim=feature_dim,
-            num_slots=num_slots,
             backbone=backbone,
         )
 
     @classmethod
-    def frozen_clip(
+    def frozen_encoder(
         cls,
         name: str,
-        variant: str = "openai/clip-vit-base-patch32",
+        model_name: str,
+        feature_dim: int = 512,
     ) -> 'StreamSpec':
-        """Frozen CLIP model (vector output)."""
-        dim_map = {
-            "openai/clip-vit-base-patch32": 512,
-            "openai/clip-vit-base-patch16": 512,
-            "openai/clip-vit-large-patch14": 768,
-            "openai/clip-vit-large-patch14-336": 768,
-        }
+        """Frozen pretrained encoder (CLIP, etc)."""
         return cls(
             name=name,
             stream_type='frozen',
             input_shape=InputShape.IMAGE,
-            input_dim=dim_map.get(variant, 512),
-            feature_dim=dim_map.get(variant, 512),
-            model_name=variant,
+            input_dim=feature_dim,  # Output dim of encoder
+            feature_dim=feature_dim,
+            model_name=model_name,
             frozen=True,
         )
 
@@ -296,7 +286,7 @@ class StreamSpec:
         input_dim: int,
         feature_dim: int = 512,
     ) -> 'StreamSpec':
-        """Basic sequence stream (projection only)."""
+        """Basic sequence stream with optional projection."""
         return cls(
             name=name,
             stream_type='sequence',

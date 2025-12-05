@@ -46,7 +46,7 @@ Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
 
-from .protocols import (
+from .head_protocols import (
     # Protocols
     Fingerprinted,
     AttentionHead,
@@ -66,7 +66,7 @@ from .protocols import (
     HeadComponents,
 )
 
-from .components import (
+from .head_components import (
     HeadConfig,
     # Attention
     StandardAttention,
@@ -92,7 +92,7 @@ from .components import (
     build_cantor_bias,
 )
 
-from .builder import (
+from .head_builder import (
     HeadBuilder,
     HeadPreset,
     ComposedHead,

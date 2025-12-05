@@ -186,7 +186,6 @@ class GlobalFractalRouterConfig:
     num_routes: int = 8
     temperature: float = 0.1
 
-    num_router_slots: int = 16
     router_comm_dim: int = 128
 
     use_adjacent_gating: bool = True

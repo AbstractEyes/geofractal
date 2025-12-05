@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 from typing import Dict, Tuple, Optional, Any, Callable
 
-from geofractal.router.streams.base import BaseStream
+from geofractal.router.streams.stream_base import BaseStream
 from geofractal.router.config import CollectiveConfig
 from geofractal.router.registry import RouterMailbox
 

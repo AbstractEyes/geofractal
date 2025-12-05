@@ -13,7 +13,7 @@ from typing_extensions import deprecated
 import torch
 from typing import Dict, Tuple, Optional, Any
 
-from geofractal.router.streams.base import BaseStream
+from geofractal.router.streams.stream_base import BaseStream
 from geofractal.router.config import CollectiveConfig
 from geofractal.router.registry import RouterMailbox
 

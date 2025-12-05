@@ -23,8 +23,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import threading
 
-from .protocols import StreamSpec, HeadSpec, FusionSpec
-from .prototype import PrototypeConfig, AssembledPrototype
+from .factory_protocols import StreamSpec, HeadSpec, FusionSpec
+from .factory_prototype import PrototypeConfig, AssembledPrototype
 
 
 # =============================================================================

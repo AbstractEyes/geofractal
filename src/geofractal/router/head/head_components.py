@@ -14,7 +14,7 @@ from typing import Dict, Tuple, Optional, Any
 from dataclasses import dataclass
 import math
 
-from .protocols import (
+from .head_protocols import (
     BaseAttention,
     BaseRouter,
     BaseAnchorBank,

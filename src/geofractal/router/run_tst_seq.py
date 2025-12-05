@@ -54,7 +54,7 @@ def test_imports():
         errors.append(test_fail("registry imports", str(e)))
 
     try:
-        from geofractal.router.head.components import (
+        from geofractal.router.head.head_components import (
             cantor_pair, cantor_unpair, build_cantor_bias,
             HeadConfig, CantorAttention, TopKRouter, FingerprintGate,
             ConstitutiveAnchorBank, LearnableWeightCombiner, FFNRefinement,
@@ -64,7 +64,7 @@ def test_imports():
         errors.append(test_fail("head.components imports", str(e)))
 
     try:
-        from geofractal.router.head.builder import HeadBuilder, ComposedHead, build_standard_head
+        from geofractal.router.head.head_builder import HeadBuilder, ComposedHead, build_standard_head
         test_pass("head.builder imports")
     except ImportError as e:
         errors.append(test_fail("head.builder imports", str(e)))
@@ -109,7 +109,7 @@ def test_imports():
 def test_cantor_functions():
     test_section("2. Cantor Functions")
 
-    from geofractal.router.head.components import cantor_pair, cantor_unpair, build_cantor_bias
+    from geofractal.router.head.head_components import cantor_pair, cantor_unpair, build_cantor_bias
 
     x = torch.tensor([0, 1, 2, 0, 1])
     y = torch.tensor([0, 0, 0, 1, 1])
@@ -139,7 +139,7 @@ def test_cantor_functions():
 def test_head_components():
     test_section("3. Head Components")
 
-    from geofractal.router.head.components import (
+    from geofractal.router.head.head_components import (
         HeadConfig, CantorAttention, TopKRouter, FingerprintGate,
         ConstitutiveAnchorBank, LearnableWeightCombiner, FFNRefinement,
     )
@@ -221,8 +221,8 @@ def test_head_components():
 def test_head_builder():
     test_section("4. HeadBuilder and ComposedHead")
 
-    from geofractal.router.head.builder import HeadBuilder, build_standard_head
-    from geofractal.router.head.components import HeadConfig
+    from geofractal.router.head.head_builder import HeadBuilder, build_standard_head
+    from geofractal.router.head.head_components import HeadConfig
 
     B, S, D = 4, 16, 512
     x = torch.randn(B, S, D).to(DEVICE)

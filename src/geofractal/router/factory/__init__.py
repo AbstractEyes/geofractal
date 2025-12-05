@@ -57,7 +57,7 @@ Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
 
-from .protocols import (
+from .factory_protocols import (
     # Protocols
     RouterPrototype,
     Configurable,
@@ -71,13 +71,13 @@ from .protocols import (
     FusionSpec,
 )
 
-from .prototype import (
+from .factory_prototype import (
     PrototypeConfig,
     AssembledPrototype,
     LightweightPrototype,
 )
 
-from .builder import (
+from .factory_builder import (
     # Presets
     PrototypePreset,
     PRESETS,
@@ -89,7 +89,7 @@ from .builder import (
     build_feature_prototype,
 )
 
-from .registry import (
+from .factory_registry import (
     PrototypeRecord,
     PrototypeRegistry,
     get_prototype_registry,

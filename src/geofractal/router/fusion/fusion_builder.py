@@ -16,8 +16,8 @@ from typing import Type, Dict, Optional, List, Any
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from .protocols import BaseFusion, FusionInfo
-from .methods import (
+from .fusion_protocols import BaseFusion, FusionInfo
+from .fusion_methods import (
     FusionConfig,
     ConcatFusion,
     WeightedFusion,

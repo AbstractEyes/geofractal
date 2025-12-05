@@ -1,68 +1,99 @@
 """
 geofractal.router.streams
 =========================
-Stream types for router collectives.
+Stream types for router systems.
 
-Streams are the "experts" that get coordinated by the router.
-Each stream has:
-- A backbone (optional - encodes input)
-- A head (ComposedHead from head/builder.py)
-- Access to fingerprint via head
+Streams transform inputs into features suitable for heads:
+- VectorStream: [B, D] → project → [B, D] (head unsqueezes to [B, 1, D])
+- SequenceStream: [B, S, D] → project → [B, S, D]
+- FrozenEncoderStream: [B, C, H, W] → encode → [B, D]
 
-Input Shapes:
-- VectorStream: [B, D] - expands to slots
-- SequenceStream: [B, S, D] - routes tokens directly
+NO SLOT EXPANSION. Streams are simple projections.
+The head handles attention/routing, not the stream.
 
 Types:
-- BaseStream: Abstract base class
-- VectorStream: For [B, D] vector inputs
-  - FeatureVectorStream: Pre-extracted features
-  - TrainableVectorStream: Trainable backbone
-- SequenceStream: For [B, S, D] sequence inputs
-  - TransformerSequenceStream: Transformer backbone
-  - ConvSequenceStream: Multi-scale conv backbone
+------
+Vector (for [B, D] inputs):
+- FeatureVectorStream: Pre-extracted features, just projection
+- TrainableVectorStream: Trainable backbone + projection
+
+Sequence (for [B, S, D] inputs):
+- SequenceStream: Basic projection
+- TransformerSequenceStream: Transformer encoder + projection
+- ConvSequenceStream: Multi-scale conv + projection
+
+Frozen (for images):
+- FrozenEncoderStream: Frozen pretrained encoder (CLIP, DINO, etc.)
 
 Factory:
-- StreamBuilder: Factory for building streams with consistent config
+--------
+- StreamBuilder: Factory for building streams
+
+Usage:
+------
+    from geofractal.router.streams import StreamBuilder, FeatureVectorStream
+
+    # Direct construction
+    stream = FeatureVectorStream(
+        name='clip_b32',
+        input_dim=512,
+        feature_dim=256,
+    )
+
+    # Via builder
+    builder = StreamBuilder(feature_dim=256)
+    stream = builder.feature_vector('clip_b32', input_dim=512)
+
+    # Forward
+    features = torch.randn(B, 512)
+    output, info = stream(features)  # [B, 1, 256] ready for head
+
+Copyright 2025 AbstractPhil
+Licensed under the Apache License, Version 2.0
 """
 
-from geofractal.router.streams.protocols import StreamProtocol, InputShape
-from geofractal.router.streams.base import BaseStream
-from geofractal.router.streams.vector import (
-    VectorStream,
+from .stream_protocols import StreamProtocol, InputShape
+from .stream_base import BaseStream
+from .stream_vector import (
     FeatureVectorStream,
     TrainableVectorStream,
+    # Legacy aliases
+    VectorStream,
+    FeatureStream,
+    TrainableStream,
 )
-from geofractal.router.streams.sequence import (
+from .stream_sequence import (
     SequenceStream,
     TransformerSequenceStream,
     ConvSequenceStream,
 )
-from geofractal.router.streams.builder import StreamBuilder
+from .stream_frozen import (
+    FrozenEncoderStream,
+    FrozenStream,
+)
+from .stream_builder import StreamBuilder
 
-# Legacy aliases (deprecated - use new names)
-FrozenStream = FeatureVectorStream
-FeatureStream = FeatureVectorStream
-TrainableStream = TrainableVectorStream
 
 __all__ = [
     # Protocols
-    "StreamProtocol",
-    "InputShape",
+    'StreamProtocol',
+    'InputShape',
     # Base
-    "BaseStream",
+    'BaseStream',
     # Vector streams
-    "VectorStream",
-    "FeatureVectorStream",
-    "TrainableVectorStream",
+    'FeatureVectorStream',
+    'TrainableVectorStream',
     # Sequence streams
-    "SequenceStream",
-    "TransformerSequenceStream",
-    "ConvSequenceStream",
+    'SequenceStream',
+    'TransformerSequenceStream',
+    'ConvSequenceStream',
+    # Frozen encoder
+    'FrozenEncoderStream',
     # Factory
-    "StreamBuilder",
-    # Legacy (deprecated)
-    "FrozenStream",
-    "FeatureStream",
-    "TrainableStream",
+    'StreamBuilder',
+    # Legacy aliases (deprecated)
+    'VectorStream',
+    'FeatureStream',
+    'TrainableStream',
+    'FrozenStream',
 ]

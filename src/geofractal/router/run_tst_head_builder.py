@@ -70,11 +70,11 @@ def run_test(name: str, fn):
 def test_headbuilder_basic():
     test_section("1. HeadBuilder Basic")
 
-    from geofractal.router.head.builder import (
+    from geofractal.router.head.head_builder import (
         HeadBuilder, ComposedHead, HeadPreset,
         STANDARD_HEAD, LIGHTWEIGHT_HEAD, HEAVY_HEAD,
     )
-    from geofractal.router.head.components import HeadConfig
+    from geofractal.router.head.head_components import HeadConfig
 
     B, S, D = 4, 16, 256
     config = HeadConfig(feature_dim=D, fingerprint_dim=64, num_heads=8, num_anchors=16, num_routes=4)
@@ -141,8 +141,8 @@ def test_headbuilder_basic():
 def test_headbuilder_fluent():
     test_section("2. HeadBuilder Fluent API")
 
-    from geofractal.router.head.builder import HeadBuilder, ComposedHead
-    from geofractal.router.head.components import (
+    from geofractal.router.head.head_builder import HeadBuilder, ComposedHead
+    from geofractal.router.head.head_components import (
         HeadConfig,
         CantorAttention, StandardAttention,
         TopKRouter, SoftRouter,
@@ -258,8 +258,8 @@ def test_headbuilder_fluent():
 def test_headbuilder_injection():
     test_section("3. HeadBuilder Static Injection")
 
-    from geofractal.router.head.builder import HeadBuilder, ComposedHead
-    from geofractal.router.head.components import (
+    from geofractal.router.head.head_builder import HeadBuilder, ComposedHead
+    from geofractal.router.head.head_components import (
         HeadConfig,
         CantorAttention, StandardAttention,
         TopKRouter,
@@ -359,8 +359,8 @@ def test_headbuilder_injection():
 def test_headbuilder_gradients():
     test_section("4. HeadBuilder Gradient Flow")
 
-    from geofractal.router.head.builder import HeadBuilder
-    from geofractal.router.head.components import (
+    from geofractal.router.head.head_builder import HeadBuilder
+    from geofractal.router.head.head_components import (
         HeadConfig,
         CantorAttention, StandardAttention,
         TopKRouter, SoftRouter,
@@ -526,8 +526,8 @@ def test_headbuilder_gradients():
 def test_composedhead_access():
     test_section("5. ComposedHead Component Access")
 
-    from geofractal.router.head.builder import HeadBuilder, ComposedHead
-    from geofractal.router.head.components import (
+    from geofractal.router.head.head_builder import HeadBuilder, ComposedHead
+    from geofractal.router.head.head_components import (
         HeadConfig,
         CantorAttention,
         TopKRouter,
@@ -567,7 +567,7 @@ def test_composedhead_access():
         B, S, D = 4, 16, 256
         x = torch.randn(B, S, D).to(DEVICE)
 
-        from geofractal.router.head.components import StandardAttention
+        from geofractal.router.head.head_components import StandardAttention
         new_attn = StandardAttention(config).to(DEVICE)
         head.replace_component('attention', new_attn)
 
@@ -595,8 +595,8 @@ def test_composedhead_access():
 def test_prototype_config():
     test_section("6. PrototypeConfig")
 
-    from geofractal.router.factory.prototype import PrototypeConfig
-    from geofractal.router.factory.protocols import StreamSpec, HeadSpec, FusionSpec
+    from geofractal.router.factory.factory_prototype import PrototypeConfig
+    from geofractal.router.factory.factory_protocols import StreamSpec, HeadSpec, FusionSpec
 
     # Basic construction
     def test_basic_config():
@@ -673,8 +673,8 @@ def test_prototype_config():
 def test_assembled_prototype():
     test_section("7. AssembledPrototype")
 
-    from geofractal.router.factory.prototype import AssembledPrototype, PrototypeConfig
-    from geofractal.router.factory.protocols import StreamSpec, HeadSpec, FusionSpec
+    from geofractal.router.factory.factory_prototype import AssembledPrototype, PrototypeConfig
+    from geofractal.router.factory.factory_protocols import StreamSpec, HeadSpec, FusionSpec
 
     B = 4
 
@@ -879,7 +879,7 @@ def test_assembled_prototype():
 def test_lightweight_prototype():
     test_section("8. LightweightPrototype")
 
-    from geofractal.router.factory.prototype import LightweightPrototype
+    from geofractal.router.factory.factory_prototype import LightweightPrototype
 
     B = 4
 
@@ -1033,10 +1033,10 @@ def test_lightweight_prototype():
 def test_factory_functions():
     test_section("9. Factory Functions")
 
-    from geofractal.router.head.builder import (
+    from geofractal.router.head.head_builder import (
         build_standard_head, build_lightweight_head, build_custom_head,
     )
-    from geofractal.router.head.components import (
+    from geofractal.router.head.head_components import (
         HeadConfig,
         StandardAttention,
         SoftRouter,
@@ -1084,10 +1084,10 @@ def test_factory_functions():
 def test_serialization():
     test_section("10. Serialization")
 
-    from geofractal.router.head.builder import HeadBuilder
-    from geofractal.router.head.components import HeadConfig
-    from geofractal.router.factory.prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
-    from geofractal.router.factory.protocols import StreamSpec
+    from geofractal.router.head.head_builder import HeadBuilder
+    from geofractal.router.head.head_components import HeadConfig
+    from geofractal.router.factory.factory_prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
+    from geofractal.router.factory.factory_protocols import StreamSpec
 
     B, S, D = 4, 16, 256
 
@@ -1226,10 +1226,10 @@ def test_serialization():
 def test_training():
     test_section("11. Training Loop")
 
-    from geofractal.router.head.builder import HeadBuilder
-    from geofractal.router.head.components import HeadConfig
-    from geofractal.router.factory.prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
-    from geofractal.router.factory.protocols import StreamSpec
+    from geofractal.router.head.head_builder import HeadBuilder
+    from geofractal.router.head.head_components import HeadConfig
+    from geofractal.router.factory.factory_prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
+    from geofractal.router.factory.factory_protocols import StreamSpec
 
     B = 8
 
@@ -1406,10 +1406,10 @@ def test_training():
 def test_edge_cases():
     test_section("12. Edge Cases")
 
-    from geofractal.router.head.builder import HeadBuilder
-    from geofractal.router.head.components import HeadConfig
-    from geofractal.router.factory.prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
-    from geofractal.router.factory.protocols import StreamSpec, HeadSpec, FusionSpec
+    from geofractal.router.head.head_builder import HeadBuilder
+    from geofractal.router.head.head_components import HeadConfig
+    from geofractal.router.factory.factory_prototype import LightweightPrototype, AssembledPrototype, PrototypeConfig
+    from geofractal.router.factory.factory_protocols import StreamSpec, HeadSpec, FusionSpec
 
     B = 4
 

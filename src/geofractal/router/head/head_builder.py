@@ -27,7 +27,7 @@ import torch.nn.functional as F
 from typing import Type, Optional, Dict, Any, Callable
 from dataclasses import dataclass, field
 
-from .protocols import (
+from .head_protocols import (
     AttentionHead,
     Router,
     AnchorProvider,
@@ -36,7 +36,7 @@ from .protocols import (
     Refinement,
     HeadComponents,
 )
-from .components import (
+from .head_components import (
     HeadConfig,
     CantorAttention,
     StandardAttention,
