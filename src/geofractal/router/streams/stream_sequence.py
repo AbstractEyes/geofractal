@@ -1,9 +1,10 @@
-# streams/sequence.py
 """
+geofractal.router.streams.sequence
+==================================
 Sequence stream implementations.
 
 For [B, S, D] sequence inputs. These pass through naturally
-since heads already expect [B, S, D].
+since the router expects [B, S, D].
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -13,8 +14,8 @@ import torch
 import torch.nn as nn
 from typing import Optional, List
 
-from .stream_base import BaseStream
-from .stream_protocols import InputShape
+from .stream_base import BaseStream, InputShape
+from geofractal.router.head import HeadConfig, ComposedHead
 
 
 class SequenceStream(BaseStream):
@@ -22,6 +23,8 @@ class SequenceStream(BaseStream):
     Stream for [B, S, D] sequence inputs.
 
     Projects to feature_dim if needed, passes through otherwise.
+    No slot expansion needed - sequences already have S > 1.
+
     Use for transformer embeddings, token sequences, time series.
     """
 
@@ -30,9 +33,22 @@ class SequenceStream(BaseStream):
             name: str,
             input_dim: int,
             feature_dim: int,
+            head: Optional[ComposedHead] = None,
+            head_config: Optional[HeadConfig] = None,
+            parent_id: Optional[str] = None,
+            cooperation_group: str = "default",
     ):
-        super().__init__(name, input_dim, feature_dim)
+        super().__init__(
+            name=name,
+            input_dim=input_dim,
+            feature_dim=feature_dim,
+            head=head,
+            head_config=head_config,
+            parent_id=parent_id,
+            cooperation_group=cooperation_group,
+        )
 
+        # Project if dimensions differ
         if input_dim != feature_dim:
             self.projection = nn.Sequential(
                 nn.Linear(input_dim, feature_dim),
@@ -77,8 +93,20 @@ class TransformerSequenceStream(SequenceStream):
             num_layers: int = 2,
             num_heads: int = 8,
             dropout: float = 0.1,
+            head: Optional[ComposedHead] = None,
+            head_config: Optional[HeadConfig] = None,
+            parent_id: Optional[str] = None,
+            cooperation_group: str = "default",
     ):
-        super().__init__(name, input_dim, feature_dim)
+        super().__init__(
+            name=name,
+            input_dim=input_dim,
+            feature_dim=feature_dim,
+            head=head,
+            head_config=head_config,
+            parent_id=parent_id,
+            cooperation_group=cooperation_group,
+        )
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=feature_dim,
@@ -119,8 +147,20 @@ class ConvSequenceStream(SequenceStream):
             feature_dim: int,
             kernel_sizes: List[int] = None,
             dropout: float = 0.1,
+            head: Optional[ComposedHead] = None,
+            head_config: Optional[HeadConfig] = None,
+            parent_id: Optional[str] = None,
+            cooperation_group: str = "default",
     ):
-        super().__init__(name, input_dim, feature_dim)
+        super().__init__(
+            name=name,
+            input_dim=input_dim,
+            feature_dim=feature_dim,
+            head=head,
+            head_config=head_config,
+            parent_id=parent_id,
+            cooperation_group=cooperation_group,
+        )
 
         kernel_sizes = kernel_sizes or [3, 5, 7]
 

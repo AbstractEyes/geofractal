@@ -1,59 +1,38 @@
 """
 geofractal.router.streams
 =========================
-Stream types for router systems.
+Stream types for router collectives.
 
-Streams transform inputs into features suitable for heads:
-- VectorStream: [B, D] → project → [B, D] (head unsqueezes to [B, 1, D])
-- SequenceStream: [B, S, D] → project → [B, S, D]
-- FrozenEncoderStream: [B, C, H, W] → encode → [B, D]
+Streams are complete processing units that:
+1. Encode input (backbone, projection, or identity)
+2. Expand to slots (vectors) or passthrough (sequences)
+3. Route through internal head with mailbox coordination
+4. Return routed output [B, S, D]
 
-NO SLOT EXPANSION. Streams are simple projections.
-The head handles attention/routing, not the stream.
+The stream CONTAINS the head - they are not separate components.
+Mailbox is passed through forward() for inter-stream coordination.
+
+Interface matches original collective:
+    routed, info = stream(input, mailbox, target_fingerprint)
 
 Types:
 ------
 Vector (for [B, D] inputs):
-- FeatureVectorStream: Pre-extracted features, just projection
-- TrainableVectorStream: Trainable backbone + projection
+- FeatureVectorStream: Pre-extracted features → slot expansion
+- TrainableVectorStream: Trainable backbone → slot expansion
+- FrozenEncoderStream: Frozen pretrained encoder → slot expansion
 
 Sequence (for [B, S, D] inputs):
-- SequenceStream: Basic projection
-- TransformerSequenceStream: Transformer encoder + projection
-- ConvSequenceStream: Multi-scale conv + projection
-
-Frozen (for images):
-- FrozenEncoderStream: Frozen pretrained encoder (CLIP, DINO, etc.)
-
-Factory:
---------
-- StreamBuilder: Factory for building streams
-
-Usage:
-------
-    from geofractal.router.streams import StreamBuilder, FeatureVectorStream
-
-    # Direct construction
-    stream = FeatureVectorStream(
-        name='clip_b32',
-        input_dim=512,
-        feature_dim=256,
-    )
-
-    # Via builder
-    builder = StreamBuilder(feature_dim=256)
-    stream = builder.feature_vector('clip_b32', input_dim=512)
-
-    # Forward
-    features = torch.randn(B, 512)
-    output, info = stream(features)  # [B, 1, 256] ready for head
+- SequenceStream: Basic projection → passthrough
+- TransformerSequenceStream: Transformer encoder → passthrough
+- ConvSequenceStream: Multi-scale conv → passthrough
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
 
-from .stream_protocols import StreamProtocol, InputShape
-from .stream_base import BaseStream
+from .stream_base import BaseStream, InputShape
+
 from .stream_vector import (
     FeatureVectorStream,
     TrainableVectorStream,
@@ -62,24 +41,25 @@ from .stream_vector import (
     FeatureStream,
     TrainableStream,
 )
+
 from .stream_sequence import (
     SequenceStream,
     TransformerSequenceStream,
     ConvSequenceStream,
 )
+
 from .stream_frozen import (
     FrozenEncoderStream,
     FrozenStream,
 )
+
 from .stream_builder import StreamBuilder
 
 
 __all__ = [
-    # Protocols
-    'StreamProtocol',
-    'InputShape',
     # Base
     'BaseStream',
+    'InputShape',
     # Vector streams
     'FeatureVectorStream',
     'TrainableVectorStream',
@@ -89,7 +69,7 @@ __all__ = [
     'ConvSequenceStream',
     # Frozen encoder
     'FrozenEncoderStream',
-    # Factory
+    # Builder
     'StreamBuilder',
     # Legacy aliases (deprecated)
     'VectorStream',

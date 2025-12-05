@@ -185,15 +185,15 @@ geofractal/router/
 ├── run_tst_seq.py
 ├── factory/
 │   ├── __init__.py
-│   ├── builder.py
-│   ├── protocols.py
-│   ├── prototype.py
-│   └── registry.py
+│   ├── factory_builder.py
+│   ├── factory_protocols.py
+│   ├── factory_prototype.py
+│   └── factory_registry.py
 ├── fusion/
 │   ├── __init__.py
-│   ├── builder.py
-│   ├── methods.py
-│   └── protocols.py
+│   ├── fusion_builder.py
+│   ├── fusion_methods.py
+│   └── fusion_protocols.py
 ├── getting_started/
 │   ├── ARCHITECTURE.md
 │   ├── DEVELOPMENT.md
@@ -202,19 +202,19 @@ geofractal/router/
 │   └── PROTOCOL.md
 ├── head/
 │   ├── __init__.py
-│   ├── builder.py
-│   ├── components.py
-│   └── protocols.py
+│   ├── head_builder.py
+│   ├── head_components.py
+│   └── head_protocols.py
 ├── streams/
 │   ├── __init__.py
-│   ├── base.py
-│   ├── builder.py
-│   ├── feature.py
-│   ├── frozen.py
-│   ├── protocols.py
-│   ├── sequence.py
-│   ├── trainable.py
-│   └── vector.py
+│   ├── stream_base.py
+│   ├── stream_builder.py
+│   ├── stream_feature.py
+│   ├── stream_frozen.py
+│   ├── stream_protocols.py
+│   ├── stream_sequence.py
+│   ├── stream_trainable.py
+│   └── stream_vector.py
 ```
 
 ### Head Components
