@@ -31,6 +31,7 @@ from datetime import datetime
 import logging
 
 from geofractal.train_base import TrainBase
+from geovocab2.shapes.factory.simplex_factory import SimplexFactory
 
 
 class TrainEpoch(TrainBase):
@@ -877,7 +878,7 @@ if __name__ == "__main__":
     device_config = TrainEpochConfig(
         name="device_test",
         uid="c.train.device",
-        device="cpu",
+        device="mps",
         num_epochs=1,
         checkpoint_dir="checkpoints/device_test"
     )

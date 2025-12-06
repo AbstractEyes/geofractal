@@ -119,7 +119,7 @@ if __name__ == "__main__":
         weight_decay=1e-5,
         grad_clip=1.0,
         checkpoint_dir="./checkpoints/simplex",
-        device="cuda",
+        device="mps",
         val_interval=5,
         save_interval=50
     )
