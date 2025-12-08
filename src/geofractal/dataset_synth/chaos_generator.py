@@ -131,7 +131,7 @@ class BiasHook(nn.Module if HAS_TORCH else object):
             }
             self._initialized = True
 
-    def _init_parameters(self, input_dim: int):
+    def _init_parameters(self, input_dim: int, device: str = "cpu"):
         """Initialize parameters for given dimension."""
         if self._initialized and self.input_dim == input_dim:
             return
@@ -141,40 +141,40 @@ class BiasHook(nn.Module if HAS_TORCH else object):
         if HAS_TORCH:
             # Core learnable parameters (per-dimension)
             self.scale = nn.Parameter(
-                torch.full((input_dim,), self._init_scale),
+                torch.full((input_dim,), self._init_scale, device=device),
                 requires_grad=self._learnable_scale
             )
             self.shift = nn.Parameter(
-                torch.full((input_dim,), self._init_shift),
+                torch.full((input_dim,), self._init_shift, device=device),
                 requires_grad=self._learnable_shift
             )
             self.amplitude = nn.Parameter(
-                torch.full((input_dim,), self._init_amplitude),
+                torch.full((input_dim,), self._init_amplitude, device=device),
                 requires_grad=self._learnable_amplitude
             )
             self.offset = nn.Parameter(
-                torch.full((input_dim,), self._init_offset),
+                torch.full((input_dim,), self._init_offset, device=device),
                 requires_grad=self._learnable_offset
             )
 
             # Curve-specific parameters
             if self.curve_type == CurveType.POLYNOMIAL:
                 self.poly_coeffs = nn.Parameter(
-                    torch.randn(input_dim, self.polynomial_degree + 1) * 0.1
+                    torch.randn(input_dim, self.polynomial_degree + 1, device=device) * 0.1
                 )
             elif self.curve_type == CurveType.SPLINE:
                 self.spline_points = nn.Parameter(
-                    torch.linspace(-1, 1, self.spline_knots).unsqueeze(0).expand(input_dim, -1).clone()
+                    torch.linspace(-1, 1, self.spline_knots, device=device).unsqueeze(0).expand(input_dim, -1).clone()
                 )
                 self.spline_values = nn.Parameter(
-                    torch.zeros(input_dim, self.spline_knots)
+                    torch.zeros(input_dim, self.spline_knots, device=device)
                 )
             elif self.curve_type == CurveType.RATIONAL:
-                self.rational_num = nn.Parameter(torch.randn(input_dim, 3) * 0.1)
-                self.rational_den = nn.Parameter(torch.ones(input_dim, 3) * 0.1)
+                self.rational_num = nn.Parameter(torch.randn(input_dim, 3, device=device) * 0.1)
+                self.rational_den = nn.Parameter(torch.ones(input_dim, 3, device=device) * 0.1)
             elif self.curve_type == CurveType.SINUSOIDAL:
-                self.frequency = nn.Parameter(torch.ones(input_dim))
-                self.phase = nn.Parameter(torch.zeros(input_dim))
+                self.frequency = nn.Parameter(torch.ones(input_dim, device=device))
+                self.phase = nn.Parameter(torch.zeros(input_dim, device=device))
         else:
             self._params = {
                 'scale': np.full(input_dim, self._init_scale),
@@ -190,17 +190,19 @@ class BiasHook(nn.Module if HAS_TORCH else object):
         if not HAS_TORCH:
             raise RuntimeError("PyTorch required for forward()")
 
-        # Lazy initialization based on actual input dimension
+        # Lazy initialization based on actual input dimension and device
         actual_dim = x.shape[-1]
+        device = x.device
+
         if not self._initialized:
-            self._init_parameters(actual_dim)
+            self._init_parameters(actual_dim, device=device)
         elif self.input_dim != actual_dim:
             # Re-initialize for new dimension (warning: loses learned weights)
             warnings.warn(
                 f"BiasHook input_dim changed from {self.input_dim} to {actual_dim}. "
                 f"Re-initializing parameters."
             )
-            self._init_parameters(actual_dim)
+            self._init_parameters(actual_dim, device=device)
 
         # Apply scale and shift
         z = x * self.scale + self.shift
@@ -275,8 +277,8 @@ class BiasHook(nn.Module if HAS_TORCH else object):
                 self.input_dim = actual_dim
                 self._initialized = True
             else:
-                # Initialize torch params then extract
-                self._init_parameters(actual_dim)
+                # Initialize torch params then extract (CPU for numpy inference)
+                self._init_parameters(actual_dim, device="cpu")
 
         if HAS_TORCH and self._initialized:
             params = {
@@ -345,9 +347,9 @@ class BiasHook(nn.Module if HAS_TORCH else object):
         if input_dim is None:
             return
 
-        # Initialize parameters if needed
+        # Initialize parameters if needed (CPU, will be moved by .to(device))
         if not self._initialized:
-            self._init_parameters(input_dim)
+            self._init_parameters(input_dim, device="cpu")
 
         if HAS_TORCH:
             with torch.no_grad():
