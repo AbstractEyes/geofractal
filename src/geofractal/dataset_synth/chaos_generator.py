@@ -613,7 +613,7 @@ class ChaosFactory(nn.Module if HAS_TORCH else object):
         # Training state
         self._step = 0
         self._baseline_captured = False
-        self._baseline_activations: Dict[str, torch.Tensor] = {}
+        self._baseline_stats: Dict[str, Dict[str, torch.Tensor]] = {}
 
     # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     # Hook Registration (for classifier integration)
@@ -698,13 +698,18 @@ class ChaosFactory(nn.Module if HAS_TORCH else object):
 
     def capture_baseline(self, activations: Dict[str, "torch.Tensor"]):
         """
-        Capture baseline activations (without chaos) for counter-bias learning.
+        Capture baseline activation STATISTICS (without chaos) for counter-bias learning.
 
+        Stores mean and std per feature dimension, not raw activations.
         Call this once before training with a representative batch.
         """
-        self._baseline_activations = {
-            k: v.detach().clone() for k, v in activations.items()
-        }
+        self._baseline_stats = {}
+        for k, v in activations.items():
+            # Store statistics, not raw tensors (batch-size independent)
+            self._baseline_stats[k] = {
+                'mean': v.mean(dim=0).detach(),  # [feature_dims]
+                'std': v.std(dim=0).detach() + 1e-6,
+            }
         self._baseline_captured = True
 
     def compute_chaos_loss(
@@ -716,11 +721,11 @@ class ChaosFactory(nn.Module if HAS_TORCH else object):
         Compute loss for learning counter-bias.
 
         The goal: learn bias curves that produce controlled divergence
-        from baseline activations.
+        from baseline activation statistics.
 
         Args:
             current_activations: Dict of hook_point -> activations
-            target_divergence: Desired L2 distance from baseline
+            target_divergence: Desired normalized distance from baseline
 
         Returns:
             Loss tensor for optimization
@@ -731,13 +736,20 @@ class ChaosFactory(nn.Module if HAS_TORCH else object):
         total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
 
         for hook_point, current in current_activations.items():
-            if hook_point not in self._baseline_activations:
+            if hook_point not in self._baseline_stats:
                 continue
 
-            baseline = self._baseline_activations[hook_point]
+            baseline = self._baseline_stats[hook_point]
 
-            # Compute actual divergence
-            divergence = torch.norm(current - baseline, dim=-1).mean()
+            # Compute statistics of current batch
+            current_mean = current.mean(dim=0)
+            current_std = current.std(dim=0) + 1e-6
+
+            # Divergence = normalized difference in mean + std ratio
+            mean_div = ((current_mean - baseline['mean']) / baseline['std']).pow(2).mean()
+            std_div = ((current_std / baseline['std']) - 1).pow(2).mean()
+
+            divergence = (mean_div + std_div).sqrt()
 
             # Loss: penalize deviation from target divergence
             divergence_loss = (divergence - target_divergence) ** 2
