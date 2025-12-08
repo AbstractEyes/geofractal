@@ -725,7 +725,7 @@ class ChaosFactory(nn.Module if HAS_TORCH else object):
 
         Args:
             current_activations: Dict of hook_point -> activations
-            target_divergence: Desired normalized distance from baseline
+            target_divergence: Desired divergence (in activation units)
 
         Returns:
             Loss tensor for optimization
@@ -743,16 +743,13 @@ class ChaosFactory(nn.Module if HAS_TORCH else object):
 
             # Compute statistics of current batch
             current_mean = current.mean(dim=0)
-            current_std = current.std(dim=0) + 1e-6
 
-            # Divergence = normalized difference in mean + std ratio
-            mean_div = ((current_mean - baseline['mean']) / baseline['std']).pow(2).mean()
-            std_div = ((current_std / baseline['std']) - 1).pow(2).mean()
-
-            divergence = (mean_div + std_div).sqrt()
+            # Simple MSE between means (no normalization = no explosion)
+            mean_diff = (current_mean - baseline['mean']).pow(2).mean().sqrt()
 
             # Loss: penalize deviation from target divergence
-            divergence_loss = (divergence - target_divergence) ** 2
+            # We want SOME divergence (target), but not too much or too little
+            divergence_loss = (mean_diff - target_divergence) ** 2
 
             total_loss = total_loss + divergence_loss
 
