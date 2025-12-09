@@ -155,6 +155,8 @@ class BaseRouter(nn.Module, ABC):
         If component is not nn.Module, it is stored in auxiliary dict
         without parameter tracking.
 
+        If component is BaseComponent, lifecycle hooks are called.
+
         Args:
             name: Name to register component under.
             component: Any object. nn.Module recommended.
@@ -168,6 +170,39 @@ class BaseRouter(nn.Module, ABC):
             self.components[name] = component
         else:
             self.objects[name] = component
+
+        # Lifecycle hooks for BaseComponent
+        if hasattr(component, 'parent') and hasattr(component, 'on_attach'):
+            component.parent = self
+            component.on_attach(self)
+
+    def detach(self, name: str) -> Optional[Any]:
+        """
+        Remove and return a component.
+
+        If component is BaseComponent, lifecycle hooks are called.
+
+        Args:
+            name: Component name.
+
+        Returns:
+            The removed component, or None if not found.
+        """
+        component = None
+
+        if name in self.components:
+            component = self.components[name]
+            del self.components[name]
+        elif name in self.objects:
+            component = self.objects.pop(name, None)
+
+        # Lifecycle hooks for BaseComponent
+        if component is not None:
+            if hasattr(component, 'on_detach') and hasattr(component, 'parent'):
+                component.on_detach()
+                component.parent = None
+
+        return component
 
     def _validate_component(self, name: str, component: nn.Module) -> None:
         """
@@ -220,22 +255,6 @@ class BaseRouter(nn.Module, ABC):
             True if component exists in either storage.
         """
         return name in self.components or name in self.objects
-
-    def detach(self, name: str) -> Optional[Any]:
-        """
-        Remove and return a component.
-
-        Args:
-            name: Component name.
-
-        Returns:
-            The removed component, or None if not found.
-        """
-        if name in self.components:
-            component = self.components[name]
-            del self.components[name]
-            return component
-        return self.objects.pop(name, None)
 
     def reset(self) -> None:
         """
