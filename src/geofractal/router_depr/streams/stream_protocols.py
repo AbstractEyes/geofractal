@@ -4,7 +4,6 @@ geofractal.router.factory.protocols
 Abstract protocols for router prototypes.
 
 Updated to support new stream architecture with input shapes.
-FIXED: Removed dead num_slots config.
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
