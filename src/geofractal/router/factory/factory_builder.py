@@ -41,8 +41,8 @@ def _imagenet_preset() -> PrototypePreset:
             num_classes=1000,
             prototype_name="imagenet_gfr",
             stream_specs=[
-                StreamSpec.frozen_clip("clip_b32", "openai/clip-vit-base-patch32"),
-                StreamSpec.frozen_clip("clip_l14", "openai/clip-vit-large-patch14"),
+                StreamSpec.frozen_encoder("clip_b32", "openai/clip-vit-base-patch32"),
+                StreamSpec.frozen_encoder("clip_l14", "openai/clip-vit-large-patch14"),
             ],
             head_spec=HeadSpec.standard(feature_dim=512),
             fusion_spec=FusionSpec.standard(output_dim=512),
@@ -60,7 +60,7 @@ def _cifar_preset() -> PrototypePreset:
             num_classes=100,
             prototype_name="cifar_gfr",
             stream_specs=[
-                StreamSpec.frozen_clip("clip_b32", "openai/clip-vit-base-patch32"),
+                StreamSpec.frozen_encoder("clip_b32", "openai/clip-vit-base-patch32"),
             ],
             head_spec=HeadSpec.standard(feature_dim=512),
             fusion_spec=FusionSpec.standard(output_dim=512),
@@ -105,8 +105,8 @@ def _multimodal_preset() -> PrototypePreset:
             num_classes=1000,
             prototype_name="multimodal_gfr",
             stream_specs=[
-                StreamSpec.frozen_clip("vision_b32", "openai/clip-vit-base-patch32"),
-                StreamSpec.frozen_clip("vision_l14", "openai/clip-vit-large-patch14"),
+                StreamSpec.frozen_encoder("vision_b32", "openai/clip-vit-base-patch32"),
+                StreamSpec.frozen_encoder("vision_l14", "openai/clip-vit-large-patch14"),
             ],
             head_spec=HeadSpec.standard(feature_dim=512),
             fusion_spec=FusionSpec.attention(output_dim=512, num_heads=8),
@@ -124,8 +124,8 @@ def _research_preset() -> PrototypePreset:
             num_classes=1000,
             prototype_name="research_gfr",
             stream_specs=[
-                StreamSpec.frozen_clip("clip_b32", "openai/clip-vit-base-patch32"),
-                StreamSpec.frozen_clip("clip_l14", "openai/clip-vit-large-patch14"),
+                StreamSpec.frozen_encoder("clip_b32", "openai/clip-vit-base-patch32"),
+                StreamSpec.frozen_encoder("clip_l14", "openai/clip-vit-large-patch14"),
             ],
             head_spec=HeadSpec(
                 feature_dim=512,
