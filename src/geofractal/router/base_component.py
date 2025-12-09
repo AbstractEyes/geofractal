@@ -339,7 +339,7 @@ class BaseComponent(ABC):
 # =============================================================================
 
 class ConfigComponent(BaseComponent):
-    """Simple config holder for testing."""
+    """Simple config holder for testing, not for production use."""
 
     def __init__(self, name: str, **kwargs):
         super().__init__(name)
@@ -362,7 +362,7 @@ class ConfigComponent(BaseComponent):
 
 
 class StateComponent(BaseComponent):
-    """Simple state holder for testing."""
+    """Simple state holder for testing, not for production use."""
 
     def __init__(self, name: str):
         super().__init__(name)
