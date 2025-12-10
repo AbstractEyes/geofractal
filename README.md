@@ -32,13 +32,18 @@ The collective achieves what no individual can.
 
 ## Core Concepts
 
-| Concept | What It Is | Key Insight |
-|---------|------------|-------------|
-| **Component** | Attachable unit with identity and lifecycle | The building block - everything is a component |
-| **Tower** | Self-encapsulated processing unit | Produces an *opinion*, not just an output |
-| **Address** | Geometric identity on a manifold | Fingerprints enable similarity/distance routing |
-| **NotifierRouter** | Communication backbone | Routes messages based on geometry |
-| **Fusion** | Opinion aggregation | Where emergence happens |
+| Concept | What It Is                                               | Key Insight |
+|---------|----------------------------------------------------------|-------------|
+| **Compiles** | Device affinity management capable of torch compilation. | Multi-GPU deployment made easy |
+| **Router** | Coordination architecture                                | Collective intelligence through geometric routing |
+| **Tower** | Self-encapsulated processing unit                        | Produces an *opinion*, not just an output |
+| **NotifierRouter** | Communication backbone                                   | Routes messages based on geometry |
+| **Collective** | Multi-tower ensemble                                     | Triangulates truth from diverse perspectives |
+| **Component** | Attachable unit with identity and lifecycle              | The building block - everything is a component |
+| **Address** | Geometric identity on a manifold                         | Fingerprints enable similarity/distance routing |
+| **Fusion** | Opinion aggregation                                      | Where emergence happens |
+
+More routers to come.
 
 ---
 
@@ -376,7 +381,8 @@ Individual towers don't need to be accurate. They need to see *differently*. The
 **Not ideal:**
 - Single model already solves the task well
 - Inputs are homogeneous (no diversity to exploit)
-- Latency-critical inference (collective adds overhead)
+- Latency-critical inference (collective adds minimal overhead)
+- - Correctly stacked towers don't increase latency significantly, but very low-latency scenarios may or may not benefit.
 
 ---
 
