@@ -1,6 +1,7 @@
 """
 Multi-Modal VAE with Adaptive Cantor Fusion
 ============================================
+geofractal.model.vae.vae_lyra_v2
 
 Cantor-based fusion with learned visibility (alpha) and capacity (beta):
 - Alpha: Learned visibility controlling latent space usage (tied to KL divergence)
