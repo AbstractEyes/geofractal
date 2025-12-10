@@ -35,7 +35,7 @@ Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
 
-from typing import Optional, Tuple, Literal, Dict, Union
+from typing import Optional, Tuple, Literal, Dict, Union, List
 from dataclasses import dataclass, field
 import math
 
@@ -72,6 +72,7 @@ class WormholeAttentionConfig:
     cantor_alpha: float = 0.5
     cantor_tau: float = 0.25
     learnable_cantor_bias: bool = True
+    hierarchical_weights: bool = True  # Use 0.5^k weighting (recommended)
 
     # Local mode parameters
     local_window: int = 3
@@ -96,7 +97,21 @@ class CantorRoutingBias(nn.Module):
     Computes Cantor-based routing bias using branch path alignment.
 
     This replaces the naive Cantor pairing distance with proper
-    ternary decomposition and branch alignment.
+    ternary decomposition and hierarchically-weighted branch alignment.
+
+    Hierarchical Weighting:
+        Level k contributes weight 0.5^k to alignment score.
+        This matches Devil's Staircase semantics where coarse levels
+        (L/M/R thirds) matter more than fine structure.
+
+        - Match at level 1 (coarse): +0.5
+        - Match at level 2: +0.25
+        - Match at level 3: +0.125
+        - etc.
+
+        Two positions matching at coarse levels share "routing highways"
+        enabling wormhole teleportation. Fine matches only indicate
+        local proximity.
     """
 
     def __init__(
@@ -106,6 +121,7 @@ class CantorRoutingBias(nn.Module):
         alpha: float = 0.5,
         tau: float = 0.25,
         grid_aware: bool = True,
+        hierarchical_weights: bool = True,
     ):
         super().__init__()
 
@@ -114,7 +130,13 @@ class CantorRoutingBias(nn.Module):
         self.alpha = alpha
         self.tau = tau
         self.grid_aware = grid_aware
+        self.hierarchical_weights = hierarchical_weights
         self.grid_size = int(math.sqrt(num_positions))
+
+        # Precompute level weights: [0.5, 0.25, 0.125, ...]
+        # These match Devil's Staircase accumulation: C(x) = Σ bit_k × 0.5^k
+        level_weights = 0.5 ** torch.arange(1, levels + 1, dtype=torch.float32)
+        self.register_buffer('_level_weights', level_weights)
 
         # Precompute routing bias
         bias = self._compute_cantor_alignment_bias()
@@ -122,7 +144,7 @@ class CantorRoutingBias(nn.Module):
 
     def _compute_branch_paths(self, positions: Tensor) -> Tensor:
         """
-        Compute branch paths for normalized positions.
+        Compute branch paths for normalized positions (vectorized).
 
         Args:
             positions: Normalized positions in [0, 1], shape (P,)
@@ -131,65 +153,66 @@ class CantorRoutingBias(nn.Module):
             Branch paths, shape (P, levels) with values in {0, 1, 2}
         """
         P = positions.shape[0]
+        device = positions.device
         x = positions.clamp(1e-6, 1.0 - 1e-6).double()
 
-        branch_paths = []
-        centers = torch.tensor([0.5, 1.5, 2.5], dtype=torch.float64, device=x.device)
+        centers = torch.tensor([0.5, 1.5, 2.5], dtype=torch.float64, device=device)
 
-        for k in range(1, self.levels + 1):
-            scale = 3 ** k
-            y = (x * scale) % 3
+        # Vectorized across all levels
+        # scales[k] = 3^(k+1) for k in [0, levels-1]
+        scales = (3.0 ** torch.arange(1, self.levels + 1, dtype=torch.float64, device=device))
 
-            # Soft assignment
-            d2 = (y.unsqueeze(-1) - centers) ** 2
-            logits = -d2 / self.tau
-            p = F.softmax(logits, dim=-1)
+        # x: (P,) -> (P, 1) for broadcasting with scales (levels,)
+        # y: (P, levels) - position within ternary cell at each level
+        y = (x.unsqueeze(-1) * scales) % 3  # (P, levels)
 
-            # Hard branch assignment
-            branch_paths.append(p.argmax(dim=-1))
+        # Squared distance to centers: (P, levels, 3)
+        d2 = (y.unsqueeze(-1) - centers) ** 2
 
-        return torch.stack(branch_paths, dim=-1)  # (P, levels)
+        # Soft assignment -> hard branch
+        logits = -d2 / self.tau
+        branch_paths = logits.argmax(dim=-1)  # (P, levels)
+
+        return branch_paths.int()
 
     def _compute_cantor_alignment_bias(self) -> Tensor:
         """
-        Compute pairwise alignment-based routing bias.
+        Compute pairwise alignment-based routing bias (fully vectorized).
 
-        Higher alignment = stronger routing affinity.
+        Uses hierarchical weighting where coarse levels contribute more.
         """
         P = self.num_positions
 
         if self.grid_aware and self.grid_size ** 2 == P:
-            # 2D grid positions
+            # 2D grid positions -> Cantor pairing for 2D → 1D
             x = torch.arange(P) % self.grid_size
             y = torch.arange(P) // self.grid_size
-
-            # Cantor pairing for 2D → 1D
             z = ((x + y) * (x + y + 1)) // 2 + y
             positions = z.float() / z.max().clamp(min=1)
         else:
             # Linear positions
             positions = torch.linspace(0, 1, P)
 
-        # Compute branch paths
-        branch_paths = self._compute_branch_paths(positions)  # (P, levels)
+        # Compute branch paths: (P, levels)
+        branch_paths = self._compute_branch_paths(positions)
 
-        # Compute pairwise alignment
-        # alignment[i,j] = number of matching branch levels
-        alignment = torch.zeros(P, P)
-        for i in range(P):
-            for j in range(P):
-                alignment[i, j] = (branch_paths[i] == branch_paths[j]).sum().float()
+        # Vectorized pairwise alignment
+        # matches[i, j, k] = True if position i and j match at level k
+        matches = (branch_paths.unsqueeze(1) == branch_paths.unsqueeze(0))  # (P, P, levels)
 
-        # Normalize to [0, 1]
-        alignment = alignment / self.levels
-
-        # Convert to affinity (higher alignment = higher affinity)
-        affinity = alignment.clone()
+        if self.hierarchical_weights:
+            # Hierarchical weighting: coarse levels matter more
+            # alignment[i,j] = Σ_k matches[i,j,k] × 0.5^k
+            alignment = (matches.float() * self._level_weights).sum(dim=-1)  # (P, P)
+            # Max possible alignment ≈ 0.96875 (sum of geometric series)
+        else:
+            # Raw count (all levels equal weight)
+            alignment = matches.sum(dim=-1).float()  # (P, P)
 
         # Mask self-connections
-        affinity.fill_diagonal_(-1e9)
+        alignment.fill_diagonal_(-1e9)
 
-        return affinity
+        return alignment
 
     def forward(self, P: Optional[int] = None) -> Tensor:
         """
@@ -204,21 +227,23 @@ class CantorRoutingBias(nn.Module):
         if P is None or P == self.num_positions:
             return self._base_bias
 
-        # Truncate or recompute
+        # Truncate
         if P < self.num_positions:
             return self._base_bias[:P, :P]
 
-        # Need to recompute for larger P
-        # (This is expensive - should precompute for max expected P)
+        # Recompute for larger P (vectorized)
         positions = torch.linspace(0, 1, P, device=self._base_bias.device)
         branch_paths = self._compute_branch_paths(positions)
 
-        alignment = torch.zeros(P, P, device=self._base_bias.device)
-        for i in range(P):
-            for j in range(P):
-                alignment[i, j] = (branch_paths[i] == branch_paths[j]).sum().float()
+        # Vectorized pairwise alignment
+        matches = (branch_paths.unsqueeze(1) == branch_paths.unsqueeze(0))  # (P, P, levels)
 
-        alignment = alignment / self.levels
+        if self.hierarchical_weights:
+            level_weights = self._level_weights.to(self._base_bias.device)
+            alignment = (matches.float() * level_weights).sum(dim=-1)
+        else:
+            alignment = matches.sum(dim=-1).float()
+
         alignment.fill_diagonal_(-1e9)
 
         return alignment
@@ -382,6 +407,7 @@ class WormholeAttentionComponent(TorchComponent):
             levels=config.cantor_levels,
             alpha=config.cantor_alpha,
             tau=config.cantor_tau,
+            hierarchical_weights=config.hierarchical_weights,
         )
 
         # Learnable Cantor scale
@@ -707,17 +733,98 @@ class WormholeAttentionComponent(TorchComponent):
             'num_wormholes': torch.tensor(K, dtype=torch.float32),
         }
 
+    def _set_param_grad(self, param_names: List[str], requires_grad: bool) -> None:
+        """Enable or disable gradients for named parameters."""
+        for name in param_names:
+            param = getattr(self, name, None)
+            if param is not None and isinstance(param, nn.Parameter):
+                param.requires_grad = requires_grad
+
     def set_mode(self, mode: Literal['learned', 'cantor', 'hybrid', 'local']) -> None:
         """
         Switch routing mode at runtime.
 
-        All components are created at init, so any mode switch is valid.
+        Disables gradients for parameters not used in the new mode:
+            - 'learned': Uses router Q/K projections, no Cantor bias
+            - 'cantor': Uses Cantor bias, no router Q/K projections
+            - 'hybrid': Uses everything
+            - 'local': Uses router Q/K projections + local mask, no Cantor bias
         """
         if mode not in ('learned', 'cantor', 'hybrid', 'local'):
             raise ValueError(f"Invalid mode: {mode}. Must be one of: learned, cantor, hybrid, local")
 
+        # Parameters used by each mode
+        router_proj_params = ['route_q_proj', 'route_k_proj']
+        cantor_params = ['cantor_scale']
+
+        if mode == 'learned':
+            # Enable router projections, disable Cantor
+            for name in router_proj_params:
+                module = getattr(self, name)
+                for p in module.parameters():
+                    p.requires_grad = True
+            if isinstance(self.cantor_scale, nn.Parameter):
+                self.cantor_scale.requires_grad = False
+
+        elif mode == 'cantor':
+            # Disable router projections, enable Cantor
+            for name in router_proj_params:
+                module = getattr(self, name)
+                for p in module.parameters():
+                    p.requires_grad = False
+            if isinstance(self.cantor_scale, nn.Parameter):
+                self.cantor_scale.requires_grad = True
+
+        elif mode == 'hybrid':
+            # Enable everything
+            for name in router_proj_params:
+                module = getattr(self, name)
+                for p in module.parameters():
+                    p.requires_grad = True
+            if isinstance(self.cantor_scale, nn.Parameter):
+                self.cantor_scale.requires_grad = True
+
+        elif mode == 'local':
+            # Enable router projections, disable Cantor
+            for name in router_proj_params:
+                module = getattr(self, name)
+                for p in module.parameters():
+                    p.requires_grad = True
+            if isinstance(self.cantor_scale, nn.Parameter):
+                self.cantor_scale.requires_grad = False
+
         self.mode = mode
         self.config.mode = mode
+
+    def get_active_params(self) -> Dict[str, int]:
+        """Get count of active (requires_grad=True) parameters by component."""
+        counts = {}
+
+        # Router projections
+        router_params = sum(
+            p.numel() for p in self.route_q_proj.parameters() if p.requires_grad
+        ) + sum(
+            p.numel() for p in self.route_k_proj.parameters() if p.requires_grad
+        )
+        counts['router_projections'] = router_params
+
+        # Cantor scale
+        if isinstance(self.cantor_scale, nn.Parameter) and self.cantor_scale.requires_grad:
+            counts['cantor_scale'] = 1
+        else:
+            counts['cantor_scale'] = 0
+
+        # Attention (always active)
+        counts['attention'] = sum(
+            p.numel() for p in self.qkv_proj.parameters() if p.requires_grad
+        ) + sum(
+            p.numel() for p in self.o_proj.parameters() if p.requires_grad
+        )
+
+        counts['total_active'] = sum(counts.values())
+        counts['total_all'] = sum(p.numel() for p in self.parameters())
+
+        return counts
 
     def set_dropout_modules(
         self,
@@ -804,16 +911,43 @@ if __name__ == '__main__':
         levels=5,
         alpha=0.5,
         tau=0.25,
+        hierarchical_weights=True,
     )
 
     bias = cantor_bias()
     print(f"Cantor routing bias shape: {bias.shape}")
     print(f"Bias range (excluding diagonal): [{bias[bias > -1e8].min():.4f}, {bias[bias > -1e8].max():.4f}]")
 
-    # Show sample alignments
+    # Show sample alignments with hierarchical weighting
     print(f"\nSample alignments (position 0 to others):")
+    print(f"  Hierarchical weights: [0.5, 0.25, 0.125, 0.0625, 0.03125]")
+    print(f"  Max possible: 0.96875 (sum of geometric series)")
     for i in [1, 8, 16, 32, 63]:
         print(f"  pos 0 -> pos {i}: alignment = {bias[0, i].item():.4f}")
+
+    # Compare hierarchical vs raw
+    cantor_bias_raw = CantorRoutingBias(
+        num_positions=64,
+        levels=5,
+        hierarchical_weights=False,
+    )
+    bias_raw = cantor_bias_raw()
+    print(f"\nRaw (non-hierarchical) range: [{bias_raw[bias_raw > -1e8].min():.4f}, {bias_raw[bias_raw > -1e8].max():.4f}]")
+
+    # =========================================================================
+    section("HIERARCHICAL WEIGHTING VERIFICATION")
+    # =========================================================================
+
+    print("Devil's Staircase weighting: C(x) = Σ bit_k × 0.5^k")
+    print("\nLevel weights:")
+    for k in range(1, 6):
+        print(f"  Level {k}: weight = {0.5**k:.5f}")
+
+    print(f"\nInterpretation:")
+    print(f"  - Match at level 1 (coarse L/M/R): contributes 0.5 to alignment")
+    print(f"  - Match at level 5 (fine): contributes only 0.03125")
+    print(f"  - Coarse matches enable 'routing highways' (wormholes)")
+    print(f"  - Fine matches indicate local structure only")
 
     # =========================================================================
     section("LEGACY CANTOR BIAS (Scalar Distance)")
@@ -825,10 +959,17 @@ if __name__ == '__main__':
     print(f"Legacy bias range: [{legacy[legacy > -1e8].min():.4f}, {legacy[legacy > -1e8].max():.4f}]")
 
     # Compare
-    diff = (bias - legacy).abs()
-    print(f"\nDifference between alignment-based and distance-based:")
-    print(f"  Mean diff: {diff[diff < 1e8].mean():.4f}")
-    print(f"  Max diff: {diff[diff < 1e8].max():.4f}")
+    # Note: different scales now, so we normalize for comparison
+    bias_norm = bias.clone()
+    bias_norm[bias_norm > -1e8] = bias_norm[bias_norm > -1e8] / bias_norm[bias_norm > -1e8].max()
+    legacy_norm = legacy.clone()
+    legacy_norm[legacy_norm > -1e8] = legacy_norm[legacy_norm > -1e8] / legacy_norm[legacy_norm > -1e8].max()
+
+    diff = (bias_norm - legacy_norm).abs()
+    print(f"\nDifference between hierarchical alignment and scalar distance:")
+    print(f"  Mean diff (normalized): {diff[diff < 1e8].mean():.4f}")
+    print(f"  Max diff (normalized): {diff[diff < 1e8].max():.4f}")
+    print(f"  ⚠️  These are fundamentally different metrics!")
 
     # =========================================================================
     section("WORMHOLE ATTENTION - ALL MODES")
@@ -938,13 +1079,26 @@ if __name__ == '__main__':
 
     x = torch.randn(2, 64, 256, device=device)
 
+    print("Mode switching with parameter management:")
+    print("  - 'learned': router Q/K active, Cantor disabled")
+    print("  - 'cantor': Cantor active, router Q/K disabled")
+    print("  - 'hybrid': everything active")
+    print("  - 'local': router Q/K active, Cantor disabled")
+    print()
+
     # Now all modes should work because all components are created
     for mode in ['learned', 'cantor', 'local', 'hybrid']:
         attn.set_mode(mode)
         output = attn(x)
-        print(f"Mode {mode}: output shape = {output.shape}")
 
-    print("\n✓ All mode switches successful!")
+        # Get active param counts
+        counts = attn.get_active_params()
+        print(f"Mode {mode:8s}: output={output.shape}, "
+              f"router_proj={counts['router_projections']:,}, "
+              f"cantor={counts['cantor_scale']}, "
+              f"active={counts['total_active']:,}/{counts['total_all']:,}")
+
+    print("\n✓ All mode switches successful with proper param management!")
 
     # =========================================================================
     section("SEPARATE ROUTER VS ATTENTION PROJECTIONS")
@@ -988,6 +1142,25 @@ if __name__ == '__main__':
         learnable = sum(p.numel() for p in attn.parameters() if p.requires_grad)
 
         print(f"{mode:8s}: {params:,} total, {learnable:,} learnable")
+
+    # =========================================================================
+    section("CANTOR BIAS COMPUTATION PERFORMANCE")
+    # =========================================================================
+
+    print("Testing vectorized branch path computation...")
+
+    for P in [64, 256, 1024]:
+        import time
+
+        start = time.time()
+        bias_module = CantorRoutingBias(
+            num_positions=P,
+            levels=5,
+            hierarchical_weights=True,
+        )
+        elapsed = (time.time() - start) * 1000
+
+        print(f"  P={P:4d}: {elapsed:.2f}ms (fully vectorized, no O(P²) loops)")
 
     # =========================================================================
     section("TORCH.COMPILE COMPATIBILITY")
@@ -1041,13 +1214,20 @@ if __name__ == '__main__':
     print("\nWormholeAttentionComponent provides:")
     print("  ✓ Four routing modes (learned, cantor, hybrid, local)")
     print("  ✓ Proper Cantor semantics (branch alignment, not distance)")
+    print("  ✓ Hierarchical weighting (0.5^k per level)")
     print("  ✓ CLS dense / patches sparse attention split")
     print("  ✓ Route weight injection into attention scores")
     print("  ✓ Separate router Q/K vs attention QKV")
     print("  ✓ Multihead support")
-    print("  ✓ Runtime mode switching (all modes)")
+    print("  ✓ Runtime mode switching with param management")
     print("  ✓ Dropout hooks for TopologicalDropout")
+    print("  ✓ Fully vectorized (no O(P²) loops)")
     print("  ✓ torch.compile compatible")
+
+    print("\nCantor semantics fixed:")
+    print("  ✗ REMOVED: Scalar distance on Cantor values (meaningless)")
+    print("  ✓ ADDED: Branch path alignment (ternary decomposition)")
+    print("  ✓ ADDED: Hierarchical weighting (coarse levels matter more)")
 
     print("\nWormholeAttentionComponent is ready for integration.")
     print("Behavioral parity with DavidBeans V2.3 WormholeAttentionBlock achieved.")

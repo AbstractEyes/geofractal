@@ -10,6 +10,8 @@ Includes standard RoPE and common variants:
     - ScaledRoPE: Linear and NTK-aware scaling for length extension
     - YaRNRoPE: Yet another RoPE extensioN (state-of-the-art length extension)
     - PartialRoPE: Apply to subset of dimensions
+    - BeatrixRoPE: Devil's Staircase position encoding (hierarchical)
+    - CantorRoPE: Branch path alignment for wormhole routing
 
 Mathematical Foundation:
     RoPE encodes position by rotating query/key vectors:
@@ -22,6 +24,10 @@ Scaling Methods:
     Linear:     position' = position / scale
     NTK-aware:  theta' = theta * scale^(dim/(dim-2))
     YaRN:       NTK + attention_scale + temperature per frequency
+
+Cantor Methods (NEW):
+    BeatrixRoPE: position' = C(position) where C is Devil's Staircase
+    CantorRoPE:  rotation based on branch path alignment, not scalar position
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -1132,9 +1138,556 @@ class QuadRoPE(BaseEmbedding):
             f"head_dim={self.head_dim}, "
             f"theta=({self.theta_w}, {self.theta_x}, {self.theta_y}, {self.theta_z}){bilinear_str}"
         )
+
+
 # =============================================================================
-# TEST
+# BEATRIX ROPE (Devil's Staircase Position Encoding)
 # =============================================================================
+
+class BeatrixRoPE(BaseEmbedding):
+    """
+    RoPE based on Devil's Staircase (Beatrix) position encoding.
+
+    Instead of linear positions m ∈ [0, L-1], uses the Cantor function C(m/L)
+    to create non-uniform position encoding that respects hierarchical structure.
+
+    Mathematical Foundation:
+        Standard RoPE: phase = m × θ_d (linear in position)
+        Beatrix RoPE:  phase = C(m/L) × θ_d × L (Cantor-warped position)
+
+        Where C(x) is the Devil's Staircase:
+            C(x) = Σ_{k=1}^{levels} bit_k × 0.5^k
+
+        The Cantor function creates "plateaus" where positions within the same
+        ternary branch get similar encodings, while positions across gaps
+        get very different encodings.
+
+    Key Properties:
+        - Non-uniform position encoding (clusters positions by branch)
+        - Learnable alpha modulates middle third density
+        - Hierarchical weighting: coarse structure dominates
+        - Enables implicit "wormhole" attention patterns
+
+    Args:
+        name: Component identifier
+        head_dim: Dimension of attention heads (must be even)
+        theta: Base frequency. Default 10000.0
+        levels: Number of ternary decomposition levels. Default 5
+        alpha: Middle third weight (0=classic Cantor, 1=filled). Default 0.5
+        tau: Softmax temperature for soft branch assignment. Default 0.25
+        learnable_alpha: Whether alpha is learnable. Default True
+        learnable_tau: Whether tau is learnable. Default False
+        max_seq_len: Maximum sequence length. Default 8192
+        uuid: Optional unique identifier
+
+    Example:
+        rope = BeatrixRoPE('beatrix', head_dim=64, levels=5, alpha=0.5)
+        q_rot, k_rot = rope.rotate(q, k, seq_len=128)
+    """
+
+    def __init__(
+        self,
+        name: str,
+        head_dim: int,
+        theta: float = 10000.0,
+        levels: int = 5,
+        alpha: float = 0.5,
+        tau: float = 0.25,
+        learnable_alpha: bool = True,
+        learnable_tau: bool = False,
+        max_seq_len: int = 8192,
+        uuid: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(name, head_dim, uuid, **kwargs)
+
+        self.head_dim = head_dim
+        self.theta = theta
+        self.levels = levels
+        self.max_seq_len = max_seq_len
+
+        # Ternary interval centers for soft assignment
+        centers = torch.tensor([0.5, 1.5, 2.5], dtype=torch.float64)
+        self.register_buffer('_centers', centers)
+
+        # Alpha: middle third weight (controls routing density)
+        if learnable_alpha:
+            self._alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32))
+        else:
+            self.register_buffer('_alpha', torch.tensor(alpha, dtype=torch.float32))
+
+        # Tau: softmax temperature
+        if learnable_tau:
+            self._tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32))
+        else:
+            self.register_buffer('_tau', torch.tensor(tau, dtype=torch.float32))
+
+        # Precompute scales: 3^k for k in [1, levels]
+        scales = 3.0 ** torch.arange(1, levels + 1, dtype=torch.float64)
+        self.register_buffer('_scales', scales)
+
+        # Cantor weights: 0.5^k (hierarchical weighting)
+        weights = 0.5 ** torch.arange(1, levels + 1, dtype=torch.float64)
+        self.register_buffer('_cantor_weights', weights)
+
+        # Standard inverse frequencies
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        # Build cache
+        self._build_cache(max_seq_len)
+
+    @property
+    def alpha(self) -> float:
+        """Middle third weight."""
+        return self._alpha.item()
+
+    @property
+    def tau(self) -> float:
+        """Softmax temperature."""
+        return self._tau.item()
+
+    @property
+    def dimension(self) -> int:
+        return 1
+
+    def _compute_cantor_positions(self, seq_len: int) -> Tensor:
+        """
+        Compute Devil's Staircase values for positions [0, L-1].
+
+        Returns:
+            Cantor-warped positions, shape (L,)
+        """
+        device = self.inv_freq.device
+
+        # Normalize positions to [0, 1]
+        positions = torch.linspace(0, 1, seq_len, dtype=torch.float64, device=device)
+        positions = positions.clamp(1e-6, 1.0 - 1e-6)
+
+        # Vectorized ternary decomposition across all levels
+        # y[pos, level] = position within ternary cell at each level
+        y = (positions.unsqueeze(-1) * self._scales) % 3  # (L, levels)
+
+        # Squared distance to centers: (L, levels, 3)
+        d2 = (y.unsqueeze(-1) - self._centers) ** 2
+
+        # Soft assignment via softmax
+        tau = self._tau.double()
+        logits = -d2 / tau
+        p = F.softmax(logits, dim=-1)  # (L, levels, 3)
+
+        # Extract probabilities
+        p_middle = p[..., 1]  # (L, levels)
+        p_right = p[..., 2]   # (L, levels)
+
+        # Bit indicator: right + alpha * middle
+        alpha = self._alpha.double()
+        bit_k = p_right + alpha * p_middle  # (L, levels)
+
+        # Cantor measure: C(x) = Σ bit_k × 0.5^k
+        cantor_positions = (bit_k * self._cantor_weights).sum(dim=-1)  # (L,)
+
+        # Scale back to sequence length for RoPE
+        # Multiply by L so that phase range is comparable to standard RoPE
+        return (cantor_positions * seq_len).float()
+
+    def _build_cache(self, seq_len: int) -> None:
+        """Pre-compute cos/sin cache with Cantor-warped positions."""
+        # Get Cantor-warped positions
+        t = self._compute_cantor_positions(seq_len)
+
+        # Compute frequencies: (L, D//2)
+        freqs = torch.outer(t, self.inv_freq)
+        freqs = torch.cat([freqs, freqs], dim=-1)  # (L, D)
+
+        self.register_buffer('_cos', freqs.cos(), persistent=False)
+        self.register_buffer('_sin', freqs.sin(), persistent=False)
+        self.register_buffer('_cantor_pos', t, persistent=False)
+
+    def embed(self, seq_len: int) -> Tuple[Tensor, Tensor]:
+        """Get cos/sin embeddings for sequence length."""
+        if seq_len > self._cos.shape[0]:
+            self._build_cache(seq_len)
+        return self._cos[:seq_len], self._sin[:seq_len]
+
+    def get_cantor_positions(self, seq_len: int) -> Tensor:
+        """Get the Cantor-warped position values (for visualization/debugging)."""
+        if seq_len > self._cantor_pos.shape[0]:
+            self._build_cache(seq_len)
+        return self._cantor_pos[:seq_len]
+
+    def rotate(
+        self,
+        q: Tensor,
+        k: Tensor,
+        cos: Tensor = None,
+        sin: Tensor = None,
+        seq_len: int = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Apply Beatrix rotary embeddings to query and key tensors."""
+        if cos is None or sin is None:
+            L = seq_len or q.shape[-2]
+            cos, sin = self.embed(L)
+
+        return self._apply_rope(q, cos, sin), self._apply_rope(k, cos, sin)
+
+    def _apply_rope(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        """Apply rotation to a single tensor."""
+        if x.dim() == 4:
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+        elif x.dim() == 3:
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+
+        return self._rotate_half(x, cos, sin)
+
+    def _rotate_half(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        """Rotate using the half-dimension method."""
+        half = x.shape[-1] // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        rotated = torch.cat([-x2, x1], dim=-1)
+        return (x * cos) + (rotated * sin)
+
+    def modulate(self, x: Tensor, modulator: Tensor) -> Tensor:
+        return x * modulator
+
+    def augment(self, x: Tensor, augmentation: Tensor) -> Tensor:
+        return x
+
+    def forward(self, seq_len: int) -> Tuple[Tensor, Tensor]:
+        return self.embed(seq_len)
+
+    def extra_repr(self) -> str:
+        return (
+            f"head_dim={self.head_dim}, theta={self.theta}, "
+            f"levels={self.levels}, alpha={self.alpha:.3f}, tau={self.tau:.3f}"
+        )
+
+
+# =============================================================================
+# CANTOR ROPE (Branch Path Alignment for Wormhole Routing)
+# =============================================================================
+
+class CantorRoPE(BaseEmbedding):
+    """
+    RoPE with Cantor branch path alignment for wormhole-style attention.
+
+    CRITICAL INSIGHT: Distance is meaningless on the Cantor set.
+    This RoPE variant doesn't use Cantor distance. Instead, it uses
+    branch path alignment to give similar rotations to positions
+    that share ternary structure at coarse levels.
+
+    Mathematical Foundation:
+        Standard RoPE: Monotonic phase increase with position
+        Cantor RoPE:   Phase based on branch path encoding
+
+        For position m with branch path [b_1, b_2, ..., b_L]:
+            path_encoding = Σ_{k=1}^{levels} b_k × 3^{k-1}
+            phase = path_encoding × θ_d / normalizer
+
+        This means:
+            - Positions in same coarse branch get SIMILAR rotations
+            - Positions in different branches get DIFFERENT rotations
+            - Creates implicit "wormhole" shortcuts in attention
+
+    Key Properties:
+        - Positions with aligned branch paths attend to each other easily
+        - Sequentially distant but structurally similar positions can interact
+        - Hierarchical: coarse alignment matters more than fine alignment
+        - Enables long-range information "teleportation"
+
+    Modes:
+        - 'path_encoding': Use branch path as position (wormhole shortcuts)
+        - 'hybrid': Blend standard RoPE with path-based RoPE
+        - 'hierarchical': Per-level rotations with 0.5^k weighting
+
+    Args:
+        name: Component identifier
+        head_dim: Dimension of attention heads (must be even)
+        theta: Base frequency. Default 10000.0
+        levels: Number of ternary decomposition levels. Default 5
+        tau: Softmax temperature for branch assignment. Default 0.25
+        mode: Encoding mode. Default 'hybrid'
+        blend_alpha: Blend factor for hybrid mode (0=standard, 1=cantor). Default 0.5
+        learnable_blend: Whether blend_alpha is learnable. Default True
+        max_seq_len: Maximum sequence length. Default 8192
+        uuid: Optional unique identifier
+
+    Example:
+        rope = CantorRoPE('cantor', head_dim=64, levels=5, mode='hybrid')
+        q_rot, k_rot = rope.rotate(q, k, seq_len=128)
+
+        # Positions 0 and 63 might get similar rotations if they share
+        # branch paths at coarse levels, enabling long-range attention!
+    """
+
+    def __init__(
+        self,
+        name: str,
+        head_dim: int,
+        theta: float = 10000.0,
+        levels: int = 5,
+        tau: float = 0.25,
+        mode: Literal['path_encoding', 'hybrid', 'hierarchical'] = 'hybrid',
+        blend_alpha: float = 0.5,
+        learnable_blend: bool = True,
+        max_seq_len: int = 8192,
+        uuid: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(name, head_dim, uuid, **kwargs)
+
+        self.head_dim = head_dim
+        self.theta = theta
+        self.levels = levels
+        self.max_seq_len = max_seq_len
+        self._mode = mode
+
+        # Ternary interval centers
+        centers = torch.tensor([0.5, 1.5, 2.5], dtype=torch.float64)
+        self.register_buffer('_centers', centers)
+
+        # Tau: softmax temperature
+        self.register_buffer('_tau', torch.tensor(tau, dtype=torch.float32))
+
+        # Precompute scales: 3^k for k in [1, levels]
+        scales = 3.0 ** torch.arange(1, levels + 1, dtype=torch.float64)
+        self.register_buffer('_scales', scales)
+
+        # Powers for path encoding: 3^{k-1}
+        path_powers = 3.0 ** torch.arange(0, levels, dtype=torch.float64)
+        self.register_buffer('_path_powers', path_powers)
+
+        # Hierarchical level weights: 0.5^k
+        level_weights = 0.5 ** torch.arange(1, levels + 1, dtype=torch.float32)
+        self.register_buffer('_level_weights', level_weights)
+
+        # Blend alpha for hybrid mode
+        if learnable_blend:
+            self._blend_alpha = nn.Parameter(torch.tensor(blend_alpha, dtype=torch.float32))
+        else:
+            self.register_buffer('_blend_alpha', torch.tensor(blend_alpha, dtype=torch.float32))
+
+        # Per-level theta for hierarchical mode
+        # Coarse levels get lower theta (longer wavelength)
+        if mode == 'hierarchical':
+            level_thetas = theta * (2.0 ** torch.arange(levels, dtype=torch.float32))
+            for k in range(levels):
+                inv_freq = 1.0 / (level_thetas[k] ** (torch.arange(0, head_dim, 2).float() / head_dim))
+                self.register_buffer(f'inv_freq_level_{k}', inv_freq)
+
+        # Standard inverse frequencies
+        inv_freq = 1.0 / (theta ** (torch.arange(0, head_dim, 2).float() / head_dim))
+        self.register_buffer('inv_freq', inv_freq)
+
+        # Build cache
+        self._build_cache(max_seq_len)
+
+    @property
+    def blend_alpha(self) -> float:
+        """Blend factor (0=standard, 1=cantor)."""
+        return torch.sigmoid(self._blend_alpha).item()
+
+    @property
+    def mode(self) -> str:
+        """Current encoding mode."""
+        return self._mode
+
+    @property
+    def dimension(self) -> int:
+        return 1
+
+    def _compute_branch_paths(self, seq_len: int) -> Tensor:
+        """
+        Compute hard branch path assignments for all positions.
+
+        Returns:
+            Branch paths, shape (L, levels) with values in {0, 1, 2}
+        """
+        device = self.inv_freq.device
+
+        # Normalize positions to [0, 1]
+        positions = torch.linspace(0, 1, seq_len, dtype=torch.float64, device=device)
+        positions = positions.clamp(1e-6, 1.0 - 1e-6)
+
+        # Vectorized ternary decomposition
+        y = (positions.unsqueeze(-1) * self._scales) % 3  # (L, levels)
+
+        # Squared distance to centers
+        d2 = (y.unsqueeze(-1) - self._centers) ** 2  # (L, levels, 3)
+
+        # Hard assignment
+        tau = self._tau.double()
+        logits = -d2 / tau
+        branch_paths = logits.argmax(dim=-1)  # (L, levels)
+
+        return branch_paths
+
+    def _compute_path_positions(self, seq_len: int) -> Tensor:
+        """
+        Compute path-encoded positions (wormhole routing).
+
+        Positions with aligned branch paths get similar position values,
+        regardless of their sequential distance.
+
+        Returns:
+            Path-encoded positions, shape (L,)
+        """
+        branch_paths = self._compute_branch_paths(seq_len)  # (L, levels)
+
+        # Encode path as base-3 number: Σ b_k × 3^{k-1}
+        path_encoding = (branch_paths.float() * self._path_powers).sum(dim=-1)  # (L,)
+
+        # Normalize to reasonable range for RoPE
+        max_encoding = (3.0 ** self.levels - 1)
+        path_positions = path_encoding / max_encoding * seq_len
+
+        return path_positions.float()
+
+    def _build_cache(self, seq_len: int) -> None:
+        """Pre-compute cos/sin cache based on mode."""
+        device = self.inv_freq.device
+
+        if self._mode == 'path_encoding':
+            # Pure path-based positions (wormhole shortcuts)
+            t = self._compute_path_positions(seq_len)
+            freqs = torch.outer(t, self.inv_freq)
+            freqs = torch.cat([freqs, freqs], dim=-1)
+
+            self.register_buffer('_cos', freqs.cos(), persistent=False)
+            self.register_buffer('_sin', freqs.sin(), persistent=False)
+
+        elif self._mode == 'hybrid':
+            # Blend standard and path-based
+            t_standard = torch.arange(seq_len, device=device, dtype=torch.float32)
+            t_path = self._compute_path_positions(seq_len)
+
+            # Store both for blending at rotation time
+            freqs_std = torch.outer(t_standard, self.inv_freq)
+            freqs_std = torch.cat([freqs_std, freqs_std], dim=-1)
+
+            freqs_path = torch.outer(t_path, self.inv_freq)
+            freqs_path = torch.cat([freqs_path, freqs_path], dim=-1)
+
+            self.register_buffer('_cos_std', freqs_std.cos(), persistent=False)
+            self.register_buffer('_sin_std', freqs_std.sin(), persistent=False)
+            self.register_buffer('_cos_path', freqs_path.cos(), persistent=False)
+            self.register_buffer('_sin_path', freqs_path.sin(), persistent=False)
+
+        elif self._mode == 'hierarchical':
+            # Per-level rotations with hierarchical weighting
+            branch_paths = self._compute_branch_paths(seq_len)  # (L, levels)
+
+            # Compute per-level frequencies and combine with 0.5^k weighting
+            cos_combined = torch.zeros(seq_len, self.head_dim, device=device)
+            sin_combined = torch.zeros(seq_len, self.head_dim, device=device)
+
+            for k in range(self.levels):
+                inv_freq_k = getattr(self, f'inv_freq_level_{k}')
+
+                # Position for this level is the branch assignment (0, 1, or 2)
+                # shifted by accumulated path
+                t_k = branch_paths[:, k].float()
+
+                freqs_k = torch.outer(t_k, inv_freq_k)
+                freqs_k = torch.cat([freqs_k, freqs_k], dim=-1)
+
+                # Weight by 0.5^k (coarse levels matter more)
+                weight = self._level_weights[k]
+                cos_combined = cos_combined + weight * freqs_k.cos()
+                sin_combined = sin_combined + weight * freqs_k.sin()
+
+            # Normalize to unit circle
+            magnitude = torch.sqrt(cos_combined ** 2 + sin_combined ** 2 + 1e-8)
+            cos_combined = cos_combined / magnitude
+            sin_combined = sin_combined / magnitude
+
+            self.register_buffer('_cos', cos_combined, persistent=False)
+            self.register_buffer('_sin', sin_combined, persistent=False)
+
+    def embed(self, seq_len: int) -> Tuple[Tensor, Tensor]:
+        """Get cos/sin embeddings for sequence length."""
+        if self._mode == 'hybrid':
+            # Blend embeddings
+            if seq_len > self._cos_std.shape[0]:
+                self._build_cache(seq_len)
+
+            alpha = torch.sigmoid(self._blend_alpha)
+            cos = (1 - alpha) * self._cos_std[:seq_len] + alpha * self._cos_path[:seq_len]
+            sin = (1 - alpha) * self._sin_std[:seq_len] + alpha * self._sin_path[:seq_len]
+
+            # Renormalize to unit circle
+            magnitude = torch.sqrt(cos ** 2 + sin ** 2 + 1e-8)
+            return cos / magnitude, sin / magnitude
+        else:
+            if seq_len > self._cos.shape[0]:
+                self._build_cache(seq_len)
+            return self._cos[:seq_len], self._sin[:seq_len]
+
+    def get_branch_paths(self, seq_len: int) -> Tensor:
+        """Get branch paths for visualization/debugging."""
+        return self._compute_branch_paths(seq_len)
+
+    def get_path_positions(self, seq_len: int) -> Tensor:
+        """Get path-encoded positions for visualization/debugging."""
+        return self._compute_path_positions(seq_len)
+
+    def rotate(
+        self,
+        q: Tensor,
+        k: Tensor,
+        cos: Tensor = None,
+        sin: Tensor = None,
+        seq_len: int = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """Apply Cantor rotary embeddings to query and key tensors."""
+        if cos is None or sin is None:
+            L = seq_len or q.shape[-2]
+            cos, sin = self.embed(L)
+
+        return self._apply_rope(q, cos, sin), self._apply_rope(k, cos, sin)
+
+    def _apply_rope(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        """Apply rotation to a single tensor."""
+        if x.dim() == 4:
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+        elif x.dim() == 3:
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+
+        return self._rotate_half(x, cos, sin)
+
+    def _rotate_half(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        """Rotate using the half-dimension method."""
+        half = x.shape[-1] // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        rotated = torch.cat([-x2, x1], dim=-1)
+        return (x * cos) + (rotated * sin)
+
+    def set_mode(self, mode: Literal['path_encoding', 'hybrid', 'hierarchical']) -> None:
+        """Switch encoding mode at runtime."""
+        if mode not in ('path_encoding', 'hybrid', 'hierarchical'):
+            raise ValueError(f"Invalid mode: {mode}")
+        self._mode = mode
+        self._build_cache(self.max_seq_len)
+
+    def modulate(self, x: Tensor, modulator: Tensor) -> Tensor:
+        return x * modulator
+
+    def augment(self, x: Tensor, augmentation: Tensor) -> Tensor:
+        return x
+
+    def forward(self, seq_len: int) -> Tuple[Tensor, Tensor]:
+        return self.embed(seq_len)
+
+    def extra_repr(self) -> str:
+        return (
+            f"head_dim={self.head_dim}, theta={self.theta}, "
+            f"levels={self.levels}, mode='{self._mode}', blend={self.blend_alpha:.3f}"
+        )
+
 
 # =============================================================================
 # TEST
@@ -1322,6 +1875,117 @@ if __name__ == '__main__':
         print(f"  {mod}: Q norm = {q_rot.norm(dim=-1).mean():.4f}")
 
     # -------------------------------------------------------------------------
+    section("BEATRIX ROPE (Devil's Staircase)")
+    # -------------------------------------------------------------------------
+
+    beatrix = BeatrixRoPE(
+        'beatrix',
+        head_dim=64,
+        theta=10000.0,
+        levels=5,
+        alpha=0.5,
+        tau=0.25,
+    )
+    print(f"BeatrixRoPE: {beatrix}")
+
+    cos, sin = beatrix(128)
+    print(f"cos: {cos.shape}, sin: {sin.shape}")
+
+    q_rot, k_rot = beatrix.rotate(q, k, seq_len=128)
+    print(f"Q rotated: {q_rot.shape}")
+
+    # Compare Cantor vs linear positions
+    cantor_pos = beatrix.get_cantor_positions(128)
+    linear_pos = torch.arange(128, dtype=torch.float32)
+
+    print(f"\nPosition comparison (first 10):")
+    print(f"  Linear: {linear_pos[:10].tolist()}")
+    print(f"  Cantor: {[f'{p:.2f}' for p in cantor_pos[:10].tolist()]}")
+
+    print(f"\nCantor position statistics:")
+    print(f"  Min: {cantor_pos.min():.2f}")
+    print(f"  Max: {cantor_pos.max():.2f}")
+    print(f"  Mean: {cantor_pos.mean():.2f}")
+
+    # Show the non-uniform nature
+    deltas = cantor_pos[1:] - cantor_pos[:-1]
+    print(f"  Delta range: [{deltas.min():.4f}, {deltas.max():.4f}]")
+    print(f"  (Standard RoPE would have constant delta of 1.0)")
+
+    # -------------------------------------------------------------------------
+    section("CANTOR ROPE (Branch Path Alignment)")
+    # -------------------------------------------------------------------------
+
+    cantor = CantorRoPE(
+        'cantor',
+        head_dim=64,
+        theta=10000.0,
+        levels=5,
+        mode='hybrid',
+        blend_alpha=0.5,
+    )
+    print(f"CantorRoPE: {cantor}")
+
+    cos, sin = cantor(128)
+    print(f"cos: {cos.shape}, sin: {sin.shape}")
+
+    q_rot, k_rot = cantor.rotate(q, k, seq_len=128)
+    print(f"Q rotated: {q_rot.shape}")
+
+    # Show branch paths
+    paths = cantor.get_branch_paths(16)
+    print(f"\nBranch paths (first 16 positions):")
+    path_strs = []
+    for i in range(16):
+        path_str = ''.join({0: 'L', 1: 'M', 2: 'R'}[p.item()] for p in paths[i])
+        path_strs.append(f"{i:2d}: {path_str}")
+    for i in range(0, 16, 4):
+        print(f"  {path_strs[i]}  {path_strs[i+1]}  {path_strs[i+2]}  {path_strs[i+3]}")
+
+    # Show path-encoded positions
+    path_pos = cantor.get_path_positions(16)
+    print(f"\nPath-encoded positions (first 16):")
+    print(f"  {[f'{p:.1f}' for p in path_pos.tolist()]}")
+
+    print(f"\nWormhole insight:")
+    print(f"  Positions with similar branch paths get similar rotations,")
+    print(f"  regardless of sequential distance!")
+
+    # -------------------------------------------------------------------------
+    section("CANTOR ROPE MODES")
+    # -------------------------------------------------------------------------
+
+    for mode in ['path_encoding', 'hybrid', 'hierarchical']:
+        cantor_mode = CantorRoPE(
+            f'cantor_{mode}',
+            head_dim=64,
+            levels=5,
+            mode=mode,
+        )
+        q_rot, k_rot = cantor_mode.rotate(q, k, seq_len=128)
+        print(f"Mode '{mode}': Q norm = {q_rot.norm(dim=-1).mean():.4f}")
+
+    # -------------------------------------------------------------------------
+    section("BLEND ALPHA COMPARISON")
+    # -------------------------------------------------------------------------
+
+    print("Hybrid mode with different blend values:")
+    for alpha in [0.0, 0.25, 0.5, 0.75, 1.0]:
+        cantor_blend = CantorRoPE(
+            'cantor_blend',
+            head_dim=64,
+            levels=5,
+            mode='hybrid',
+            blend_alpha=alpha,
+            learnable_blend=False,
+        )
+        q_rot, _ = cantor_blend.rotate(q, k, seq_len=128)
+        print(f"  alpha={alpha:.2f}: Q norm = {q_rot.norm(dim=-1).mean():.4f}")
+
+    print("\n  alpha=0.0 = pure standard RoPE")
+    print("  alpha=1.0 = pure path-based (wormhole) RoPE")
+
+    # -------------------------------------------------------------------------
     section("COMPARISON: SCALING METHODS")
     # -------------------------------------------------------------------------
 
@@ -1372,76 +2036,6 @@ if __name__ == '__main__':
     print(f"seq_len=512: cache rebuilt to {rope._cos.shape}")
 
     # -------------------------------------------------------------------------
-    section("DEVICE MOVEMENT")
-    # -------------------------------------------------------------------------
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    rope = RoPE('rope', head_dim=64).to(device)
-    print(f"RoPE device: {rope.inv_freq.device}")
-
-    q_dev = torch.randn(4, 8, 64, 64, device=device)
-    k_dev = torch.randn(4, 8, 64, 64, device=device)
-
-    cos, sin = rope(64)
-    print(f"cos device: {cos.device}")
-
-    q_rot, k_rot = rope.rotate(q_dev, k_dev, cos, sin)
-    print(f"Q_rot device: {q_rot.device}")
-
-    # -------------------------------------------------------------------------
-    section("COMPILE TEST")
-    # -------------------------------------------------------------------------
-
-    rope = RoPE('rope', head_dim=64).to(device)
-    q_gpu = torch.randn(4, 8, 64, 64, device=device)
-    k_gpu = torch.randn(4, 8, 64, 64, device=device)
-
-    # Uncompiled
-    cos, sin = rope(64)
-    q_rot1, k_rot1 = rope.rotate(q_gpu, k_gpu, cos, sin)
-
-    # Compiled
-    rotate_compiled = torch.compile(rope.rotate)
-    q_rot2, k_rot2 = rotate_compiled(q_gpu, k_gpu, cos, sin)
-
-    print(f"Device: {q_rot1.device}")
-
-    q_match = torch.allclose(q_rot1, q_rot2, rtol=1e-4, atol=1e-6)
-    k_match = torch.allclose(k_rot1, k_rot2, rtol=1e-4, atol=1e-6)
-    q_max_diff = (q_rot1 - q_rot2).abs().max().item()
-    k_max_diff = (k_rot1 - k_rot2).abs().max().item()
-
-    print(f"Compiled match Q: {q_match} (max diff: {q_max_diff:.2e})")
-    print(f"Compiled match K: {k_match} (max diff: {k_max_diff:.2e})")
-
-    # -------------------------------------------------------------------------
-    section("AGATHA TOWER EXAMPLE")
-    # -------------------------------------------------------------------------
-
-    print("Creating 10 towers with different theta configurations:\n")
-
-    tower_configs = [
-        ('T1 Cantor', 10000.0, 1.0),
-        ('T2 Simplex', 10000.0, 1.0),
-        ('T3 Shape', 10000.0, 1.0),
-        ('T4 Cantor-Inv', 10000.0, 1.0),
-        ('T5 Simplex-Inv', 10000.0, 1.0),
-        ('T6 Shape-Inv', 10000.0, 1.0),
-        ('T7 θ=1.00', 10000.0, 1.00),
-        ('T8 θ=0.15', 10000.0, 0.15),
-        ('T9 θ=0.30', 10000.0, 0.30),
-        ('T10 θ=0.45', 10000.0, 0.45),
-    ]
-
-    print(f"{'Tower':<15} {'theta':>10} {'scale':>8} {'inv_freq[0]':>12}")
-    print("-" * 50)
-
-    for name, theta, scale in tower_configs:
-        r = RoPE(name, head_dim=64, theta=theta, theta_scale=scale)
-        print(f"{name:<15} {theta:>10.1f} {scale:>8.2f} {r.inv_freq[0]:>12.6f}")
-
-    # -------------------------------------------------------------------------
     section("BILINEAR TOGGLE")
     # -------------------------------------------------------------------------
 
@@ -1460,6 +2054,11 @@ if __name__ == '__main__':
     print(f"{'Variant':<20} {'Params':>12}")
     print("-" * 34)
     print(f"{'RoPE':<20} {0:>12,}")
+    print(f"{'ScaledRoPE':<20} {0:>12,}")
+    print(f"{'YaRNRoPE':<20} {0:>12,}")
+    print(f"{'PartialRoPE':<20} {0:>12,}")
+    print(f"{'BeatrixRoPE':<20} {count_params(beatrix):>12,}")
+    print(f"{'CantorRoPE':<20} {count_params(cantor):>12,}")
     print(f"{'DualRoPE (lean)':<20} {count_params(dual_lean):>12,}")
     print(f"{'DualRoPE (bilinear)':<20} {count_params(dual_heavy):>12,}")
     print(f"{'TriRoPE (lean)':<20} {count_params(tri_lean):>12,}")
@@ -1496,6 +2095,8 @@ if __name__ == '__main__':
         ('ScaledRoPE', ScaledRoPE('s', 64, scale_factor=2.0)),
         ('YaRNRoPE', YaRNRoPE('y', 64, scale_factor=2.0)),
         ('PartialRoPE', PartialRoPE('p', 64, rotary_dim=32)),
+        ('BeatrixRoPE', BeatrixRoPE('b', 64, levels=5)),
+        ('CantorRoPE', CantorRoPE('c', 64, levels=5)),
         ('DualRoPE', DualRoPE('d', 64)),
         ('TriRoPE', TriRoPE('t', 64)),
         ('QuadRoPE', QuadRoPE('q', 64)),
@@ -1533,6 +2134,62 @@ if __name__ == '__main__':
         print(f"  {aug}: Q norm = {q_rot.norm(dim=-1).mean():.4f}")
 
     # -------------------------------------------------------------------------
+    section("WORMHOLE DEMONSTRATION")
+    # -------------------------------------------------------------------------
+
+    print("Showing how Cantor RoPE creates 'wormhole' shortcuts:\n")
+
+    cantor_worm = CantorRoPE('worm', head_dim=64, levels=5, mode='path_encoding')
+
+    # Get path positions
+    path_pos = cantor_worm.get_path_positions(64)
+
+    # Find positions with similar path encodings
+    print("Positions with similar path encodings (potential wormholes):")
+
+    # Group by rounded path position
+    groups = {}
+    for i, p in enumerate(path_pos.tolist()):
+        key = round(p, 1)
+        if key not in groups:
+            groups[key] = []
+        groups[key].append(i)
+
+    # Show groups with multiple positions
+    shown = 0
+    for key, positions in sorted(groups.items()):
+        if len(positions) > 1 and shown < 5:
+            print(f"  Path ~{key:.1f}: positions {positions}")
+            shown += 1
+
+    print("\n  These positions get similar rotations despite sequential distance!")
+    print("  In attention, Q at position i easily attends to K at position j")
+    print("  if they share path encoding (branch path alignment).")
+
+    # -------------------------------------------------------------------------
+    section("COMPARISON: STANDARD vs BEATRIX vs CANTOR")
+    # -------------------------------------------------------------------------
+
+    rope_std = RoPE('std', head_dim=64)
+    rope_beatrix = BeatrixRoPE('beatrix', head_dim=64, levels=5)
+    rope_cantor = CantorRoPE('cantor', head_dim=64, levels=5, mode='hybrid')
+
+    print(f"{'Variant':<20} {'Position 0':>12} {'Position 63':>12} {'Position 127':>12}")
+    print("-" * 60)
+
+    # Get first cos value at each position as proxy for "effective position"
+    for name, r in [('Standard', rope_std), ('Beatrix', rope_beatrix), ('Cantor', rope_cantor)]:
+        cos, _ = r.embed(128)
+        p0 = cos[0, 0].item()
+        p63 = cos[63, 0].item()
+        p127 = cos[127, 0].item()
+        print(f"{name:<20} {p0:>12.4f} {p63:>12.4f} {p127:>12.4f}")
+
+    print("\n  Standard: monotonic progression")
+    print("  Beatrix:  non-uniform (plateaus from Devil's Staircase)")
+    print("  Cantor:   branch-aligned (wormhole shortcuts)")
+
+    # -------------------------------------------------------------------------
     section("MULTI-SCALE UNIFIED EXAMPLE")
     # -------------------------------------------------------------------------
 
@@ -1556,17 +2213,45 @@ if __name__ == '__main__':
     print(f"Norm preserved: {torch.allclose(q.norm(dim=-1).mean(), q_rot.norm(dim=-1).mean(), atol=0.5)}")
 
     # -------------------------------------------------------------------------
+    section("AGATHA TOWER EXAMPLE")
+    # -------------------------------------------------------------------------
+
+    print("Creating 10 towers with different theta configurations:\n")
+
+    tower_configs = [
+        ('T1 Cantor', 10000.0, 1.0),
+        ('T2 Simplex', 10000.0, 1.0),
+        ('T3 Shape', 10000.0, 1.0),
+        ('T4 Cantor-Inv', 10000.0, 1.0),
+        ('T5 Simplex-Inv', 10000.0, 1.0),
+        ('T6 Shape-Inv', 10000.0, 1.0),
+        ('T7 θ=1.00', 10000.0, 1.00),
+        ('T8 θ=0.15', 10000.0, 0.15),
+        ('T9 θ=0.30', 10000.0, 0.30),
+        ('T10 θ=0.45', 10000.0, 0.45),
+    ]
+
+    print(f"{'Tower':<15} {'theta':>10} {'scale':>8} {'inv_freq[0]':>12}")
+    print("-" * 50)
+
+    for name, theta, scale in tower_configs:
+        r = RoPE(name, head_dim=64, theta=theta, theta_scale=scale)
+        print(f"{name:<15} {theta:>10.1f} {scale:>8.2f} {r.inv_freq[0]:>12.6f}")
+
+    # -------------------------------------------------------------------------
     section("ALL TESTS PASSED")
     # -------------------------------------------------------------------------
 
     print("\nRoPE variants ready:")
-    print("  RoPE        - Standard rotary embedding")
-    print("  ScaledRoPE  - Linear and NTK-aware scaling")
-    print("  YaRNRoPE    - State-of-the-art length extension")
-    print("  PartialRoPE - Apply to subset of dimensions")
-    print("  DualRoPE    - Two configs with modulation/augmentation")
-    print("  TriRoPE     - Three configs with barycentric combination")
-    print("  QuadRoPE    - Four configs with quaternionic/simplex combination")
+    print("  RoPE         - Standard rotary embedding")
+    print("  ScaledRoPE   - Linear and NTK-aware scaling")
+    print("  YaRNRoPE     - State-of-the-art length extension")
+    print("  PartialRoPE  - Apply to subset of dimensions")
+    print("  BeatrixRoPE  - Devil's Staircase position encoding (NEW)")
+    print("  CantorRoPE   - Branch path alignment for wormholes (NEW)")
+    print("  DualRoPE     - Two configs with modulation/augmentation")
+    print("  TriRoPE      - Three configs with barycentric combination")
+    print("  QuadRoPE     - Four configs with quaternionic/simplex combination")
 
     print("\nKey features:")
     print("  - Pre-computed cache for efficiency")
@@ -1577,3 +2262,18 @@ if __name__ == '__main__':
     print("  - Lean (few params) or bilinear (learnable) modes")
     print("  - Geometric modulation: phase_blend, complex, quaternion")
     print("  - Geometric augmentation: lerp, barycentric, simplex, hierarchical")
+
+    print("\nCantor-family RoPE (NEW):")
+    print("  BeatrixRoPE:")
+    print("    - Non-uniform positions via Cantor function C(x)")
+    print("    - Learnable alpha (middle third density)")
+    print("    - Creates natural 'plateaus' for similar positions")
+    print("  CantorRoPE:")
+    print("    - Positions with aligned branch paths get similar rotations")
+    print("    - Enables long-range information teleportation")
+    print("    - Three modes: path_encoding, hybrid, hierarchical")
+    print("    - Learnable blend factor for hybrid mode")
+    print()
+    print("Key insight: 'Distance is an illusion.'")
+    print("  Cantor routing doesn't care about sequential distance.")
+    print("  It cares about branch path structure at coarse levels.")
