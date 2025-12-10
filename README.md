@@ -358,9 +358,9 @@ Individual towers don't need to be accurate. They need to see *differently*. The
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [GETTING_STARTED.md](GETTING_STARTED.md) | Complete tutorial with examples |
+| Document                                                       | Description |
+|----------------------------------------------------------------|-------------|
+| [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Complete tutorial with examples |
 
 ---
 
