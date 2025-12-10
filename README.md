@@ -9,20 +9,10 @@
 
 ## What Is This?
 
-!!!CURRENTLY!!! this architecture is under active development. Expect a lot of changes.
+GeoFractal Router is a coordination architecture for building **collectives of autonomous AI units**. Instead of one monolithic model, you build multiple *towers* that produce opinions, coordinate through *geometric routing*, and fuse their perspectives into emergent collective intelligence.
 
-Primarily, what you want is geofractal.model.blocks.router.global_fractal_router.py
-This structure is the primary blueprint implementation of the GeoFractal Router architecture and
-is to be used as a module within larger models.
+**The key insight:** Individual units don't need to be accurate. They need to *see differently*. The collective triangulates truth from divergent viewpoints.
 
-I'm currently implementing a higher-level factory interface to build complete models around this router.
-The process is ongoing.
-
-## Overview
-
-GeoFractal Router is a coordination architecture for **collective intelligence**. Instead of building one smart model, you build multiple *different* models that communicate and triangulate truth together.
-
-**The key insight:** Individual models don't need to be accurate. They need to *see differently*. The collective triangulates from divergent perspectives.
 ```
 Traditional Ensemble:    Smart Model + Smart Model + Smart Model → Average
 GeoFractal Collective:   Different View + Different View + Different View → Triangulate
@@ -32,7 +22,7 @@ GeoFractal Collective:   Different View + Different View + Different View → Tr
 
 | Experiment | Individual Accuracy | Collective Accuracy | Multiplier |
 |------------|---------------------|---------------------|------------|
-| ImageNet (5 CLIP streams) | 0.1% each | 84.68% | **847×** |
+| ImageNet (5 streams) | 0.1% each | 84.68% | **847×** |
 | FashionMNIST (3 streams) | 10% each | 93.4% | **9.34×** |
 | Dual CLIP (frozen) | 7-18% | 92.6% | **5-13×** |
 
@@ -40,83 +30,131 @@ The collective achieves what no individual can.
 
 ---
 
-## How It Works
+## Core Concepts
 
-### The Collective
+| Concept | What It Is | Key Insight |
+|---------|------------|-------------|
+| **Component** | Attachable unit with identity and lifecycle | The building block - everything is a component |
+| **Tower** | Self-encapsulated processing unit | Produces an *opinion*, not just an output |
+| **Address** | Geometric identity on a manifold | Fingerprints enable similarity/distance routing |
+| **NotifierRouter** | Communication backbone | Routes messages based on geometry |
+| **Fusion** | Opinion aggregation | Where emergence happens |
 
-A GeoFractal collective consists of multiple **streams** that process inputs through **heads**, coordinate through a **mailbox**, and fuse their perspectives:
+---
+
+## Architecture
+
+### The Component Hierarchy
+
+Everything in GeoFractal is a **component** - an attachable unit with identity and lifecycle:
+
 ```
-                    ┌─────────────────────────────────────┐
-                    │           Collective                 │
-                    ├─────────────────────────────────────┤
-   Input A ────────►│  Stream A ──► Head A ──┐            │
-                    │                        │            │
-   Input B ────────►│  Stream B ──► Head B ──┼──► Fusion ──► Output
-                    │                        │            │
-   Input C ────────►│  Stream C ──► Head C ──┘            │
-                    │         ▲      │                    │
-                    │         └──────┴─── Mailbox ◄───────│
-                    └─────────────────────────────────────┘
+BaseComponent (ABC - pure Python)
+│   - name, uuid, parent
+│   - Lifecycle: on_attach(), on_detach()
+│
+└── TorchComponent (BaseComponent + nn.Module)
+        - Learnable parameters
+        - Device affinity (home_device, allowed_devices)
+        │
+        ├── AddressComponent      # Geometric identity, fingerprints
+        │   ├── SphericalAddress  # Unit hypersphere (geodesic routing)
+        │   ├── HyperbolicAddress # Poincaré ball (hierarchical)
+        │   ├── SimplexAddress    # Barycentric coordinates
+        │   ├── FractalAddress    # Julia set orbits
+        │   ├── CantorAddress     # Devil's staircase
+        │   └── ShapeAddress      # RoPE-compatible
+        │
+        ├── FusionComponent       # Combine opinions
+        │   ├── AdaptiveFusion    # Content-dependent weights
+        │   ├── GatedFusion       # Learned gates
+        │   ├── AttentionFusion   # Cross-attention
+        │   └── SlotFusion        # Collapse slot dimension
+        │
+        └── ProjectionComponent   # Transform shapes
+            ├── SlotProjection    # Multi-view expansion
+            ├── BottleneckProjection
+            └── MultiHeadProjection
 ```
 
-Each stream sees the same problem from a different angle. The mailbox lets them observe each other's routing decisions. The fusion layer triangulates their divergent views into a unified answer.
+### Towers: Autonomous Processing Units
 
-### Why Divergence Matters
+A **Tower** is a self-encapsulated unit that produces an *opinion*:
 
-Traditional ensembles train each model to be accurate, then average their predictions. This works, but you're limited by what each model can learn individually.
-
-GeoFractal inverts this: each stream is trained to be **different**, not accurate. When streams provide orthogonal projections of the input space, the routing fabric can recover the true answer even when no single stream knows it.
-
-This is how sensor fusion works: multiple imperfect measurements → accurate state estimation.
-
-### The Fingerprint
-
-Every head has a unique **fingerprint** - a learnable identity vector that makes it see differently:
 ```python
-# Each head's fingerprint creates divergent behavior through:
-anchor_affinities = sigmoid(W @ fingerprint)      # Different behavioral modes
-value_gating = v * sigmoid(W @ fingerprint)       # Different attention patterns  
-score_bias = scores + (q @ W @ fingerprint) * 0.1 # Different routing decisions
+class ExpertTower(BaseTower):
+    def __init__(self, name: str, dim: int, depth: int = 4):
+        super().__init__(name)
+        
+        # Stages are TorchComponent instances
+        for i in range(depth):
+            self.append(TransformerBlock(f'{name}_block_{i}', dim))
+        
+        # Named components accessed via self['key']
+        self.attach('final_norm', nn.LayerNorm(dim))
+    
+    def forward(self, x: Tensor) -> Tensor:
+        for stage in self.stages:
+            x = stage(x)
+        return self['final_norm'](x)
 ```
 
-Fingerprints don't encode "what to look for" - they encode "how to look."
+Towers are **not** raw PyTorch modules. They have:
+- **Identity** - `name` + `uuid` for addressing
+- **Stages** - Ordered pipeline of components (not primitives)
+- **Components** - Named auxiliaries (`self['norm']`)
+- **Objects** - Non-module storage (`self['config']`)
 
-### The Mailbox
+### Geometric Routing
 
-Streams coordinate through a shared mailbox where they post their routing states:
+Towers coordinate through **addresses** - geometric identities that enable routing based on manifold geometry:
+
 ```python
-# After each head processes its input:
-mailbox.post(head_id, routing_state.detach())
+# Create router
+notifier = NotifierRouter('collective')
 
-# Other heads can observe (content is detached - no gradient flow):
-peer_states = mailbox.read_all(exclude=my_id)
+# Register towers with addresses
+notifier.register(SphericalAddressComponent('teacher', dim=64), channel='knowledge')
+notifier.register(SphericalAddressComponent('student', dim=64), channel='knowledge')
+
+# Route by geometric similarity
+notifier.route_by_similarity(source, payload, channel='knowledge', top_k=3)
+
+# Route by manifold distance
+notifier.route_by_distance(source, payload, channel='knowledge', max_distance=1.0)
+
+# Affinity-weighted broadcast
+notifier.affinity_broadcast(source, payload, temperature=0.5)
 ```
 
-**Critical:** Mailbox content is detached. Gradients don't flow through coordination. This prevents collapse to trivial solutions - specialization must emerge from observation, not optimization.
+### The Collective Pattern
 
-### Constitutive Contribution
-
-All components must contribute **constitutively** to the output:
-```python
-# WRONG - gradients die:
-attention_scores = scores + learned_bias
-
-# RIGHT - gradients flow:
-output = w0*attention + w1*routing + w2*anchor_contribution
 ```
-
-This emerged from experimental failure. Additive-only biases become ignorable noise.
+┌─────────────────────────────────────────────────────────────────┐
+│                        Collective                               │
+│                                                                 │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
+│  │   Tower A   │  │   Tower B   │  │   Tower C   │             │
+│  │ + Address   │  │ + Address   │  │ + Address   │             │
+│  │ (Spherical) │  │ (Spherical) │  │ (Hyperbolic)│             │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
+│         │                │                │                     │
+│         └────────────────┼────────────────┘                     │
+│                          ↓                                      │
+│              NotifierRouter (geometric routing)                 │
+│                          ↓                                      │
+│              FusionComponent (aggregate opinions)               │
+│                          ↓                                      │
+│                    Collective Output                            │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## Quick Start
 
 ### Installation
-```bash
-pip install geofractal
-```
 
-Or from source:
 ```bash
 git clone https://github.com/AbstractPhil/geofractal.git
 cd geofractal
@@ -124,162 +162,205 @@ pip install -e .
 ```
 
 ### Build a Collective
+
 ```python
-from geofractal.router import (
-    PrototypeBuilder,
-    StreamSpec,
-    HeadSpec,
-    FusionSpec,
-)
+import torch
+import torch.nn as nn
+from torch import Tensor
 
-# Define streams with different input sources
-prototype = (PrototypeBuilder("vision_collective")
-    .add_stream(StreamSpec.feature_vector("clip_b32", input_dim=512))
-    .add_stream(StreamSpec.feature_vector("clip_l14", input_dim=768))
-    .add_stream(StreamSpec.feature_vector("dino_b16", input_dim=768))
-    .with_head(HeadSpec.standard(feature_dim=512))
-    .with_fusion(FusionSpec.gated(output_dim=512))
-    .with_classifier(num_classes=1000)
-    .build())
+from geofractal.router.base_router import BaseRouter
+from geofractal.router.base_tower import BaseTower
+from geofractal.router.components.torch_component import TorchComponent
+from geofractal.router.prefab.notifier_router import NotifierRouter
+from geofractal.router.components.address_component import SphericalAddressComponent
+from geofractal.router.components.fusion_component import AdaptiveFusion
 
-# Forward pass with dict of features
-logits = prototype({
-    "clip_b32": clip_b32_features,   # [B, 512]
-    "clip_l14": clip_l14_features,   # [B, 768]  
-    "dino_b16": dino_features,       # [B, 768]
-})
-```
 
-### Stream Types
+class TransformerBlock(TorchComponent):
+    """Reusable block component."""
+    
+    def __init__(self, name: str, dim: int, num_heads: int = 8):
+        super().__init__(name)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim),
+        )
+    
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
+        x = x + self.ffn(self.norm2(x))
+        return x
 
-**Vector Streams** - for pooled embeddings `[B, D]`:
-```python
-StreamSpec.feature_vector("name", input_dim=512)      # Pre-extracted
-StreamSpec.trainable_vector("name", input_dim=512)    # Learnable backbone
-```
 
-**Sequence Streams** - for token sequences `[B, S, D]`:
-```python
-StreamSpec.sequence("name", input_dim=768)                    # Pass-through
-StreamSpec.transformer_sequence("name", input_dim=768)        # +Transformer layers
-StreamSpec.conv_sequence("name", input_dim=768)               # +Conv layers
-```
+class ExpertTower(BaseTower):
+    """Tower with address for collective participation."""
+    
+    def __init__(self, name: str, dim: int, notifier: NotifierRouter, depth: int = 3):
+        super().__init__(name)
+        
+        # Geometric identity
+        addr = SphericalAddressComponent(name, fingerprint_dim=64)
+        self.attach('address', addr)
+        self.attach('notifier', notifier)
+        notifier.register(addr, channel='collective')
+        
+        # Block stages (not raw primitives)
+        for i in range(depth):
+            self.append(TransformerBlock(f'{name}_block_{i}', dim))
+        self.attach('norm', nn.LayerNorm(dim))
+    
+    def forward(self, x: Tensor) -> Tensor:
+        # Receive knowledge from other towers
+        addr = self['address']
+        if addr.has_mail:
+            knowledge = addr.aggregate_inbox('mean')
+            if knowledge is not None and knowledge.shape == x.shape:
+                x = x + 0.1 * knowledge
+            addr.clear()
+        
+        # Process through stages
+        for stage in self.stages:
+            x = stage(x)
+        return self['norm'](x)
+    
+    def share(self, opinion: Tensor):
+        """Share opinion with collective."""
+        self['notifier'].post(self['address'], opinion, channel='collective')
 
-### Head Presets
-```python
-HeadSpec.lightweight(feature_dim=512)  # Minimal params
-HeadSpec.standard(feature_dim=512)     # Balanced
-HeadSpec.heavy(feature_dim=512)        # Maximum capacity
-```
 
-### Fusion Strategies
-```python
-FusionSpec.concat(output_dim=512)       # Concatenate + project
-FusionSpec.gated(output_dim=512)        # Input-adaptive gates
-FusionSpec.attention(output_dim=512)    # Cross-stream attention
-FusionSpec.moe(output_dim=512)          # Mixture of experts
+class Collective(BaseRouter):
+    """Multi-tower collective with geometric coordination."""
+    
+    def __init__(self, name: str, dim: int, num_towers: int = 3, depth: int = 3):
+        super().__init__(name)
+        
+        # Communication backbone
+        notifier = NotifierRouter('notifier')
+        self.attach('notifier', notifier)
+        
+        # Expert towers
+        for i in range(num_towers):
+            tower = ExpertTower(f'expert_{i}', dim, notifier, depth)
+            self.attach(f'expert_{i}', tower)
+        
+        # Opinion fusion
+        fusion = AdaptiveFusion('fusion', num_inputs=num_towers, in_features=dim)
+        self.attach('fusion', fusion)
+        
+        self.attach('config', {'dim': dim, 'num_towers': num_towers})
+    
+    def forward(self, x: Tensor) -> Tensor:
+        config = self['config']
+        
+        # Each tower produces an opinion
+        opinions = []
+        for i in range(config['num_towers']):
+            tower = self[f'expert_{i}']
+            opinion = tower(x)
+            tower.share(opinion)  # Share with collective
+            opinions.append(opinion)
+        
+        # Route messages between towers
+        self['notifier'].route()
+        
+        # Fuse opinions into collective output
+        return self['fusion'](*opinions)
+
+
+# Usage
+collective = Collective('my_collective', dim=256, num_towers=3, depth=4)
+x = torch.randn(4, 32, 256)  # [B, L, D]
+output = collective(x)
+print(f"Output: {output.shape}")  # [4, 32, 256]
 ```
 
 ---
 
-## Architecture
+## Package Structure
 
-### Package Structure
 ```
 geofractal/router/
-├── __init__.py
-├── factory/
-│   ├── __init__.py
-│   ├── builder.py
-│   ├── protocols.py
-│   ├── prototype.py
-│   └── registry.py
-├── fusion/
-│   ├── __init__.py
-│   ├── builder.py
-│   ├── methods.py
-│   └── protocols.py
-├── getting_started/
-│   ├── ARCHITECTURE.md
-│   ├── DEVELOPMENT.md
-│   ├── INDEX.md
-│   ├── MATHEMATICS.md
-│   └── PROTOCOL.md
-├── head/
-│   ├── __init__.py
-│   ├── builder.py
-│   ├── components.py
-│   └── protocols.py
-├── streams/
-│   ├── __init__.py
-│   ├── base.py
-│   ├── builder.py
-│   ├── feature.py
-│   ├── frozen.py
-│   ├── protocols.py
-│   ├── sequence.py
-│   ├── trainable.py
-│   └── vector.py
+├── base_router.py          # BaseRouter ABC
+├── base_tower.py           # BaseTower (autonomous units)
+├── base_component.py       # BaseComponent ABC
+│
+├── components/
+│   ├── torch_component.py      # TorchComponent (nn.Module + identity)
+│   ├── address_component.py    # Geometric addresses (7 manifolds)
+│   ├── fusion_component.py     # Opinion aggregation strategies
+│   ├── projection_component.py # Shape transformations
+│   ├── cantor_address_component.py
+│   └── ...
+│
+└── prefab/
+    ├── notifier_router.py      # Geometric routing backbone
+    └── ...
 ```
-
-### Head Components
-
-| Component | Purpose |
-|-----------|---------|
-| **Fingerprint** | Unique identity that creates divergent behavior |
-| **CantorAttention** | Geometric attention via Cantor pairing |
-| **TopKRouter** | Sparse routing with fingerprint modulation |
-| **ConstitutiveAnchorBank** | Shared behavioral modes (gradients flow) |
-| **FingerprintGate** | Identity-based value gating |
-| **LearnableWeightCombiner** | Weighted combination of pathways |
-| **FFNRefinement** | Post-combination refinement |
-
-### The Cantor Prior
-
-Attention includes a geometric bias from Cantor pairing - a bijection ℕ² → ℕ where diagonal positions receive consecutive indices:
-```
-Position:     Cantor Index:
-(0,0) (0,1)     0   2
-(1,0) (1,1)     1   4
-```
-
-This encodes self-similar spatial relationships without learned parameters.
 
 ---
 
-## Documentation
+## Address Types
 
-Detailed documentation is in `getting_started/`:
+Different manifolds for different routing semantics:
 
-| Document | Description |
-|----------|-------------|
-| [INDEX.md](getting_started/INDEX.md) | Documentation overview and quick reference |
-| [PROTOCOL.md](getting_started/PROTOCOL.md) | Complete protocol specification |
-| [ARCHITECTURE.md](getting_started/ARCHITECTURE.md) | Component deep dive |
-| [MATHEMATICS.md](getting_started/MATHEMATICS.md) | Formal foundations |
-| [RATIONALITY.md](getting_started/RATIONALITY.md) | Why each component exists |
-| [FUSION.md](getting_started/FUSION.md) | Fusion strategy guide |
-| [FACTORY.md](getting_started/FACTORY.md) | Prototype building guide |
+| Address Type | Manifold | Best For |
+|--------------|----------|----------|
+| `AddressComponent` | Euclidean (ℝⁿ) | General purpose |
+| `SphericalAddressComponent` | Unit hypersphere | Normalized representations |
+| `HyperbolicAddressComponent` | Poincaré ball | Hierarchical relationships |
+| `SimplexAddressComponent` | Probability simplex | Barycentric blending |
+| `FractalAddressComponent` | Julia set orbits | Chaotic/emergent dynamics |
+| `CantorAddressComponent` | Devil's staircase | Plateau clustering |
+| `ShapeAddressComponent` | RoPE-compatible | Positional/rotational |
+
+---
+
+## Fusion Strategies
+
+| Strategy | Description | Use Case |
+|----------|-------------|----------|
+| `AdaptiveFusion` | Content-dependent weights | General (Lyra pattern) |
+| `ConcatFusion` | Concatenate + project | Simple combination |
+| `SumFusion` | Learned weighted sum | Averaging with weights |
+| `GatedFusion` | Sigmoid gates per input | Selective combination |
+| `AttentionFusion` | Cross-attention | Sequence-to-sequence |
+| `SlotFusion` | Collapse slot dimension | After slot expansion |
 
 ---
 
 ## Key Principles
 
-### 1. Divergence Over Accuracy
+### 1. Components, Not Modules
 
-Don't optimize individual streams for accuracy. Optimize the collective for emergence.
+Everything is a **component** with identity (`name`, `uuid`), lifecycle hooks, and parent awareness. Raw `nn.Module` lacks these coordination features.
 
-### 2. Coordination Without Gradients
+### 2. Stages Are Components
 
-Mailbox content is detached. Streams learn to coordinate through observation, not backpropagation. This prevents collapse.
+Tower stages should be `TorchComponent` subclasses, not raw primitives like `nn.Linear`. This enables uniform output capture and block-level operations (freezing, distillation, replacement).
 
-### 3. Constitutive Contribution
+### 3. Towers Produce Opinions
 
-Every learned component must contribute directly to output. Additive biases die.
+A tower's output is its *opinion* - a local conclusion from its perspective. The collective triangulates from divergent opinions.
 
-### 4. Fingerprint Identity
+### 4. Geometric Routing
 
-Each head's fingerprint creates its unique perspective. Same architecture, different identity, different behavior.
+Addresses give towers geometric identity. Routing decisions are based on manifold geometry (similarity, distance, affinity), not just names.
+
+### 5. Divergence Over Accuracy
+
+Individual towers don't need to be accurate. They need to see *differently*. The collective emerges from triangulating divergent perspectives.
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| [GETTING_STARTED.md](GETTING_STARTED.md) | Complete tutorial with examples |
 
 ---
 
@@ -290,6 +371,7 @@ Each head's fingerprint creates its unique perspective. Same architecture, diffe
 - Task benefits from diverse perspectives
 - Individual models underperform but see different things
 - You want emergence, not just averaging
+- Multi-GPU deployment with device affinity
 
 **Not ideal:**
 - Single model already solves the task well
@@ -299,6 +381,7 @@ Each head's fingerprint creates its unique perspective. Same architecture, diffe
 ---
 
 ## Citation
+
 ```bibtex
 @software{geofractalrouter2025,
   author       = {AbstractPhil},
@@ -319,4 +402,4 @@ See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
 
 ---
 
-*"Individual streams don't need to classify accurately. They need to see differently. The routing fabric triangulates truth from divergent viewpoints."*
+*"Individual towers don't need to be accurate. They need to see differently. The routing fabric triangulates truth from divergent viewpoints."*
