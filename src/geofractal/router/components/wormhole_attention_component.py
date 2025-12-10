@@ -1225,7 +1225,7 @@ if __name__ == '__main__':
     print("  ✓ torch.compile compatible")
 
     print("\nCantor semantics fixed:")
-    print("  ✗ REMOVED: Scalar distance on Cantor values (meaningless)")
+    print("  ✗ REMOVED: Scalar distance on Cantor only values (cantor shapes)")
     print("  ✓ ADDED: Branch path alignment (ternary decomposition)")
     print("  ✓ ADDED: Hierarchical weighting (coarse levels matter more)")
 

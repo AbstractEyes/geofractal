@@ -4,25 +4,48 @@ geofractal.router.components.cantor_address_component
 
 CantorAddressComponent - Address with Cantor/Beatrix fingerprint for geometric routing.
 
-This component provides addresses based on the Devil's Staircase (Cantor function),
-enabling routing decisions based on hierarchical structure rather than scalar distance.
+PHILOSOPHICAL FOUNDATION:
 
-CRITICAL INSIGHT: Distance is meaningless on the Cantor set.
+    Cantor fingerprints are NOT "helpers" - they are GUARANTEED DETERMINISTIC
+    RECURSIVE TOPOLOGY. Position 0.37 ALWAYS maps to the same branch path.
+    This is mathematical truth, not learned behavior.
 
-    The Cantor set is totally disconnected - between any two points lie infinitely
-    many removed intervals. There is no continuous path, no meaningful "distance."
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  WHAT CANTOR TOPOLOGY IS:                                          │
+    │  - Globally accessible deterministic structure                     │
+    │  - Guaranteed recursive self-similarity                            │
+    │  - Fixed mathematical truth independent of learning                │
+    │                                                                    │
+    │  WHAT IT IS NOT:                                                   │
+    │  - A "better" distance metric                                      │
+    │  - A replacement for Euclidean operations                          │
+    │  - Something that "helps" - it simply EXISTS                       │
+    └─────────────────────────────────────────────────────────────────────┘
 
-    The Devil's Staircase makes this concrete:
-    - It's constant across gaps (the removed middle thirds)
-    - It only "moves" on the measure-zero Cantor set itself
-    - Two values 0.001 apart in scalar terms could be separated by infinite hierarchy
-    - Two values 0.5 apart could share coarse routing highways
+DISTANCE AS BRIDGE TOOL:
 
-WHAT HAS MEANING:
-    - Branch path alignment (do ternary paths share structure?)
-    - Plateau membership (same routing behavior at scale?)
-    - First divergence level (where do paths split?)
-    - Hierarchical weighting (coarse levels matter more: 0.5^k)
+    Distance is not forbidden - it's a BRIDGE to Euclidean systems.
+
+    Euclidean mathematics has 300+ years of refinement. We interface with
+    these systems via scalar projections (distance, measure). This is lossy
+    but necessary - we don't have a lifetime to rewrite all of mathematics.
+
+    distance() = scalar projection of topology → Euclidean interface
+    alignment() = native topological comparison → Cantor-native
+
+    Use distance when interfacing with Euclidean systems.
+    Use alignment when operating in Cantor-native context.
+
+THE MESH PROBLEM:
+
+    We are meshing:
+    - π-based systems (continuous, transcendental, circular)
+    - Cantor dust (totally disconnected, measure zero, fractal)
+
+    This is inherently difficult. The Devil's Staircase is our bridge:
+    - Continuous (interfaces with π-systems)
+    - Encodes Cantor structure (preserves topology)
+    - Constant across gaps (respects disconnection)
 
 Mathematical Foundation:
     Devil's Staircase: C(x) = Σ_{k=1}^{levels} bit_k × 0.5^k
@@ -33,14 +56,12 @@ Mathematical Foundation:
     - α controls middle third fill (learnable)
     - τ controls softmax temperature
 
-    Hierarchical Alignment:
+    Hierarchical Alignment (Cantor-native):
     - Level 1 (coarse L/M/R thirds): weight 0.5
     - Level 2: weight 0.25
     - Level 3: weight 0.125
-    - etc.
-
-    Two positions matching at coarse levels share "routing highways"
-    enabling wormhole teleportation. Fine matches only indicate local structure.
+    - Coarse matches → routing highways (wormholes)
+    - Fine matches → local structure only
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -331,28 +352,34 @@ class CantorAddressComponent(TorchComponent):
     """
     Address with Cantor/Beatrix fingerprint for geometric routing.
 
-    CRITICAL: This component does NOT support scalar distance operations.
-    The Cantor set is totally disconnected - distance is meaningless.
+    CORE PRINCIPLE:
+        Cantor topology is DETERMINISTIC TRUTH, not learned behavior.
+        Position 0.37 ALWAYS maps to the same branch path.
+        The learning happens in WHEN to use this topology.
 
-    SUPPORTED OPERATIONS:
-        - branch_alignment(): Hierarchically-weighted path similarity
-        - raw_branch_alignment(): Count of matching levels (use hierarchical instead)
-        - first_divergence(): Where paths split in hierarchy
-        - same_plateau(): Share routing behavior at scale?
-        - is_routable_to(): Can route with minimum alignment?
-        - feature_similarity(): Cosine on hierarchical features
+    TWO OPERATION MODES:
 
-    NOT SUPPORTED (raises NotImplementedError):
-        - distance(): Scalar distance is meaningless
-        - cantor_distance(): Also meaningless
+        1. CANTOR-NATIVE (alignment-based):
+           - branch_alignment(): Hierarchical path matching
+           - same_plateau(): Share routing highways?
+           - first_divergence(): Where do paths split?
+           Use when operating within Cantor topology.
+
+        2. EUCLIDEAN BRIDGE (distance-based):
+           - distance(): Scalar |C(x) - C(y)| projection
+           - cantor_distance(): Same as distance()
+           Use when interfacing with Euclidean systems (optimizers, losses).
+
+        The bridge is LOSSY but NECESSARY. Euclidean systems have
+        300+ years of refinement. We interface, we don't replace.
 
     Attributes:
         position: Normalized position in [0, 1]
         alpha: Middle third weight (routing density)
         tau: Softmax temperature
-        cantor_measure: Scalar value (for PE only, NOT routing)
+        cantor_measure: Scalar value (EUCLIDEAN BRIDGE)
         features: Per-level features, shape (levels, 2)
-        branch_path: Hard ternary assignments, shape (levels,)
+        branch_path: Hard ternary assignments (DETERMINISTIC TOPOLOGY)
         plateau_id: Encodes position in Cantor hierarchy
         fingerprint: Flattened features for compatibility
     """
@@ -388,6 +415,13 @@ class CantorAddressComponent(TorchComponent):
         else:
             self.register_buffer('_position', torch.tensor(position, dtype=torch.float32))
 
+        # Register fingerprint buffers (will be populated by _update_fingerprint)
+        # These must be buffers so they move with .to(device)
+        self.register_buffer('_cantor_measure', torch.tensor(0.0, dtype=torch.float32))
+        self.register_buffer('_features', torch.zeros(config.levels, 2, dtype=torch.float32))
+        self.register_buffer('_branch_path', torch.zeros(config.levels, dtype=torch.int32))
+        self.register_buffer('_plateau_id', torch.tensor(0, dtype=torch.int64))
+
         # Precompute fingerprint
         self._update_fingerprint()
 
@@ -395,8 +429,14 @@ class CantorAddressComponent(TorchComponent):
         """Recompute fingerprint from current position."""
         with torch.no_grad():
             pos = self._position.clamp(0, 1)
-            self._cantor_measure, self._features, self._branch_path = self.staircase(pos)
-            self._plateau_id = self.staircase.plateau_id(self._branch_path)
+            cantor_measure, features, branch_path = self.staircase(pos)
+            plateau_id = self.staircase.plateau_id(branch_path)
+
+            # Copy to registered buffers (preserves device)
+            self._cantor_measure.copy_(cantor_measure)
+            self._features.copy_(features)
+            self._branch_path.copy_(branch_path)
+            self._plateau_id.copy_(plateau_id)
 
     # =========================================================================
     # PROPERTIES
@@ -562,45 +602,37 @@ class CantorAddressComponent(TorchComponent):
         return ''.join(mapping[b.item()] for b in self._branch_path)
 
     # =========================================================================
-    # FORBIDDEN OPERATIONS (raise NotImplementedError)
+    # EUCLIDEAN BRIDGE OPERATIONS (Scalar Projections)
     # =========================================================================
 
     def distance(self, other: 'CantorAddressComponent') -> float:
         """
-        FORBIDDEN: Scalar distance is meaningless on Cantor set.
+        Scalar distance between Cantor measures.
 
-        The Cantor set is totally disconnected. Between any two points
-        lie infinitely many removed intervals. There is no continuous
-        path, no meaningful distance.
+        EUCLIDEAN BRIDGE: Lossy projection of topology into scalar space.
 
-        Use instead:
-            - branch_alignment(): Hierarchically-weighted path similarity
-            - first_divergence(): Where paths split
-            - same_plateau(): Share routing behavior?
-            - is_routable_to(): Can route with minimum alignment?
+        Use when interfacing with Euclidean systems (optimizers, losses,
+        traditional neural network components). This is necessary because
+        Euclidean mathematics has 300+ years of refinement.
+
+        For Cantor-native operations, use branch_alignment() instead.
+
+        Note: Two positions close in distance may have very different
+        branch paths. Two positions far in distance may share coarse
+        structure. The scalar projection is LOSSY but NECESSARY.
+
+        Returns:
+            |C(self) - C(other)| in [0, 1]
         """
-        raise NotImplementedError(
-            "Distance is meaningless on the Cantor set. "
-            "The set is totally disconnected - between any two points "
-            "lie infinitely many removed intervals. "
-            "Use branch_alignment(), same_plateau(), or is_routable_to() instead."
-        )
+        return abs(self._cantor_measure.item() - other._cantor_measure.item())
 
     def cantor_distance(self, other: 'CantorAddressComponent') -> float:
         """
-        FORBIDDEN: Cantor distance is also meaningless.
+        Alias for distance().
 
-        Even distance between Cantor measure values (C(x) - C(y)) is meaningless
-        because the Devil's Staircase is constant across gaps.
-        Two positions close in Cantor measure may be separated by infinite hierarchy.
+        EUCLIDEAN BRIDGE: Same as distance(), provided for API clarity.
         """
-        raise NotImplementedError(
-            "Cantor distance is meaningless. "
-            "The Devil's Staircase is constant across gaps - "
-            "two positions close in Cantor measure may be separated by "
-            "infinite hierarchical structure. "
-            "Use branch_alignment(), same_plateau(), or is_routable_to() instead."
-        )
+        return self.distance(other)
 
     # =========================================================================
     # SERIALIZATION
@@ -1011,22 +1043,28 @@ if __name__ == '__main__':
         print(f"  origin -> {b.name}: {result} (alignment={alignment:.4f})")
 
     # =========================================================================
-    section("DISTANCE IS FORBIDDEN")
+    section("EUCLIDEAN BRIDGE (distance)")
     # =========================================================================
 
-    print("Attempting to call distance()...")
-    try:
-        addr_origin.distance(addr_quarter)
-        print("  ERROR: Should have raised NotImplementedError!")
-    except NotImplementedError as e:
-        print(f"  ✓ Correctly rejected: {str(e)[:60]}...")
+    print("Testing distance() as Euclidean bridge:")
+    dist_oq = addr_origin.distance(addr_quarter)
+    dist_om = addr_origin.distance(addr_middle)
+    dist_ot = addr_origin.distance(addr_three_q)
 
-    print("\nAttempting to call cantor_distance()...")
-    try:
-        addr_origin.cantor_distance(addr_quarter)
-        print("  ERROR: Should have raised NotImplementedError!")
-    except NotImplementedError as e:
-        print(f"  ✓ Correctly rejected: {str(e)[:60]}...")
+    print(f"\n  origin → quarter:       distance={dist_oq:.4f}")
+    print(f"  origin → middle:        distance={dist_om:.4f}")
+    print(f"  origin → three_quarter: distance={dist_ot:.4f}")
+
+    print("\nComparing BRIDGE (distance) vs NATIVE (alignment):")
+    print(f"  {'Pair':25s} {'Distance':>10s} {'Alignment':>10s}")
+    print(f"  {'-'*25} {'-'*10} {'-'*10}")
+    for other in [addr_quarter, addr_middle, addr_three_q]:
+        d = addr_origin.distance(other)
+        a = addr_origin.branch_alignment(other)
+        print(f"  origin → {other.name:15s} {d:10.4f} {a:10.4f}")
+
+    print("\nNote: Distance is LOSSY projection for Euclidean interfaces.")
+    print("      Use alignment for Cantor-native routing decisions.")
 
     # =========================================================================
     section("CANTOR ADDRESS BOOK")
@@ -1107,18 +1145,22 @@ if __name__ == '__main__':
     # =========================================================================
 
     print("\nCantorAddressComponent provides:")
-    print("  ✓ Branch path (ternary decomposition)")
-    print("  ✓ Hierarchical alignment (0.5^k weighting)")
-    print("  ✓ Plateau membership (hierarchical clustering)")
-    print("  ✓ First divergence level")
-    print("  ✓ Routability check")
-    print("  ✓ Feature similarity")
-    print("  ✓ Alpha modulation (sparse ↔ dense routing)")
-    print("  ✓ Alignment-based message routing")
+    print("\n  CANTOR-NATIVE (topology):")
+    print("    ✓ Branch path (ternary decomposition)")
+    print("    ✓ Hierarchical alignment (0.5^k weighting)")
+    print("    ✓ Plateau membership (hierarchical clustering)")
+    print("    ✓ First divergence level")
+    print("    ✓ Routability check")
+    print("    ✓ Feature similarity")
 
-    print("\nFORBIDDEN (meaningless on Cantor set):")
-    print("  ✗ distance()")
-    print("  ✗ cantor_distance()")
+    print("\n  EUCLIDEAN BRIDGE (scalar projection):")
+    print("    ✓ distance() - |C(x) - C(y)| for Euclidean interface")
+    print("    ✓ cantor_distance() - alias for API clarity")
+    print("    ✓ Alpha modulation (sparse ↔ dense routing)")
+    print("    ✓ Alignment-based message routing")
 
-    print("\nCantorAddressComponent is ready for geometric routing.")
-    print("'Distance is an illusion.'")
+    print("\n  The bridge is LOSSY but NECESSARY.")
+    print("  Euclidean has 300+ years of refinement.")
+    print("  We interface, we don't replace.")
+
+    print("\n  CantorAddressComponent is ready for geometric routing.")
