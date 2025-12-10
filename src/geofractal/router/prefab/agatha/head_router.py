@@ -281,7 +281,7 @@ class EncoderStream(TorchComponent):
 
         # Project if needed
         if self.projection is not None:
-            features = self.projection(features)
+            features = self.projection(features.to(self.projection.weight.dtype))
 
         # Get learned fingerprint (expand to batch)
         B = features.shape[0]
@@ -571,7 +571,9 @@ class AgathaHeadRouter(BaseRouter):
                         content = content.mean(dim=1)
                     pooled.append(content)
 
-            # Fuse
+            # Cast to fusion dtype and fuse
+            fusion_dtype = next(self._fusion.parameters()).dtype
+            pooled = [p.to(fusion_dtype) for p in pooled]
             fused = self._fusion(*pooled)
 
             # Get fusion fingerprint (expand to batch)
