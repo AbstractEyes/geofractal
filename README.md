@@ -43,7 +43,10 @@ The collective achieves what no individual can.
 | **Address** | Geometric identity on a manifold                         | Fingerprints enable similarity/distance routing |
 | **Fusion** | Opinion aggregation                                      | Where emergence happens |
 
-More routers to come.
+More routers, towers, components, and collective patterns are planned for immediate and future releases.
+
+Device transfer for compiled torch models is fairly untested at this time - 
+the architecture is designed to support it, but real-world usage may vary based on architecture and model specifics.
 
 ---
 
