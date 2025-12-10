@@ -14,7 +14,7 @@ def visualize_cantor_topology():
     It should show a fractal block structure, proving that the system
     organizes information by Branch Path, not by Array Index.
     """
-    seq_len = 1024  # Sufficient length to see recursive structure
+    seq_len = 10240  # Sufficient length to see recursive structure
     head_dim = 64
     levels = 5
 
