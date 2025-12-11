@@ -115,7 +115,7 @@ class BaseComponent(ABC):
         Args:
             parent: The router this component is being attached to.
         """
-        pass
+        ...
 
     def on_detach(self) -> None:
         """
@@ -124,7 +124,7 @@ class BaseComponent(ABC):
         Override for cleanup. Parent is still set when this is called,
         cleared immediately after.
         """
-        pass
+        ...
 
     # =========================================================================
     # PYTORCH-STYLE ACCESS (override in subclasses)
