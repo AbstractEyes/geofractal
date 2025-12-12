@@ -97,28 +97,28 @@ class CollectiveOpinion:
 # SAFE ATTACH MIXIN
 # =============================================================================
 
-#lass SafeAttachMixin:
-#   """
-#   Mixin that overrides attach() to avoid nn.Module parent cycle.
+class SafeAttachMixin:
+    """
+    Mixin that overrides attach() to avoid nn.Module parent cycle.
 
-#   The issue: When BaseRouter.attach() sets component.parent = self,
-#   and both are nn.Module, PyTorch's __setattr__ registers self as
-#   a submodule of component, creating a cycle.
+    The issue: When BaseRouter.attach() sets component.parent = self,
+    and both are nn.Module, PyTorch's __setattr__ registers self as
+    a submodule of component, creating a cycle.
 
-#   Fix: Use object.__setattr__ to bypass nn.Module tracking.
-#   """
+    Fix: Use object.__setattr__ to bypass nn.Module tracking.
+    """
 
-#   def attach(self, name: str, component: Any) -> None:
-#       """Attach component without creating parent cycle."""
-#       if isinstance(component, nn.Module):
-#           self.components[name] = component
-#       else:
-#           self.objects[name] = component
+    def attach(self, name: str, component: Any) -> None:
+        """Attach component without creating parent cycle."""
+        if isinstance(component, nn.Module):
+            self.components[name] = component
+        else:
+            self.objects[name] = component
 
-#       # Set parent using object.__setattr__ to bypass nn.Module tracking
-#       if hasattr(component, 'parent') and hasattr(component, 'on_attach'):
-#           object.__setattr__(component, 'parent', self)
-#           component.on_attach(self)
+        # Set parent using object.__setattr__ to bypass nn.Module tracking
+        if hasattr(component, 'parent') and hasattr(component, 'on_attach'):
+            object.__setattr__(component, 'parent', self)
+            component.on_attach(self)
 
 
 # =============================================================================
@@ -192,7 +192,7 @@ def build_address(name: str, geometry: GeometryType, fingerprint_dim: int) -> nn
 # GEOMETRIC TOWER (BaseTower + SafeAttach)
 # =============================================================================
 
-class GeometricTower(BaseTower):
+class GeometricTower(SafeAttachMixin, BaseTower):
     """
     Single tower with geometric personality.
 
@@ -298,7 +298,7 @@ class GeometricTower(BaseTower):
 # TOWER COLLECTIVE (BaseRouter + SafeAttach)
 # =============================================================================
 
-class AgathaTowerCollective(BaseRouter):
+class AgathaTowerCollective(SafeAttachMixin, BaseRouter):
     """
     Agatha Block 2: Six Tower Collective.
 
@@ -619,7 +619,7 @@ if __name__ == '__main__':
 
     print("           " + " ".join(f"{n[:7]:>8s}" for n in tower_names))
     for i, name in enumerate(tower_names):
-        row = sim_matrix[i].cpu().detach().numpy()
+        row = sim_matrix[i].detach().cpu().numpy()
         row_str = " ".join(f"{v:8.3f}" for v in row)
         print(f"{name:10s} {row_str}")
 
