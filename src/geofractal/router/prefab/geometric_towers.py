@@ -1,5 +1,5 @@
 """
-geofractal.router.prefab.agatha.tower_collective
+geofractal.router.prefab.geometric_towers
 =================================================
 
 Agatha Block 2: Six Tower Collective
