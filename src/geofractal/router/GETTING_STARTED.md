@@ -10,6 +10,7 @@ A system for building collectives of autonomous AI units that coordinate through
 | **Tower** | Self-encapsulated processing unit | Produces an *opinion*, not just an output |
 | **Address** | Geometric identity on a manifold | Fingerprints enable similarity/distance routing |
 | **NotifierRouter** | Communication backbone | Routes messages based on geometry |
+| **WideRouter** | Compile-optimized wide model router | Near-linear scaling via torch.compile |
 | **Fusion** | Opinion aggregation | Where emergence happens (0.1% → 84.68%) |
 | **Projection** | Shape transformation | SlotProjection enables multi-view processing |
 
@@ -99,6 +100,7 @@ from torch import Tensor
 from geofractal.router.base_tower import BaseTower
 from geofractal.router.components.torch_component import TorchComponent
 from geofractal.router.prefab.notifier_router import NotifierRouter
+from geofractal.router.prefab.wide_router import WideRouter
 from geofractal.router.components.address_component import (
     AddressComponent,
     SphericalAddressComponent,
@@ -207,16 +209,134 @@ for stage in tower:  # Iterate stages
     ...
 ```
 
-### Tower Construction (Fluent API)
+---
+
+## 3. WideRouter for Wide Models
+
+When you have multiple towers processing the same input, **WideRouter** provides compile-optimized execution with near-linear scaling.
+
+### Why WideRouter?
+
+| Method | 8 Towers | Per-Tower |
+|--------|----------|-----------|
+| Sequential (eager) | 2.92ms | 365µs |
+| WideRouter (eager) | 2.81ms | 351µs |
+| Sequential (compiled) | 1.88ms | 235µs |
+| **WideRouter (compiled)** | **1.89ms** | **236µs** |
+
+With more towers, per-tower cost *decreases*:
+
+| Towers | Total Time | Per-Tower |
+|--------|------------|-----------|
+| 4 | 1.03ms | 258µs |
+| 8 | 1.90ms | 238µs |
+| 16 | 3.63ms | 227µs |
+| 32 | 7.21ms | 225µs |
+
+### Basic WideRouter Usage
 
 ```python
-tower = (
-    ExpertTower('encoder', dim=256, depth=2)
-    .append(TransformerBlock('encoder_extra', dim=256))  # Add another block
-)
+from geofractal.router.prefab.wide_router import WideRouter
+
+class SimpleTower(BaseTower):
+    """Simple tower for wide collective."""
+    
+    def __init__(self, name: str, dim: int, depth: int = 2):
+        super().__init__(name, strict=False)
+        
+        for i in range(depth):
+            self.append(nn.Sequential(
+                nn.Linear(dim, dim * 2),
+                nn.GELU(),
+                nn.Linear(dim * 2, dim),
+            ))
+        self.attach('norm', nn.LayerNorm(dim))
+    
+    def forward(self, x: Tensor) -> Tensor:
+        for stage in self.stages:
+            x = x + stage(x)
+        return self['norm'](x)
+
+
+class WideCollective(WideRouter):
+    """Compile-optimized collective."""
+    
+    def __init__(self, name: str, num_towers: int, dim: int):
+        super().__init__(name, auto_discover=True)
+        
+        # Attach towers
+        for i in range(num_towers):
+            self.attach(f'tower_{i}', SimpleTower(f'tower_{i}', dim))
+        
+        # IMPORTANT: Call discover_towers() after attaching
+        self.discover_towers()
+        
+        # Fusion
+        self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
+    
+    def forward(self, x: Tensor) -> Tensor:
+        # wide_forward returns Dict[tower_name, output]
+        opinions = self.wide_forward(x)
+        return self['fusion'](*opinions.values())
+
+
+# Create collective
+collective = WideCollective('wide', num_towers=8, dim=256)
+collective.network_to(device='cuda')
+
+# Compile for best performance
+compiled = collective.prepare_and_compile()
+
+# Use compiled model
+x = torch.randn(32, 64, 256, device='cuda')
+output = compiled(x)
 ```
 
-## 3. Adding Addresses for Coordination
+### WideRouter Methods
+
+| Method | Purpose |
+|--------|---------|
+| `discover_towers()` | Find and register all BaseTower components |
+| `analyze_structure()` | Analyze tower structure for alignment |
+| `wide_forward(x)` | Execute all towers, return Dict[name, output] |
+| `compile(**kwargs)` | Compile with torch.compile |
+| `prepare_and_compile(**kwargs)` | Analyze + compile (recommended) |
+| `get_wide_stats()` | Get execution statistics |
+
+### WideRouter Best Practices
+
+1. **Call `discover_towers()` in `__init__`** after attaching all towers
+2. **Use `prepare_and_compile()`** instead of raw `torch.compile()`
+3. **Pre-analyze before compile** - structure analysis uses Python constructs that dynamo can't trace
+4. **Set `torch.set_float32_matmul_precision('high')`** for better performance
+
+```python
+# Recommended pattern
+torch.set_float32_matmul_precision('high')
+
+collective = WideCollective('wide', num_towers=16, dim=256)
+collective.network_to(device='cuda')
+
+# prepare_and_compile = analyze_structure() + compile()
+compiled = collective.prepare_and_compile()
+
+# For fine control:
+# collective.analyze_structure()  # Separate analysis
+# compiled = collective.compile(mode='reduce-overhead')
+```
+
+### When to Use WideRouter vs BaseRouter
+
+| Use WideRouter | Use BaseRouter |
+|----------------|----------------|
+| 4+ towers with same structure | Heterogeneous tower structures |
+| All towers process same input | Different inputs per tower |
+| Throughput-critical | Fine-grained execution control |
+| Want `torch.compile` benefits | Need geometric routing between towers |
+
+---
+
+## 4. Adding Addresses for Coordination
 
 Addresses give towers geometric identity for routing.
 
@@ -235,395 +355,162 @@ class AddressedTower(BaseTower):
     ):
         super().__init__(name)
         
-        # Create address component based on geometry
-        if address_type == 'euclidean':
-            addr = AddressComponent(name, fingerprint_dim=64)
-        elif address_type == 'spherical':
+        # Create address based on type
+        if address_type == 'spherical':
             addr = SphericalAddressComponent(name, fingerprint_dim=64)
-        # ... other types: hyperbolic, simplex, fractal, cantor, shape
+        else:
+            addr = AddressComponent(name, fingerprint_dim=64)
         
-        # Attach address as component
         self.attach('address', addr)
         self.attach('notifier', notifier)
-        self.attach('channel', channel)
-        
-        # Register with router
         notifier.register(addr, channel=channel)
         
-        # Stages are TorchComponent instances (TransformerBlock from section 1)
+        # Stages
         for i in range(depth):
             self.append(TransformerBlock(f'{name}_block_{i}', dim))
-        
         self.attach('final_norm', nn.LayerNorm(dim))
     
     def forward(self, x: Tensor) -> Tensor:
         # Check for incoming messages
         addr = self['address']
         if addr.has_mail:
-            knowledge = addr.aggregate_inbox('mean')
-            if knowledge is not None and knowledge.shape == x.shape:
-                x = x + 0.1 * knowledge
+            mail = addr.aggregate_inbox('mean')
+            if mail is not None and mail.shape == x.shape:
+                x = x + 0.1 * mail
             addr.clear()
         
-        # Process through component stages
+        # Process
         for stage in self.stages:
             x = stage(x)
         return self['final_norm'](x)
     
-    def share(self, opinion: Tensor):
-        """Broadcast opinion to channel subscribers."""
-        self['notifier'].post(self['address'], opinion, self['channel'])
+    def broadcast(self, opinion: Tensor):
+        """Share opinion with collective."""
+        self['notifier'].post(self['address'], opinion, channel='default')
 ```
 
-## 4. Setting Up Communication
+---
 
-NotifierRouter orchestrates message passing between towers.
+## 5. Fusion Strategies
 
-```python
-# Create router
-notifier = NotifierRouter('collective_comm')
-
-# Create towers with addresses (depth parameter controls block count)
-teacher = AddressedTower('teacher', dim=512, notifier=notifier, depth=4, address_type='spherical', channel='knowledge')
-student_a = AddressedTower('student_a', dim=256, notifier=notifier, depth=2, address_type='spherical', channel='knowledge')
-student_b = AddressedTower('student_b', dim=256, notifier=notifier, depth=2, address_type='spherical', channel='knowledge')
-
-# Add projector for dimension mismatch (teacher 512 → student 256)
-notifier.create_projector('teacher', 'student_a', 512, 256)
-notifier.create_projector('teacher', 'student_b', 512, 256)
-```
-
-### Message Patterns
-
-```python
-# Post to channel (one-to-many)
-notifier.post(source_addr, payload, channel='knowledge')
-
-# Direct send (one-to-one)
-notifier.send(source_addr, target_addr, payload)
-
-# Broadcast to all (one-to-all)
-notifier.broadcast(source_addr, payload)
-
-# Execute routing (delivers queued messages)
-notifier.route()
-```
-
-## 5. Geometric Routing
-
-Route based on fingerprint geometry, not just names.
-
-```python
-# Route to k most similar addresses
-targets = notifier.route_by_similarity(
-    source_addr,
-    payload,
-    channel='experts',
-    top_k=3,
-    threshold=0.5,  # Optional minimum similarity
-)
-
-# Route to nearest by manifold distance
-targets = notifier.route_by_distance(
-    source_addr,
-    payload,
-    channel='experts',
-    top_k=3,
-    max_distance=1.0,  # Optional maximum distance
-)
-
-# Affinity broadcast (weighted by similarity)
-weights = notifier.affinity_broadcast(
-    source_addr,
-    payload,
-    channel='experts',
-    temperature=0.5,  # Lower = sharper weights
-)
-```
-
-### Address Types and Their Geometry
-
-| Type | Manifold | Best For |
-|------|----------|----------|
-| `AddressComponent` | Euclidean (R^n) | General purpose |
-| `SphericalAddressComponent` | Unit hypersphere | Normalized representations |
-| `HyperbolicAddressComponent` | Poincaré ball | Hierarchical relationships |
-| `SimplexAddressComponent` | Probability simplex | Barycentric blending |
-| `FractalAddressComponent` | Julia set orbits | Chaotic/emergent dynamics |
-| `CantorAddressComponent` | Devil's staircase | Plateau clustering |
-| `ShapeAddressComponent` | RoPE-compatible | Positional/rotational |
-
-## 6. Fusing Opinions
-
-Combine multiple tower outputs into collective decision.
+Different fusion strategies for different needs:
 
 ```python
 from geofractal.router.components.fusion_component import (
-    AdaptiveFusion,  # Content-dependent weights (Lyra pattern)
-    ConcatFusion,    # Concatenate then project
-    SumFusion,       # Learned weighted sum
-    GatedFusion,     # Sigmoid gates per input
-    AttentionFusion, # Cross-attention
-    SlotFusion,      # Collapse slot dimension
+    AdaptiveFusion,    # Content-dependent weights (recommended)
+    GatedFusion,       # Sigmoid gates per input
+    AttentionFusion,   # Cross-attention between inputs
+    ConcatFusion,      # Concatenate + project
+    SumFusion,         # Learned weighted sum
 )
 
-# Adaptive fusion - each input influences its own weight
-fusion = AdaptiveFusion('collective', num_inputs=3, in_features=256)
+# AdaptiveFusion - learns to weight based on content
+fusion = AdaptiveFusion('fusion', num_inputs=3, in_features=256)
+fused = fusion(opinion_a, opinion_b, opinion_c)
 
-# Get opinions from towers
-opinion_a = tower_a(x)
-opinion_b = tower_b(x)
-opinion_c = tower_c(x)
-
-# Fuse into collective decision
-collective_opinion = fusion(opinion_a, opinion_b, opinion_c)
+# GatedFusion - binary-ish selection
+fusion = GatedFusion('fusion', num_inputs=3, in_features=256)
+fused = fusion(opinion_a, opinion_b, opinion_c)
 ```
 
-## 7. Slot Expansion (The Emergence Mechanism)
+---
 
-SlotProjection transforms single vectors into multi-view representations.
-
-```python
-from geofractal.router.components.projection_component import SlotProjection
-
-# Expand to multiple learned viewpoints
-slot_proj = SlotProjection('views', features=256, num_slots=16)
-
-x = torch.randn(4, 256)        # [B, D]
-expanded = slot_proj(x)         # [B, 16, D] - 16 different views
-collapsed = slot_proj.collapse(expanded, mode='mean')  # [B, D]
-```
-
-This is the mechanism that enabled 0.1% individual accuracy → 84.68% collective accuracy.
-
-## 8. Complete Example: Teacher-Student Collective
-
-A complete, copy-paste ready example combining all concepts:
+## 6. Complete Example: Wide Collective with Routing
 
 ```python
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-from geofractal.router.base_router import BaseRouter
+from geofractal.router.prefab.wide_router import WideRouter
+from geofractal.router.prefab.notifier_router import NotifierRouter
 from geofractal.router.base_tower import BaseTower
 from geofractal.router.components.torch_component import TorchComponent
-from geofractal.router.prefab.notifier_router import NotifierRouter
 from geofractal.router.components.address_component import SphericalAddressComponent
 from geofractal.router.components.fusion_component import AdaptiveFusion
-from geofractal.router.components.projection_component import SlotProjection
 
 
 class TransformerBlock(TorchComponent):
-    """Reusable transformer block component.
-    
-    Note: This is a TorchComponent, not a BaseTower.
-    It has identity (name, uuid), lifecycle hooks, and device affinity.
-    """
-    
     def __init__(self, name: str, dim: int, num_heads: int = 8):
         super().__init__(name)
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(dim, num_heads, batch_first=True)
         self.norm2 = nn.LayerNorm(dim)
         self.ffn = nn.Sequential(
-            nn.Linear(dim, dim * 4),
-            nn.GELU(),
-            nn.Linear(dim * 4, dim),
+            nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
         )
     
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
-        x = x + self.ffn(self.norm2(x))
-        return x
+        return x + self.ffn(self.norm2(x))
 
 
-class TeacherTower(BaseTower):
-    def __init__(self, name: str, dim: int, notifier: NotifierRouter, depth: int = 6):
-        super().__init__(name)
+class ExpertTower(BaseTower):
+    def __init__(self, name: str, dim: int, depth: int = 3):
+        super().__init__(name, strict=False)
         
-        addr = SphericalAddressComponent(name, fingerprint_dim=64)
-        self.attach('address', addr)
-        self.attach('notifier', notifier)
-        notifier.register(addr, channel='distillation')
-        
-        # Deep tower with block stages
         for i in range(depth):
             self.append(TransformerBlock(f'{name}_block_{i}', dim))
-        self.attach('final_norm', nn.LayerNorm(dim))
+        self.attach('norm', nn.LayerNorm(dim))
     
     def forward(self, x: Tensor) -> Tensor:
         for stage in self.stages:
             x = stage(x)
-        x = self['final_norm'](x)
-        
-        # Broadcast knowledge
-        self['notifier'].post(self['address'], x, channel='distillation')
-        return x
+        return self['norm'](x)
 
 
-class StudentTower(BaseTower):
-    def __init__(self, name: str, dim: int, notifier: NotifierRouter, depth: int = 3, distill_weight: float = 0.3):
-        super().__init__(name)
-        
-        addr = SphericalAddressComponent(name, fingerprint_dim=64)
-        self.attach('address', addr)
-        self.attach('notifier', notifier)
-        self.attach('distill_weight', distill_weight)
-        notifier.register(addr, channel='distillation')
-        
-        # Shallower tower
-        for i in range(depth):
-            self.append(TransformerBlock(f'{name}_block_{i}', dim))
-        self.attach('final_norm', nn.LayerNorm(dim))
+class RoutedWideCollective(WideRouter):
+    """Wide collective with geometric routing."""
     
-    def forward(self, x: Tensor) -> Tensor:
-        for stage in self.stages:
-            x = stage(x)
-        x = self['final_norm'](x)
+    def __init__(self, name: str, num_towers: int, dim: int):
+        super().__init__(name, auto_discover=True)
         
-        # Receive teacher knowledge
-        addr = self['address']
-        if addr.has_mail:
-            knowledge = addr.aggregate_inbox('mean')
-            if knowledge is not None and knowledge.shape == x.shape:
-                w = self['distill_weight']
-                x = (1 - w) * x + w * knowledge
-            addr.clear()
-        
-        return x
-
-
-class Collective(BaseRouter):
-    def __init__(
-        self,
-        name: str,
-        teacher_dim: int,
-        student_dim: int,
-        num_students: int,
-        teacher_depth: int = 6,
-        student_depth: int = 3,
-    ):
-        super().__init__(name)
-        
-        # Communication backbone (component)
+        # Communication backbone
         notifier = NotifierRouter('notifier')
         self.attach('notifier', notifier)
         
-        # Teacher tower - deeper, more capacity
-        teacher = TeacherTower('teacher', teacher_dim, notifier, depth=teacher_depth)
-        self.attach('teacher', teacher)
+        # Expert towers with addresses
+        for i in range(num_towers):
+            tower = ExpertTower(f'expert_{i}', dim)
+            addr = SphericalAddressComponent(f'expert_{i}', fingerprint_dim=64)
+            tower.attach('address', addr)
+            notifier.register(addr, channel='experts')
+            self.attach(f'expert_{i}', tower)
         
-        # Student towers - shallower, learn from teacher
-        for i in range(num_students):
-            student = StudentTower(f'student_{i}', student_dim, notifier, depth=student_depth)
-            self.attach(f'student_{i}', student)
-            
-            # Projector for dimension mismatch
-            if teacher_dim != student_dim:
-                notifier.create_projector('teacher', student.name, teacher_dim, student_dim)
-        
-        # Fusion (component)
-        fusion = AdaptiveFusion('fusion', num_inputs=num_students, in_features=student_dim)
-        self.attach('fusion', fusion)
-        
-        # Config (object)
-        self.attach('config', {
-            'teacher_dim': teacher_dim,
-            'student_dim': student_dim,
-            'num_students': num_students,
-            'teacher_depth': teacher_depth,
-            'student_depth': student_depth,
-        })
+        self.discover_towers()
+        self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
+        self.objects['num_towers'] = num_towers
     
-    def forward(self, teacher_input: Tensor, student_inputs: list[Tensor]) -> Tensor:
-        config = self['config']
+    def forward(self, x: Tensor) -> Tensor:
+        # Get opinions from all towers
+        opinions = self.wide_forward(x)
         
-        # Teacher processes and broadcasts
-        _ = self['teacher'](teacher_input)
+        # Each tower shares its opinion
+        notifier = self['notifier']
+        for name, opinion in opinions.items():
+            tower = self[name]
+            notifier.post(tower['address'], opinion, channel='experts')
         
         # Route messages
-        self['notifier'].route()
+        notifier.route()
         
-        # Students process with teacher knowledge
-        opinions = [
-            self[f'student_{i}'](student_inputs[i])
-            for i in range(config['num_students'])
-        ]
-        
-        # Fuse student opinions
-        return self['fusion'](*opinions)
+        # Fuse
+        return self['fusion'](*opinions.values())
 
 
 # Usage
-collective = Collective('my_collective', teacher_dim=512, student_dim=256, num_students=3)
+torch.set_float32_matmul_precision('high')
 
-# Sequence inputs: [B, L, D]
-teacher_x = torch.randn(4, 32, 512)
-student_xs = [torch.randn(4, 32, 256) for _ in range(3)]
+collective = RoutedWideCollective('routed', num_towers=8, dim=256)
+collective.network_to(device='cuda')
+compiled = collective.prepare_and_compile()
 
-output = collective(teacher_x, student_xs)
-print(f"Collective output: {output.shape}")  # [4, 32, 256]
-print(f"Stats: {collective['notifier'].stats}")
+x = torch.randn(32, 64, 256, device='cuda')
+output = compiled(x)
+print(f"Output: {output.shape}")  # [32, 64, 256]
 ```
 
-## 9. Hierarchical Routing (Hyperbolic)
-
-For tree-like relationships where some towers are "parents" of others.
-
-```python
-from geofractal.router.components.address_component import HyperbolicAddressComponent
-
-notifier = NotifierRouter('hierarchy')
-
-# Create hyperbolic addresses
-root = HyperbolicAddressComponent('root', fingerprint_dim=64, curvature=1.0)
-child_a = HyperbolicAddressComponent('child_a', fingerprint_dim=64, curvature=1.0)
-child_b = HyperbolicAddressComponent('child_b', fingerprint_dim=64, curvature=1.0)
-
-for addr in [root, child_a, child_b]:
-    notifier.register(addr, channel='tree')
-
-# Find parent (closer to origin in Poincaré ball)
-parent = notifier.find_hierarchical_parent(child_a, channel='tree')
-
-# Find children (further from origin)
-children = notifier.find_hierarchical_children(root, channel='tree')
-```
-
-## 10. Custom Routing Functions
-
-Define your own routing logic per channel.
-
-```python
-def similarity_decay_router(source_addr, target_addr, payload):
-    """Scale payload by similarity (distant = attenuated)."""
-    sim = source_addr.similarity(target_addr)
-    return payload * sim.abs()
-
-notifier.set_routing_function('experts', similarity_decay_router)
-```
-
-## 11. Debugging and Monitoring
-
-```python
-# Statistics
-print(notifier.stats)
-# {'routes_executed': 5, 'messages_routed': 12, 'broadcasts': 1, ...}
-
-# Similarity matrix for a channel
-names, matrix = notifier.similarity_matrix(channel='experts')
-
-# Distance matrix
-names, dist_matrix = notifier.distance_matrix(channel='experts')
-
-# Check subscriptions
-print(notifier.subscribers('knowledge'))  # Set of address names
-print(notifier.channels('teacher'))       # Set of channel names
-
-# Clear state
-notifier.reset()  # Clear mailboxes and stats
-```
+---
 
 ## Summary
 
@@ -632,54 +519,62 @@ notifier.reset()  # Clear mailboxes and stats
 The power of the geofractal system comes from **hierarchical composition**:
 
 ```
-Collective (BaseRouter)
+Collective (WideRouter or BaseRouter)
 ├── NotifierRouter (communication)
-├── TeacherTower (BaseTower)
+├── ExpertTower (BaseTower)
 │   ├── TransformerBlock (TorchComponent) ← stage 0
 │   ├── TransformerBlock (TorchComponent) ← stage 1
 │   └── ...
-├── StudentTower (BaseTower)
-│   ├── TransformerBlock (TorchComponent) ← stage 0
+├── ExpertTower (BaseTower)
 │   └── ...
 └── FusionComponent (TorchComponent)
 ```
 
-Each level produces a **capturable opinion**. You can:
-- Freeze any tower or component independently
-- Replace a teacher's block with a different architecture
-- Distill knowledge at any granularity
-- Route between components, towers, or collectives
+### Router Selection Guide
 
-**Raw primitives (`nn.Linear`, `nn.GELU`) belong inside TorchComponents, not as tower stages.**
+| Scenario | Router | Why |
+|----------|--------|-----|
+| 8+ identical towers, same input | `WideRouter` | Near-linear scaling with compile |
+| 4-8 towers, throughput matters | `WideRouter` | Compile benefits |
+| Heterogeneous towers | `BaseRouter` | Flexibility |
+| Complex inter-tower routing | `BaseRouter` + `NotifierRouter` | Fine control |
 
-### The Component Difference
+### The WideRouter Advantage
 
-| Raw nn.Module | TorchComponent |
-|---------------|----------------|
-| No identity | name + uuid |
-| No lifecycle | on_attach / on_detach |
-| No parent awareness | knows its router |
-| No device affinity | home_device, allowed_devices |
-| Just computes | Participates in coordination |
+```
+Eager (sequential):     O(n) kernel launches, O(n) Python overhead
+Compiled WideRouter:    Fused kernels, minimal Python in hot path
+
+Result: Per-tower cost DECREASES as tower count INCREASES
+        4 towers: 258µs/tower
+       32 towers: 225µs/tower
+```
+
+### Key Takeaways
+
+1. **Use WideRouter for wide models** - let `torch.compile` handle fusion
+2. **Call `discover_towers()` after attaching** - ensures registration
+3. **Use `prepare_and_compile()`** - handles analysis before compile
+4. **Stages are components** - not raw nn.Linear
+5. **Divergence over accuracy** - towers see differently, collective triangulates
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Collective                               │
+│                    WideRouter Collective                        │
 │                                                                 │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
-│  │   Tower A   │  │   Tower B   │  │   Tower C   │             │
-│  │ + Address   │  │ + Address   │  │ + Address   │             │
-│  │ (Spherical) │  │ (Spherical) │  │ (Hyperbolic)│             │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
-│         │                │                │                     │
-│         └────────────────┼────────────────┘                     │
-│                          ↓                                      │
-│              NotifierRouter (geometric routing)                 │
-│                          ↓                                      │
-│              FusionComponent (aggregate opinions)               │
-│                          ↓                                      │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐   │
+│  │ Tower 0 │ │ Tower 1 │ │ Tower 2 │ │ Tower 3 │ │  ...    │   │
+│  └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘ └────┬────┘   │
+│       │          │          │          │          │            │
+│       └──────────┴──────────┴──────────┴──────────┘            │
+│                             ↓                                   │
+│                    wide_forward(x)                              │
+│              (torch.compile fuses kernels)                      │
+│                             ↓                                   │
+│                   FusionComponent                               │
+│                             ↓                                   │
 │                    Collective Output                            │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**The key insight:** Towers don't need to see the whole picture. They produce local opinions, geometric routing determines who talks to whom, and fusion creates emergence where the whole exceeds the sum of parts.
+**The key insight:** Towers don't need to see the whole picture. They produce local opinions, and the collective triangulates truth from divergent viewpoints. WideRouter makes this efficient at scale.
