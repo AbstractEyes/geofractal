@@ -30,6 +30,7 @@ from torch import Tensor
 
 from geofractal.router.base_router import BaseRouter
 from geofractal.router.base_tower import BaseTower
+from geofractal.router.wide_router import WideRouter
 from geofractal.router.components.torch_component import TorchComponent
 from geofractal.router.components.address_component import AddressComponent
 from geofractal.router.components.fusion_component import AdaptiveFusion
@@ -334,18 +335,26 @@ class ConfigurableConvTower(BaseTower):
 
         features = pooled.unsqueeze(1).expand(-1, L, -1)
 
+        # Cache features for retrieval after wide_forward
+        self.objects['_cached_features'] = features
+
         return opinion, features
 
+    @property
+    def cached_features(self) -> Optional[Tensor]:
+        """Features from last forward pass (for WideRouter integration)."""
+        return self.objects.get('_cached_features')
+
 
 # =============================================================================
-# CONV TOWER COLLECTIVE (with BATCHED forward)
+# CONV TOWER COLLECTIVE (using WideRouter)
 # =============================================================================
 
-class ConvTowerCollective(BaseRouter):
+class ConvTowerCollective(WideRouter):
     """
-    Conv tower collective with BATCHED forward processing.
+    Conv tower collective using WideRouter for optimized execution.
 
-    Groups towers by type for batched processing.
+    Groups towers by type for batched processing via torch.compile.
     """
 
     def __init__(
@@ -357,26 +366,19 @@ class ConvTowerCollective(BaseRouter):
         fingerprint_dim: int = 64,
         spatial_size: int = 16,
     ):
-        super().__init__(name, strict=False)
+        # Initialize WideRouter with auto_discover=False (we'll register manually)
+        super().__init__(name, strict=False, auto_discover=False)
 
         self.dim = dim
         self._fingerprint_dim = fingerprint_dim
         self._num_towers = len(tower_configs)
 
-        # Group by tower type
-        tower_groups = defaultdict(list)
-        for cfg in tower_configs:
-            tower_groups[cfg.structure_signature].append(cfg.name)
-
-        self.objects['tower_names'] = [c.name for c in tower_configs]
-        self.objects['tower_groups'] = dict(tower_groups)
         self.objects['config'] = {
             'dim': dim,
             'num_towers': self._num_towers,
-            'num_groups': len(tower_groups),
         }
 
-        # Build towers
+        # Build and attach towers
         for cfg in tower_configs:
             tower = ConfigurableConvTower(
                 config=cfg,
@@ -386,8 +388,10 @@ class ConvTowerCollective(BaseRouter):
                 spatial_size=spatial_size,
             )
             self.attach(cfg.name, tower)
+            # Register with WideRouter for optimized execution
+            self.register_tower(cfg.name)
 
-        # Fusion
+        # Fusion (attached after towers so it's not auto-discovered)
         self.attach('fusion', AdaptiveFusion(
             f'{name}_fusion',
             num_inputs=self._num_towers,
@@ -397,42 +401,9 @@ class ConvTowerCollective(BaseRouter):
         # Fingerprint projection
         self.attach('fp_proj', nn.Linear(fingerprint_dim * self._num_towers, fingerprint_dim))
 
-    @property
-    def tower_names(self) -> List[str]:
-        return self.objects['tower_names']
-
-    @property
-    def tower_groups(self) -> Dict[str, List[str]]:
-        return self.objects['tower_groups']
-
-    def _batched_group_forward(
-        self,
-        group_names: List[str],
-        x: Tensor,
-    ) -> List[Tuple[Tensor, Tensor]]:
-        """Process a group of towers via batch expansion."""
-        N = len(group_names)
-        if N == 0:
-            return []
-
-        B, L, D = x.shape
-        towers = [self[name] for name in group_names]
-
-        # Expand: [B, L, D] → [B*N, L, D]
-        x_expanded = x.unsqueeze(0).expand(N, -1, -1, -1).reshape(N * B, L, D)
-
-        # Process each tower
-        results = []
-        for i, tower in enumerate(towers):
-            xi = x_expanded[i * B:(i + 1) * B]
-            opinion, features = tower(xi)
-            results.append((opinion, features))
-
-        return results
-
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
-        Batched forward through conv collective.
+        Forward using WideRouter's optimized execution.
 
         Returns:
             fused: [B, D] fused opinion
@@ -441,22 +412,15 @@ class ConvTowerCollective(BaseRouter):
         if x.dim() == 2:
             x = x.unsqueeze(1)
 
-        name_to_result = {}
+        # Use WideRouter's optimized execution
+        opinions_dict = self.wide_forward(x, mask=mask)
+
+        # Collect fingerprints and opinion tensors in order
         all_fingerprints = []
-
-        # Process by group (batched)
-        for sig, group_names in self.tower_groups.items():
-            results = self._batched_group_forward(group_names, x)
-            for i, name in enumerate(group_names):
-                name_to_result[name] = results[i]
-
-        # Collect in order
         opinion_tensors = []
-        opinions_dict = {}
+
         for name in self.tower_names:
-            opinion, features = name_to_result[name]
-            opinion_tensors.append(opinion)
-            opinions_dict[name] = opinion
+            opinion_tensors.append(opinions_dict[name])
             all_fingerprints.append(self[name].fingerprint)
 
         # Fuse
@@ -541,7 +505,7 @@ if __name__ == '__main__':
     import time
 
     print("=" * 60)
-    print("Batched Conv Collective Test")
+    print("WideRouter Conv Collective Test")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -553,29 +517,53 @@ if __name__ == '__main__':
     collective = build_conv_collective(configs, dim=256, spatial_size=16)
     collective.network_to(device=device)
 
-    print(f"Groups: {collective.tower_groups}")
+    print(f"Tower names: {collective.tower_names}")
     print(f"Params: {sum(p.numel() for p in collective.parameters()):,}")
 
     B, L, D = 32, 256, 256
     x = torch.randn(B, L, D, device=device)
 
-    # Warmup
+    # Warmup (eager)
+    print("\nEager warmup...")
     for _ in range(5):
         _ = collective(x)
     if device.type == 'cuda':
         torch.cuda.synchronize()
 
-    # Benchmark
+    # Benchmark eager
     t0 = time.perf_counter()
     for _ in range(50):
         fused, opinions = collective(x)
     if device.type == 'cuda':
         torch.cuda.synchronize()
-    ms = (time.perf_counter() - t0) / 50 * 1000
+    eager_ms = (time.perf_counter() - t0) / 50 * 1000
+
+    print(f"Eager forward: {eager_ms:.2f}ms")
+
+    # Compile using WideRouter's method
+    print("\nCompiling with WideRouter.prepare_and_compile()...")
+    compiled = collective.prepare_and_compile()
+
+    # Warmup compiled
+    for _ in range(5):
+        _ = compiled(x)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
+    # Benchmark compiled
+    t0 = time.perf_counter()
+    for _ in range(50):
+        fused, opinions = compiled(x)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    compiled_ms = (time.perf_counter() - t0) / 50 * 1000
+
+    print(f"Compiled forward: {compiled_ms:.2f}ms")
+    print(f"Speedup: {eager_ms/compiled_ms:.2f}x")
 
     print(f"\nInput: {x.shape}")
     print(f"Fused: {fused.shape}")
     print(f"Opinions: {len(opinions)}")
-    print(f"Forward: {ms:.2f}ms ({B / (ms/1000):.0f} samples/sec)")
+    print(f"Throughput: {B / (compiled_ms/1000):.0f} samples/sec")
 
-    print("\n✓ Batched conv collective ready")
+    print("\n✓ WideRouter conv collective ready")

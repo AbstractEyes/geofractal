@@ -100,7 +100,7 @@ from torch import Tensor
 from geofractal.router.base_tower import BaseTower
 from geofractal.router.components.torch_component import TorchComponent
 from geofractal.router.prefab.notifier_router import NotifierRouter
-from geofractal.router.prefab.wide_router import WideRouter
+from geofractal.router.wide_router import WideRouter
 from geofractal.router.components.address_component import (
     AddressComponent,
     SphericalAddressComponent,
@@ -236,14 +236,15 @@ With more towers, per-tower cost *decreases*:
 ### Basic WideRouter Usage
 
 ```python
-from geofractal.router.prefab.wide_router import WideRouter
+from geofractal.router.wide_router import WideRouter
+
 
 class SimpleTower(BaseTower):
     """Simple tower for wide collective."""
-    
+
     def __init__(self, name: str, dim: int, depth: int = 2):
         super().__init__(name, strict=False)
-        
+
         for i in range(depth):
             self.append(nn.Sequential(
                 nn.Linear(dim, dim * 2),
@@ -251,7 +252,7 @@ class SimpleTower(BaseTower):
                 nn.Linear(dim * 2, dim),
             ))
         self.attach('norm', nn.LayerNorm(dim))
-    
+
     def forward(self, x: Tensor) -> Tensor:
         for stage in self.stages:
             x = x + stage(x)
@@ -260,20 +261,20 @@ class SimpleTower(BaseTower):
 
 class WideCollective(WideRouter):
     """Compile-optimized collective."""
-    
+
     def __init__(self, name: str, num_towers: int, dim: int):
         super().__init__(name, auto_discover=True)
-        
+
         # Attach towers
         for i in range(num_towers):
             self.attach(f'tower_{i}', SimpleTower(f'tower_{i}', dim))
-        
+
         # IMPORTANT: Call discover_towers() after attaching
         self.discover_towers()
-        
+
         # Fusion
         self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
-    
+
     def forward(self, x: Tensor) -> Tensor:
         # wide_forward returns Dict[tower_name, output]
         opinions = self.wide_forward(x)
@@ -422,7 +423,7 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from geofractal.router.prefab.wide_router import WideRouter
+from geofractal.router.wide_router import WideRouter
 from geofractal.router.prefab.notifier_router import NotifierRouter
 from geofractal.router.base_tower import BaseTower
 from geofractal.router.components.torch_component import TorchComponent
@@ -439,7 +440,7 @@ class TransformerBlock(TorchComponent):
         self.ffn = nn.Sequential(
             nn.Linear(dim, dim * 4), nn.GELU(), nn.Linear(dim * 4, dim)
         )
-    
+
     def forward(self, x: Tensor) -> Tensor:
         x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x))[0]
         return x + self.ffn(self.norm2(x))
@@ -448,11 +449,11 @@ class TransformerBlock(TorchComponent):
 class ExpertTower(BaseTower):
     def __init__(self, name: str, dim: int, depth: int = 3):
         super().__init__(name, strict=False)
-        
+
         for i in range(depth):
             self.append(TransformerBlock(f'{name}_block_{i}', dim))
         self.attach('norm', nn.LayerNorm(dim))
-    
+
     def forward(self, x: Tensor) -> Tensor:
         for stage in self.stages:
             x = stage(x)
@@ -461,14 +462,14 @@ class ExpertTower(BaseTower):
 
 class RoutedWideCollective(WideRouter):
     """Wide collective with geometric routing."""
-    
+
     def __init__(self, name: str, num_towers: int, dim: int):
         super().__init__(name, auto_discover=True)
-        
+
         # Communication backbone
         notifier = NotifierRouter('notifier')
         self.attach('notifier', notifier)
-        
+
         # Expert towers with addresses
         for i in range(num_towers):
             tower = ExpertTower(f'expert_{i}', dim)
@@ -476,24 +477,24 @@ class RoutedWideCollective(WideRouter):
             tower.attach('address', addr)
             notifier.register(addr, channel='experts')
             self.attach(f'expert_{i}', tower)
-        
+
         self.discover_towers()
         self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
         self.objects['num_towers'] = num_towers
-    
+
     def forward(self, x: Tensor) -> Tensor:
         # Get opinions from all towers
         opinions = self.wide_forward(x)
-        
+
         # Each tower shares its opinion
         notifier = self['notifier']
         for name, opinion in opinions.items():
             tower = self[name]
             notifier.post(tower['address'], opinion, channel='experts')
-        
+
         # Route messages
         notifier.route()
-        
+
         # Fuse
         return self['fusion'](*opinions.values())
 

@@ -10,6 +10,9 @@ Classes:
     MultiTextEncode: Multiple text encoders with optional caching
     MultiVisionEncode: Multiple vision encoders with optional caching
     MultiEncode: Efficient combination of text and vision encoders
+    StagedCacheBuilder: Sequential encode → cache → unload workflow
+    CachedEmbeddingDataset: Yields cached tensors (no models needed)
+    CacheManager: Runtime discovery of existing caches
 
 Features:
     - Local model loading or HuggingFace AutoModel
@@ -17,31 +20,35 @@ Features:
     - Device management and mixed precision
     - Batched encoding for efficiency
     - Cache persistence (save/load to disk)
+    - Dataset namespacing (prevents cross-contamination)
+    - Staged caching with VRAM management
 
 Usage:
     # Text encoding with caching
     text_enc = MultiTextEncode(
         encoders=['clip_l', 'clip_g'],
+        dataset_name='danbooru_100k',
         device='cuda',
         cache_enabled=True,
     )
     embeddings = text_enc.encode_batch(texts)
-    text_enc.save_cache('text_cache.pt')
+    text_enc.save_cache('text_cache.safetensors')
 
     # Vision encoding with DINO
     vision_enc = MultiVisionEncode(
         encoders=['dinov2_base'],
+        dataset_name='cifar100',
         device='cuda',
     )
     features = vision_enc.encode_batch(images)
 
-    # Combined multi-modal
-    multi_enc = MultiEncode(
-        text_encoders=['clip_l', 'clip_g'],
-        vision_encoders=['dinov2_base'],
-        device='cuda',
+    # Staged caching (VRAM efficient)
+    dataset = build_staged_cache(
+        dataset_name='my_prompts',
+        texts=prompts_8500,
+        text_encoders=['clip_l_illustrious', 'clip_g_illustrious'],
     )
-    text_emb, vision_emb = multi_enc.encode(texts, images)
+    # Models unloaded, dataset yields cached tensors only
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0

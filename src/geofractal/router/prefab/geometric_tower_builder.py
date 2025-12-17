@@ -24,6 +24,7 @@ from torch import Tensor
 
 from geofractal.router.base_router import BaseRouter
 from geofractal.router.base_tower import BaseTower
+from geofractal.router.wide_router import WideRouter
 from geofractal.router.components.transformer_component import (
     TransformerConfig,
     TransformerVariant,
@@ -430,7 +431,15 @@ class ConfigurableTower(SafeAttachMixin, BaseTower):
         pooled = features.mean(dim=1)
         opinion = self['opinion_proj'](pooled)
 
+        # Cache features for retrieval after wide_forward
+        self.objects['_cached_features'] = features
+
         return opinion, features
+
+    @property
+    def cached_features(self) -> Optional[Tensor]:
+        """Features from last forward pass (for WideRouter integration)."""
+        return self.objects.get('_cached_features')
 
 
 # =============================================================================
@@ -455,11 +464,11 @@ class CollectiveOpinion:
 
 
 # =============================================================================
-# CONFIGURABLE COLLECTIVE (with BATCHED forward)
+# CONFIGURABLE COLLECTIVE (using WideRouter)
 # =============================================================================
 
-class ConfigurableCollective(SafeAttachMixin, BaseRouter):
-    """Tower collective with BATCHED forward processing."""
+class ConfigurableCollective(SafeAttachMixin, WideRouter):
+    """Tower collective using WideRouter for optimized execution."""
 
     def __init__(
         self,
@@ -475,7 +484,8 @@ class ConfigurableCollective(SafeAttachMixin, BaseRouter):
         fusion_type: Union[FusionType, str] = FusionType.ADAPTIVE,
         fusion_params: Dict[str, Any] = None,
     ):
-        super().__init__(name, strict=False)
+        # Initialize WideRouter with auto_discover=False (we'll register manually)
+        super().__init__(name, strict=False, auto_discover=False)
 
         self.dim = dim
         self._fingerprint_dim = fingerprint_dim
@@ -484,22 +494,14 @@ class ConfigurableCollective(SafeAttachMixin, BaseRouter):
         if isinstance(fusion_type, str):
             fusion_type = FusionType(fusion_type)
 
-        # Group towers by structure for batching
-        tower_groups = defaultdict(list)
-        for config in tower_configs:
-            tower_groups[config.structure_signature].append(config.name)
-
-        self.objects['tower_names'] = [c.name for c in tower_configs]
         self.objects['tower_configs'] = tower_configs
-        self.objects['tower_groups'] = dict(tower_groups)
         self.objects['collective_config'] = {
             'dim': dim,
             'num_towers': self._num_towers,
             'fusion_type': fusion_type.value,
-            'num_groups': len(tower_groups),
         }
 
-        # Build towers
+        # Build and attach towers
         for config in tower_configs:
             tower = ConfigurableTower(
                 config=config,
@@ -512,8 +514,10 @@ class ConfigurableCollective(SafeAttachMixin, BaseRouter):
                 default_fingerprint_dim=fingerprint_dim,
             )
             self.attach(config.name, tower)
+            # Register with WideRouter for optimized execution
+            self.register_tower(config.name)
 
-        # Fusion
+        # Fusion (attached after towers so it's not auto-discovered)
         fusion_params = fusion_params or {}
         fusion = build_fusion(f'{name}_fusion', fusion_type,
                               num_inputs=self._num_towers, in_features=dim, **fusion_params)
@@ -529,49 +533,12 @@ class ConfigurableCollective(SafeAttachMixin, BaseRouter):
         self.objects['debug_info'] = {}
 
     @property
-    def tower_names(self) -> List[str]:
-        return self.objects['tower_names']
-
-    @property
-    def tower_groups(self) -> Dict[str, List[str]]:
-        return self.objects['tower_groups']
-
-    @property
     def towers(self) -> Dict[str, ConfigurableTower]:
+        """Dict of tower name -> ConfigurableTower."""
         return {name: self[name] for name in self.tower_names}
 
-    def _batched_group_forward(
-        self,
-        group_names: List[str],
-        x: Tensor,
-        mask: Optional[Tensor] = None,
-    ) -> List[Tuple[Tensor, Tensor]]:
-        """Process a group of towers via batch expansion."""
-        N = len(group_names)
-        if N == 0:
-            return []
-
-        B, L, D = x.shape
-        towers = [self[name] for name in group_names]
-
-        # Expand input: [B, L, D] → [B*N, L, D]
-        x_expanded = x.unsqueeze(0).expand(N, -1, -1, -1).reshape(N * B, L, D)
-
-        mask_expanded = None
-        if mask is not None:
-            mask_expanded = mask.unsqueeze(0).expand(N, -1, -1).reshape(N * B, -1)
-
-        results = []
-        for i, tower in enumerate(towers):
-            xi = x_expanded[i * B:(i + 1) * B]
-            mi = mask_expanded[i * B:(i + 1) * B] if mask_expanded is not None else None
-            opinion, features = tower(xi, mask=mi)
-            results.append((opinion, features))
-
-        return results
-
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> CollectiveOpinion:
-        """Batched forward through tower collective."""
+        """Forward using WideRouter's optimized wide_forward."""
         debug = self.objects['debug']
         debug_info = self.objects['debug_info']
 
@@ -580,20 +547,18 @@ class ConfigurableCollective(SafeAttachMixin, BaseRouter):
 
         x = self['input_proj'](x)
 
-        # Process towers by group (batched within group)
+        # Use WideRouter's optimized execution
+        # Returns Dict[tower_name, opinion_tensor]
+        opinions_dict = self.wide_forward(x, mask=mask)
+
+        # Build TowerOpinion objects with cached features
         all_opinions = []
         opinion_tensors = []
-        name_to_result = {}
 
-        for sig, group_names in self.tower_groups.items():
-            results = self._batched_group_forward(group_names, x, mask)
-            for i, name in enumerate(group_names):
-                name_to_result[name] = results[i]
-
-        # Collect in original order
         for tower_name in self.tower_names:
             tower = self[tower_name]
-            opinion, features = name_to_result[tower_name]
+            opinion = opinions_dict[tower_name]
+            features = tower.cached_features  # Retrieved from tower's cache
 
             tower_opinion = TowerOpinion(
                 name=tower_name,
@@ -700,7 +665,7 @@ if __name__ == '__main__':
     import time
 
     print("=" * 60)
-    print("Batched Tower Collective Test")
+    print("WideRouter Tower Collective Test")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -712,28 +677,52 @@ if __name__ == '__main__':
     collective = build_tower_collective(configs, dim=256, default_depth=1)
     collective.network_to(device=device)
 
-    print(f"Groups: {collective.tower_groups}")
+    print(f"Tower names: {collective.tower_names}")
     print(f"Params: {sum(p.numel() for p in collective.parameters()):,}")
 
     B, L, D = 32, 256, 256
     x = torch.randn(B, L, D, device=device)
 
-    # Warmup
+    # Warmup (eager)
+    print("\nEager warmup...")
     for _ in range(5):
         _ = collective(x)
     if device.type == 'cuda':
         torch.cuda.synchronize()
 
-    # Benchmark
+    # Benchmark eager
     t0 = time.perf_counter()
     for _ in range(50):
         out = collective(x)
     if device.type == 'cuda':
         torch.cuda.synchronize()
-    ms = (time.perf_counter() - t0) / 50 * 1000
+    eager_ms = (time.perf_counter() - t0) / 50 * 1000
+
+    print(f"Eager forward: {eager_ms:.2f}ms")
+
+    # Compile using WideRouter's method
+    print("\nCompiling with WideRouter.prepare_and_compile()...")
+    compiled = collective.prepare_and_compile()
+
+    # Warmup compiled
+    for _ in range(5):
+        _ = compiled(x)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+
+    # Benchmark compiled
+    t0 = time.perf_counter()
+    for _ in range(50):
+        out = compiled(x)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    compiled_ms = (time.perf_counter() - t0) / 50 * 1000
+
+    print(f"Compiled forward: {compiled_ms:.2f}ms")
+    print(f"Speedup: {eager_ms/compiled_ms:.2f}x")
 
     print(f"\nInput: {x.shape}")
     print(f"Fused: {out.fused.shape}")
-    print(f"Forward: {ms:.2f}ms ({B / (ms/1000):.0f} samples/sec)")
+    print(f"Throughput: {B / (compiled_ms/1000):.0f} samples/sec")
 
-    print("\n✓ Batched collective ready")
+    print("\n✓ WideRouter collective ready")

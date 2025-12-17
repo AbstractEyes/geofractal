@@ -101,21 +101,23 @@ BaseRouter (ABC - nn.Module)
 | 32 | 7.21ms | 225µs |
 
 ```python
-from geofractal.router.prefab.wide_router import WideRouter
+from geofractal.router.wide_router import WideRouter
+
 
 class MyCollective(WideRouter):
     def __init__(self, name: str, num_towers: int, dim: int):
         super().__init__(name, auto_discover=True)
-        
+
         for i in range(num_towers):
             self.attach(f'tower_{i}', ExpertTower(f'tower_{i}', dim))
-        
+
         self.discover_towers()  # Register for wide execution
         self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
-    
+
     def forward(self, x: Tensor) -> Tensor:
         opinions = self.wide_forward(x)  # Batched tower execution
         return self['fusion'](*opinions.values())
+
 
 # Usage
 collective = MyCollective('wide', num_towers=16, dim=256)
@@ -166,9 +168,10 @@ pip install -e .
 ### Build a Wide Collective (Recommended)
 
 ```python
-from geofractal.router.prefab.wide_router import WideRouter
+from geofractal.router.wide_router import WideRouter
 from geofractal.router.base_tower import BaseTower
 from geofractal.router.components.fusion_component import AdaptiveFusion
+
 
 class SimpleTower(BaseTower):
     def __init__(self, name: str, dim: int):
@@ -178,25 +181,27 @@ class SimpleTower(BaseTower):
                 nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
             ))
         self.attach('norm', nn.LayerNorm(dim))
-    
+
     def forward(self, x):
         for stage in self.stages:
             x = x + stage(x)
         return self['norm'](x)
 
+
 class WideCollective(WideRouter):
     def __init__(self, name: str, dim: int, num_towers: int = 8):
         super().__init__(name, auto_discover=True)
-        
+
         for i in range(num_towers):
             self.attach(f'tower_{i}', SimpleTower(f'tower_{i}', dim))
-        
+
         self.discover_towers()
         self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
-    
+
     def forward(self, x):
         opinions = self.wide_forward(x)
         return self['fusion'](*opinions.values())
+
 
 # Create, move to GPU, compile
 collective = WideCollective('wide', dim=256, num_towers=16)
