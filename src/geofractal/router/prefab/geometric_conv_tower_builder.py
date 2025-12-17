@@ -100,23 +100,55 @@ class DilatedConvComponent(TorchComponent):
 
 
 class FrequencyComponent(TorchComponent):
-    """FFT-based frequency domain processing stage."""
+    """
+    Spatial-domain frequency filtering (compile-safe).
+
+    Approximates FFT-based filtering using multi-scale convolutions:
+    - Low freq: large receptive field (pooled)
+    - Mid freq: medium kernel
+    - High freq: residual (fine details)
+
+    This is compile-safe (no complex tensors).
+    """
 
     def __init__(self, name: str, channels: int, spatial_size: int, **kwargs):
         super().__init__(name, **kwargs)
         self.channels = channels
         self.spatial_size = spatial_size
 
-        self.freq_real = nn.Parameter(torch.randn(1, channels, spatial_size, spatial_size // 2 + 1) * 0.02)
-        self.freq_imag = nn.Parameter(torch.randn(1, channels, spatial_size, spatial_size // 2 + 1) * 0.02)
+        # Multi-scale frequency approximation
+        # Low frequency path (large receptive field)
+        self.low_pool = nn.AvgPool2d(3, stride=1, padding=1)
+        self.low_conv = nn.Conv2d(channels, channels, 1)
+
+        # Mid frequency path
+        self.mid_conv = nn.Conv2d(channels, channels, 3, padding=1, groups=channels)
+        self.mid_mix = nn.Conv2d(channels, channels, 1)
+
+        # High frequency is residual (original - smoothed)
+        self.high_conv = nn.Conv2d(channels, channels, 1)
+
+        # Learnable frequency mixing weights
+        self.freq_weights = nn.Parameter(torch.ones(3) / 3)
+
         self.norm = nn.BatchNorm2d(channels)
 
     def forward(self, x: Tensor) -> Tensor:
-        B, C, H, W = x.shape
-        freq = torch.fft.rfft2(x, norm='ortho')
-        filt = torch.complex(self.freq_real, self.freq_imag)
-        freq_filtered = freq * filt
-        out = torch.fft.irfft2(freq_filtered, s=(H, W), norm='ortho')
+        # Normalize mixing weights
+        w = F.softmax(self.freq_weights, dim=0)
+
+        # Low frequency (smoothed)
+        low = self.low_conv(self.low_pool(x))
+
+        # Mid frequency (edges/textures)
+        mid = self.mid_mix(self.mid_conv(x))
+
+        # High frequency (fine detail = original - smoothed)
+        high = self.high_conv(x - self.low_pool(x))
+
+        # Weighted combination
+        out = w[0] * low + w[1] * mid + w[2] * high
+
         return F.gelu(self.norm(out)) + x
 
 
@@ -335,7 +367,7 @@ class ConfigurableConvTower(BaseTower):
 
         features = pooled.unsqueeze(1).expand(-1, L, -1)
 
-        # Cache features for retrieval after wide_forward
+        # Cache features for WideRouter retrieval
         self.objects['_cached_features'] = features
 
         return opinion, features
@@ -366,7 +398,7 @@ class ConvTowerCollective(WideRouter):
         fingerprint_dim: int = 64,
         spatial_size: int = 16,
     ):
-        # Initialize WideRouter with auto_discover=False (we'll register manually)
+        # Initialize WideRouter with auto_discover=False (we register manually)
         super().__init__(name, strict=False, auto_discover=False)
 
         self.dim = dim
@@ -523,8 +555,8 @@ if __name__ == '__main__':
     B, L, D = 32, 256, 256
     x = torch.randn(B, L, D, device=device)
 
-    # Warmup (eager)
-    print("\nEager warmup...")
+    # Warmup
+    collective.prepare_and_compile()
     for _ in range(5):
         _ = collective(x)
     if device.type == 'cuda':
@@ -538,32 +570,9 @@ if __name__ == '__main__':
         torch.cuda.synchronize()
     eager_ms = (time.perf_counter() - t0) / 50 * 1000
 
-    print(f"Eager forward: {eager_ms:.2f}ms")
-
-    # Compile using WideRouter's method
-    print("\nCompiling with WideRouter.prepare_and_compile()...")
-    compiled = collective.prepare_and_compile()
-
-    # Warmup compiled
-    for _ in range(5):
-        _ = compiled(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-
-    # Benchmark compiled
-    t0 = time.perf_counter()
-    for _ in range(50):
-        fused, opinions = compiled(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    compiled_ms = (time.perf_counter() - t0) / 50 * 1000
-
-    print(f"Compiled forward: {compiled_ms:.2f}ms")
-    print(f"Speedup: {eager_ms/compiled_ms:.2f}x")
-
     print(f"\nInput: {x.shape}")
     print(f"Fused: {fused.shape}")
     print(f"Opinions: {len(opinions)}")
-    print(f"Throughput: {B / (compiled_ms/1000):.0f} samples/sec")
+    print(f"Eager forward: {eager_ms:.2f}ms ({B / (eager_ms/1000):.0f} samples/sec)")
 
     print("\n✓ WideRouter conv collective ready")
