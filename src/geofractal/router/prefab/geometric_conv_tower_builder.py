@@ -1,18 +1,16 @@
 """
 geofractal.router.prefab.geometric_conv_tower_builder
-===========================================
+=====================================================
 
-Convolutional tower variants extending BaseTower with TorchComponent stages.
+Convolutional tower variants with BATCHED collective processing.
 
-Each stage is a proper TorchComponent with:
-- name, uuid, parent awareness
-- Device affinity controls
-- Lifecycle hooks
+Each tower is a TorchComponent-based stage system.
+ConvTowerCollective groups towers by type for batched forward.
 
 Tower types:
 - DepthTower: Multi-scale dilated convolutions
 - FrequencyTower: FFT-based frequency domain processing
-- ColorPatternTower: Interpolated normalization for texture
+- ColorPatternTower: Interpolated IN/BN normalization
 - CoarseFineTower: Parallel resolution streams
 - WideResNetTower: Wide residual blocks
 """
@@ -23,15 +21,18 @@ import math
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Any, Union
 from enum import Enum
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from geofractal.router.base_router import BaseRouter
 from geofractal.router.base_tower import BaseTower
 from geofractal.router.components.torch_component import TorchComponent
 from geofractal.router.components.address_component import AddressComponent
+from geofractal.router.components.fusion_component import AdaptiveFusion
 
 
 # =============================================================================
@@ -39,7 +40,6 @@ from geofractal.router.components.address_component import AddressComponent
 # =============================================================================
 
 class ConvTowerType(str, Enum):
-    """Available convolutional tower variants."""
     DEPTH = "depth"
     FREQUENCY = "frequency"
     COLOR_PATTERN = "color_pattern"
@@ -58,20 +58,21 @@ class ConvTowerConfig:
     name: str
     tower_type: Union[ConvTowerType, str] = ConvTowerType.WIDE_RESNET
 
-    # Architecture overrides (None = use collective defaults)
     dim: Optional[int] = None
     depth: Optional[int] = None
     fingerprint_dim: Optional[int] = None
 
-    # Fingerprint options
     inverted: bool = False
-
-    # Type-specific params
     tower_params: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self):
         if isinstance(self.tower_type, str):
             self.tower_type = ConvTowerType(self.tower_type)
+
+    @property
+    def structure_signature(self) -> str:
+        """Towers with same signature can be batched."""
+        return self.tower_type.value
 
 
 # =============================================================================
@@ -79,12 +80,7 @@ class ConvTowerConfig:
 # =============================================================================
 
 class DilatedConvComponent(TorchComponent):
-    """
-    Dilated convolution stage for multi-scale receptive fields.
-
-    Uses dilated convs to capture patterns at different scales
-    without downsampling.
-    """
+    """Dilated convolution stage for multi-scale receptive fields."""
 
     def __init__(self, name: str, channels: int, dilation: int, **kwargs):
         super().__init__(name, **kwargs)
@@ -99,89 +95,62 @@ class DilatedConvComponent(TorchComponent):
     def forward(self, x: Tensor) -> Tensor:
         out = F.gelu(self.bn1(self.conv1(x)))
         out = F.gelu(self.bn2(self.conv2(out)))
-        return out + x  # Residual
+        return out + x
 
 
 class FrequencyComponent(TorchComponent):
-    """
-    FFT-based frequency domain processing stage.
-
-    Learns frequency-specific filters to capture periodic
-    patterns and textures.
-    """
+    """FFT-based frequency domain processing stage."""
 
     def __init__(self, name: str, channels: int, spatial_size: int, **kwargs):
         super().__init__(name, **kwargs)
         self.channels = channels
         self.spatial_size = spatial_size
 
-        # Learnable frequency filter (real + imag parts)
         self.freq_real = nn.Parameter(torch.randn(1, channels, spatial_size, spatial_size // 2 + 1) * 0.02)
         self.freq_imag = nn.Parameter(torch.randn(1, channels, spatial_size, spatial_size // 2 + 1) * 0.02)
         self.norm = nn.BatchNorm2d(channels)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
-
-        # FFT
         freq = torch.fft.rfft2(x, norm='ortho')
-
-        # Apply learnable complex filter
         filt = torch.complex(self.freq_real, self.freq_imag)
         freq_filtered = freq * filt
-
-        # IFFT back to spatial
         out = torch.fft.irfft2(freq_filtered, s=(H, W), norm='ortho')
-        return F.gelu(self.norm(out)) + x  # Residual
+        return F.gelu(self.norm(out)) + x
 
 
 class InterpolatedNormComponent(TorchComponent):
-    """
-    Interpolated IN/BN normalization for color/texture patterns.
-
-    Learns to blend instance norm (texture-sensitive) with
-    batch norm (statistics-sensitive) for adaptive normalization.
-    """
+    """Interpolated IN/BN normalization for texture patterns."""
 
     def __init__(self, name: str, channels: int, **kwargs):
         super().__init__(name, **kwargs)
         self.channels = channels
 
-        # Learnable interpolation factor
         self.alpha = nn.Parameter(torch.zeros(1, channels, 1, 1))
         self.instance_norm = nn.InstanceNorm2d(channels, affine=True)
         self.batch_norm = nn.BatchNorm2d(channels, affine=True)
         self.conv = nn.Conv2d(channels, channels, 3, padding=1)
 
     def forward(self, x: Tensor) -> Tensor:
-        # Interpolated normalization
         alpha = torch.sigmoid(self.alpha)
         normed = alpha * self.instance_norm(x) + (1 - alpha) * self.batch_norm(x)
-        return F.gelu(self.conv(normed)) + x  # Residual
+        return F.gelu(self.conv(normed)) + x
 
 
 class CoarseFineComponent(TorchComponent):
-    """
-    Parallel coarse/fine resolution processing with cross-gating.
-
-    Fine path preserves local detail, coarse path captures global context.
-    Cross-gating allows information exchange between scales.
-    """
+    """Parallel coarse/fine resolution processing with cross-gating."""
 
     def __init__(self, name: str, channels: int, **kwargs):
         super().__init__(name, **kwargs)
         self.channels = channels
 
-        # Fine path (preserve resolution)
         self.fine_conv = nn.Conv2d(channels, channels, 3, padding=1)
         self.fine_bn = nn.BatchNorm2d(channels)
 
-        # Coarse path (downsample -> process -> upsample)
         self.coarse_down = nn.Conv2d(channels, channels, 3, stride=2, padding=1)
         self.coarse_conv = nn.Conv2d(channels, channels, 3, padding=1)
         self.coarse_bn = nn.BatchNorm2d(channels)
 
-        # Cross-gating via channel attention
         self.fine_gate = nn.Sequential(
             nn.AdaptiveAvgPool2d(1), nn.Flatten(),
             nn.Linear(channels, channels), nn.Sigmoid()
@@ -192,28 +161,19 @@ class CoarseFineComponent(TorchComponent):
         )
 
     def forward(self, x: Tensor) -> Tensor:
-        # Fine path
         fine = F.gelu(self.fine_bn(self.fine_conv(x)))
-
-        # Coarse path with upsample
         coarse = F.gelu(self.coarse_down(x))
         coarse = F.gelu(self.coarse_bn(self.coarse_conv(coarse)))
         coarse = F.interpolate(coarse, size=x.shape[2:], mode='bilinear', align_corners=False)
 
-        # Cross-gate
         fg = self.fine_gate(fine).unsqueeze(-1).unsqueeze(-1)
         cg = self.coarse_gate(coarse).unsqueeze(-1).unsqueeze(-1)
 
-        return fine * cg + coarse * fg + x  # Residual
+        return fine * cg + coarse * fg + x
 
 
 class WideResComponent(TorchComponent):
-    """
-    Wide residual block component.
-
-    Standard WRN block with pre-activation, wider channels,
-    and optional dropout for regularization.
-    """
+    """Wide residual block component."""
 
     def __init__(self, name: str, channels: int, dropout: float = 0.1, **kwargs):
         super().__init__(name, **kwargs)
@@ -231,45 +191,42 @@ class WideResComponent(TorchComponent):
         out = F.gelu(self.bn2(out))
         out = self.dropout(out)
         out = self.conv2(out)
-        return out + x  # Residual
+        return out + x
 
 
 # =============================================================================
-# INPUT/OUTPUT PROJECTION COMPONENTS
+# PROJECTION COMPONENTS
 # =============================================================================
 
 class SeqToSpatialComponent(TorchComponent):
-    """Projects sequence [B, L, D] to spatial [B, C, H, W]."""
+    """Project sequence to spatial: [B, L, D] -> [B, C, H, W]"""
 
-    def __init__(self, name: str, dim: int, channels: int, spatial_size: int, **kwargs):
+    def __init__(self, name: str, seq_dim: int, channels: int, spatial_size: int, **kwargs):
         super().__init__(name, **kwargs)
-        self.dim = dim
-        self.channels = channels
         self.spatial_size = spatial_size
-        self.proj = nn.Linear(dim, channels)
+        self.channels = channels
+        self.proj = nn.Linear(seq_dim, channels * spatial_size * spatial_size)
+        self.norm = nn.BatchNorm2d(channels)
 
     def forward(self, x: Tensor) -> Tensor:
-        # x: [B, L, D]
         B, L, D = x.shape
-        h = self.proj(x)  # [B, L, C]
-        return h.transpose(1, 2).reshape(B, self.channels, self.spatial_size, self.spatial_size)
+        h = self.proj(x.mean(dim=1))
+        h = h.view(B, self.channels, self.spatial_size, self.spatial_size)
+        return self.norm(h)
 
 
 class SpatialToOpinionComponent(TorchComponent):
-    """Projects spatial [B, C, H, W] to opinion [B, D]."""
+    """Project spatial to opinion: [B, C, H, W] -> [B, D]"""
 
-    def __init__(self, name: str, channels: int, dim: int, **kwargs):
+    def __init__(self, name: str, channels: int, out_dim: int, **kwargs):
         super().__init__(name, **kwargs)
-        self.channels = channels
-        self.dim = dim
         self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Linear(channels, dim)
-        self.norm = nn.LayerNorm(dim)
+        self.proj = nn.Linear(channels, out_dim)
+        self.norm = nn.LayerNorm(out_dim)
 
     def forward(self, x: Tensor) -> Tensor:
-        # x: [B, C, H, W]
-        h = self.pool(x).flatten(1)  # [B, C]
-        return self.norm(self.proj(h))  # [B, D]
+        h = self.pool(x).flatten(1)
+        return self.norm(self.proj(h))
 
 
 # =============================================================================
@@ -277,26 +234,18 @@ class SpatialToOpinionComponent(TorchComponent):
 # =============================================================================
 
 class ConfigurableConvTower(BaseTower):
-    """
-    Convolutional tower built from ConvTowerConfig.
-
-    Uses BaseTower's stage/component pattern:
-    - stages: nn.ModuleList of TorchComponent stages
-    - components: input_proj, output_proj, address, opinion_proj
-    - objects: config, spatial_size
-    """
+    """Conv tower built from ConvTowerConfig."""
 
     def __init__(
-            self,
-            config: ConvTowerConfig,
-            default_dim: int = 256,
-            default_depth: int = 2,
-            default_fingerprint_dim: int = 64,
-            spatial_size: int = 16,
+        self,
+        config: ConvTowerConfig,
+        default_dim: int = 256,
+        default_depth: int = 2,
+        default_fingerprint_dim: int = 64,
+        spatial_size: int = 16,
     ):
         super().__init__(config.name, strict=False)
 
-        # Resolve config with defaults
         dim = config.dim or default_dim
         depth = config.depth or default_depth
         fingerprint_dim = config.fingerprint_dim or default_fingerprint_dim
@@ -308,7 +257,6 @@ class ConfigurableConvTower(BaseTower):
         self._fingerprint_dim = fingerprint_dim
         self._inverted = config.inverted
 
-        # Store config in objects
         self.objects['tower_config'] = {
             'name': config.name,
             'tower_type': config.tower_type.value,
@@ -319,76 +267,47 @@ class ConfigurableConvTower(BaseTower):
         }
         self.objects['spatial_size'] = spatial_size
 
-        # Channel width for conv stages
         base_channels = params.get('base_channels', 64)
 
-        # Input projection component
         self.attach('input_proj', SeqToSpatialComponent(
             f'{config.name}_input', dim, base_channels, spatial_size
         ))
 
-        # Build TorchComponent stages
         self._build_stages(config.tower_type, config.name, base_channels, depth, spatial_size, params)
 
-        # Output projection component
         self.attach('output_proj', SpatialToOpinionComponent(
             f'{config.name}_output', base_channels, dim
         ))
 
-        # Address component for fingerprint
         self.attach('address', AddressComponent(
             f'{config.name}_address', fingerprint_dim=fingerprint_dim
         ))
 
-        # Opinion projection
         self.attach('opinion_proj', nn.Linear(dim, dim))
 
-    def _build_stages(
-            self,
-            tower_type: ConvTowerType,
-            tower_name: str,
-            channels: int,
-            depth: int,
-            spatial_size: int,
-            params: Dict,
-    ):
-        """Build TorchComponent stages based on tower type."""
-
+    def _build_stages(self, tower_type, tower_name, channels, depth, spatial_size, params):
         if tower_type == ConvTowerType.DEPTH:
             dilations = [1, 2, 4, 8]
             for i in range(depth):
                 dilation = dilations[i % len(dilations)]
-                self.append(DilatedConvComponent(
-                    f'{tower_name}_dilated_{i}', channels, dilation
-                ))
+                self.append(DilatedConvComponent(f'{tower_name}_dilated_{i}', channels, dilation))
 
         elif tower_type == ConvTowerType.FREQUENCY:
             for i in range(depth):
-                self.append(FrequencyComponent(
-                    f'{tower_name}_freq_{i}', channels, spatial_size
-                ))
+                self.append(FrequencyComponent(f'{tower_name}_freq_{i}', channels, spatial_size))
 
         elif tower_type == ConvTowerType.COLOR_PATTERN:
             for i in range(depth):
-                self.append(InterpolatedNormComponent(
-                    f'{tower_name}_pattern_{i}', channels
-                ))
+                self.append(InterpolatedNormComponent(f'{tower_name}_pattern_{i}', channels))
 
         elif tower_type == ConvTowerType.COARSE_FINE:
             for i in range(depth):
-                self.append(CoarseFineComponent(
-                    f'{tower_name}_cf_{i}', channels
-                ))
+                self.append(CoarseFineComponent(f'{tower_name}_cf_{i}', channels))
 
         elif tower_type == ConvTowerType.WIDE_RESNET:
             dropout = params.get('dropout', 0.1)
             for i in range(depth):
-                self.append(WideResComponent(
-                    f'{tower_name}_wrn_{i}', channels, dropout
-                ))
-
-        else:
-            raise ValueError(f"Unknown conv tower type: {tower_type}")
+                self.append(WideResComponent(f'{tower_name}_wrn_{i}', channels, dropout))
 
     @property
     def fingerprint(self) -> Tensor:
@@ -401,58 +320,191 @@ class ConfigurableConvTower(BaseTower):
     def is_inverted(self) -> bool:
         return self._inverted
 
-    def forward(
-            self,
-            x: Tensor,
-            mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
-        """
-        Process through conv tower.
-
-        Args:
-            x: [B, L, D] sequence input
-            mask: Ignored for conv towers
-
-        Returns:
-            opinion: [B, D] pooled output
-            features: [B, L, D] sequence features
-        """
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        """Process through conv tower."""
         B, L, D = x.shape
 
-        # Seq -> Spatial
-        h = self['input_proj'](x)  # [B, C, H, W]
+        h = self['input_proj'](x)
 
-        # Process through stages
         for stage in self.stages:
             h = stage(h)
 
-        # Spatial -> Opinion
-        pooled = self['output_proj'](h)  # [B, D]
+        pooled = self['output_proj'](h)
         opinion = self['opinion_proj'](pooled)
 
-        # Features for compatibility (expand pooled)
         features = pooled.unsqueeze(1).expand(-1, L, -1)
 
         return opinion, features
 
 
 # =============================================================================
-# BUILDER FUNCTION
+# CONV TOWER COLLECTIVE (with BATCHED forward)
+# =============================================================================
+
+class ConvTowerCollective(BaseRouter):
+    """
+    Conv tower collective with BATCHED forward processing.
+
+    Groups towers by type for batched processing.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        tower_configs: List[ConvTowerConfig],
+        dim: int = 256,
+        default_depth: int = 2,
+        fingerprint_dim: int = 64,
+        spatial_size: int = 16,
+    ):
+        super().__init__(name, strict=False)
+
+        self.dim = dim
+        self._fingerprint_dim = fingerprint_dim
+        self._num_towers = len(tower_configs)
+
+        # Group by tower type
+        tower_groups = defaultdict(list)
+        for cfg in tower_configs:
+            tower_groups[cfg.structure_signature].append(cfg.name)
+
+        self.objects['tower_names'] = [c.name for c in tower_configs]
+        self.objects['tower_groups'] = dict(tower_groups)
+        self.objects['config'] = {
+            'dim': dim,
+            'num_towers': self._num_towers,
+            'num_groups': len(tower_groups),
+        }
+
+        # Build towers
+        for cfg in tower_configs:
+            tower = ConfigurableConvTower(
+                config=cfg,
+                default_dim=dim,
+                default_depth=default_depth,
+                default_fingerprint_dim=fingerprint_dim,
+                spatial_size=spatial_size,
+            )
+            self.attach(cfg.name, tower)
+
+        # Fusion
+        self.attach('fusion', AdaptiveFusion(
+            f'{name}_fusion',
+            num_inputs=self._num_towers,
+            in_features=dim,
+        ))
+
+        # Fingerprint projection
+        self.attach('fp_proj', nn.Linear(fingerprint_dim * self._num_towers, fingerprint_dim))
+
+    @property
+    def tower_names(self) -> List[str]:
+        return self.objects['tower_names']
+
+    @property
+    def tower_groups(self) -> Dict[str, List[str]]:
+        return self.objects['tower_groups']
+
+    def _batched_group_forward(
+        self,
+        group_names: List[str],
+        x: Tensor,
+    ) -> List[Tuple[Tensor, Tensor]]:
+        """Process a group of towers via batch expansion."""
+        N = len(group_names)
+        if N == 0:
+            return []
+
+        B, L, D = x.shape
+        towers = [self[name] for name in group_names]
+
+        # Expand: [B, L, D] → [B*N, L, D]
+        x_expanded = x.unsqueeze(0).expand(N, -1, -1, -1).reshape(N * B, L, D)
+
+        # Process each tower
+        results = []
+        for i, tower in enumerate(towers):
+            xi = x_expanded[i * B:(i + 1) * B]
+            opinion, features = tower(xi)
+            results.append((opinion, features))
+
+        return results
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Dict[str, Tensor]]:
+        """
+        Batched forward through conv collective.
+
+        Returns:
+            fused: [B, D] fused opinion
+            opinions: Dict of tower_name -> opinion tensor
+        """
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+
+        name_to_result = {}
+        all_fingerprints = []
+
+        # Process by group (batched)
+        for sig, group_names in self.tower_groups.items():
+            results = self._batched_group_forward(group_names, x)
+            for i, name in enumerate(group_names):
+                name_to_result[name] = results[i]
+
+        # Collect in order
+        opinion_tensors = []
+        opinions_dict = {}
+        for name in self.tower_names:
+            opinion, features = name_to_result[name]
+            opinion_tensors.append(opinion)
+            opinions_dict[name] = opinion
+            all_fingerprints.append(self[name].fingerprint)
+
+        # Fuse
+        fused = self['fusion'](*opinion_tensors)
+
+        # Collective fingerprint
+        fp_cat = torch.cat(all_fingerprints, dim=-1)
+        collective_fp = F.normalize(self['fp_proj'](fp_cat), dim=-1)
+
+        return fused, opinions_dict
+
+
+# =============================================================================
+# BUILDER FUNCTIONS
 # =============================================================================
 
 def build_conv_tower(
-        config: ConvTowerConfig,
-        default_dim: int = 256,
-        default_depth: int = 2,
-        default_fingerprint_dim: int = 64,
-        spatial_size: int = 16,
+    config: ConvTowerConfig,
+    default_dim: int = 256,
+    default_depth: int = 2,
+    default_fingerprint_dim: int = 64,
+    spatial_size: int = 16,
 ) -> ConfigurableConvTower:
-    """Build a conv tower from config."""
+    """Build a single conv tower."""
     return ConfigurableConvTower(
         config=config,
         default_dim=default_dim,
         default_depth=default_depth,
         default_fingerprint_dim=default_fingerprint_dim,
+        spatial_size=spatial_size,
+    )
+
+
+def build_conv_collective(
+    configs: List[ConvTowerConfig],
+    dim: int = 256,
+    default_depth: int = 2,
+    fingerprint_dim: int = 64,
+    spatial_size: int = 16,
+    name: str = 'conv_collective',
+) -> ConvTowerCollective:
+    """Build a conv tower collective with batched forward."""
+    return ConvTowerCollective(
+        name=name,
+        tower_configs=configs,
+        dim=dim,
+        default_depth=default_depth,
+        fingerprint_dim=fingerprint_dim,
         spatial_size=spatial_size,
     )
 
@@ -486,28 +538,44 @@ def preset_conv_pos_neg() -> List[ConvTowerConfig]:
 # =============================================================================
 
 if __name__ == '__main__':
+    import time
+
     print("=" * 60)
-    print("Conv Tower Builder Test")
+    print("Batched Conv Collective Test")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    B, L, D = 2, 256, 256  # 256 patches = 16x16 spatial
+    configs = preset_conv_pos_neg()
+    print(f"Towers: {len(configs)}")
+
+    collective = build_conv_collective(configs, dim=256, spatial_size=16)
+    collective.network_to(device=device)
+
+    print(f"Groups: {collective.tower_groups}")
+    print(f"Params: {sum(p.numel() for p in collective.parameters()):,}")
+
+    B, L, D = 32, 256, 256
     x = torch.randn(B, L, D, device=device)
 
-    configs = preset_conv_towers()
+    # Warmup
+    for _ in range(5):
+        _ = collective(x)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
 
-    print("\n--- Tower Tests ---")
-    for config in configs:
-        tower = build_conv_tower(config, default_dim=256, spatial_size=16).to(device)
-        opinion, features = tower(x)
-        params = sum(p.numel() for p in tower.parameters())
+    # Benchmark
+    t0 = time.perf_counter()
+    for _ in range(50):
+        fused, opinions = collective(x)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    ms = (time.perf_counter() - t0) / 50 * 1000
 
-        # Verify stages are TorchComponents
-        stage_types = [type(s).__name__ for s in tower.stages]
+    print(f"\nInput: {x.shape}")
+    print(f"Fused: {fused.shape}")
+    print(f"Opinions: {len(opinions)}")
+    print(f"Forward: {ms:.2f}ms ({B / (ms/1000):.0f} samples/sec)")
 
-        print(f"{config.name:15s}: opinion={opinion.shape}, stages={len(tower)}, "
-              f"params={params:,}, stage_type={stage_types[0]}")
-
-    print("\n✓ All stages are TorchComponents")
+    print("\n✓ Batched conv collective ready")
