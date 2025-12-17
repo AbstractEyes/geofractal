@@ -85,23 +85,50 @@ from geofractal.router.components.data_component import DataComponent
 
 # Supported encoder types
 TEXT_ENCODER_TYPES = Literal[
-    'clip_l', 'clip_g', 'clip_l_illustrious', 'clip_g_illustrious',
-    't5_base', 't5_large', 't5_xl', 't5_xxl',
-    'bert_base', 'bert_large',
+    # CLIP text
+    'clip_l', 'clip_g', 'clip_h', 'clip_b16', 'clip_b32', 'clip_l14_336',
+    'clip_l_illustrious', 'clip_g_illustrious',
+    'openclip_h', 'openclip_g',
+    # SigLIP text
+    'siglip_base', 'siglip_large', 'siglip_so400m',
+    # T5
+    't5_small', 't5_base', 't5_large', 't5_xl', 't5_xxl',
+    # Flan-T5
+    'flan_t5_small', 'flan_t5_base', 'flan_t5_large', 'flan_t5_xl', 'flan_t5_xxl',
+    # Qwen2
     'qwen2_0.5b', 'qwen2_1.5b', 'qwen2_7b',
-    'llama3_8b', 'llama3_70b',
+    'qwen2_0.5b_instruct', 'qwen2_1.5b_instruct', 'qwen2_7b_instruct',
+    # Qwen2.5
+    'qwen2.5_0.5b', 'qwen2.5_1.5b', 'qwen2.5_3b', 'qwen2.5_7b', 'qwen2.5_14b', 'qwen2.5_32b',
+    'qwen2.5_0.5b_instruct', 'qwen2.5_1.5b_instruct', 'qwen2.5_3b_instruct',
+    'qwen2.5_7b_instruct', 'qwen2.5_14b_instruct', 'qwen2.5_32b_instruct',
+    'qwen2.5_coder_1.5b', 'qwen2.5_coder_7b',
+    # BERT
+    'bert_base', 'bert_large',
 ]
 
 VISION_ENCODER_TYPES = Literal[
+    # DINO v1
+    'dino_vit_small', 'dino_vit_small_8', 'dino_vit_base', 'dino_vit_base_8',
+    # DINO v2
     'dinov2_small', 'dinov2_base', 'dinov2_large', 'dinov2_giant',
-    'dinov3_small', 'dinov3_base', 'dinov3_large',
-    'clip_vit_base', 'clip_vit_large', 'clip_vit_huge',
-    'siglip_base', 'siglip_large',
+    'dinov2_small_reg', 'dinov2_base_reg', 'dinov2_large_reg', 'dinov2_giant_reg',
+    # CLIP vision
+    'clip_vit_b16', 'clip_vit_b32', 'clip_vit_large', 'clip_vit_large_336',
+    'clip_vit_h', 'clip_vit_g',
+    # SigLIP vision
+    'siglip_vit_base', 'siglip_vit_large', 'siglip_vit_so400m',
+    # EVA
+    'eva_vit_g', 'eva02_base', 'eva02_large',
+    # ConvNeXt
+    'convnext_tiny', 'convnext_small', 'convnext_base', 'convnext_large',
 ]
 
 # Model registry with HuggingFace paths
 MODEL_REGISTRY = {
-    # CLIP Text
+    # =========================================================================
+    # CLIP TEXT ENCODERS
+    # =========================================================================
     'clip_l': {
         'type': 'text',
         'hf_path': 'openai/clip-vit-large-patch14',
@@ -116,6 +143,38 @@ MODEL_REGISTRY = {
         'model_class': CLIPTextModelWithProjection,
         'tokenizer_class': CLIPTokenizer,
         'dim': 1280,
+        'max_length': 77,
+    },
+    'clip_h': {
+        'type': 'text',
+        'hf_path': 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K',
+        'model_class': CLIPTextModelWithProjection,
+        'tokenizer_class': CLIPTokenizer,
+        'dim': 1024,
+        'max_length': 77,
+    },
+    'clip_b16': {
+        'type': 'text',
+        'hf_path': 'openai/clip-vit-base-patch16',
+        'model_class': CLIPTextModel,
+        'tokenizer_class': CLIPTokenizer,
+        'dim': 512,
+        'max_length': 77,
+    },
+    'clip_b32': {
+        'type': 'text',
+        'hf_path': 'openai/clip-vit-base-patch32',
+        'model_class': CLIPTextModel,
+        'tokenizer_class': CLIPTokenizer,
+        'dim': 512,
+        'max_length': 77,
+    },
+    'clip_l14_336': {
+        'type': 'text',
+        'hf_path': 'openai/clip-vit-large-patch14-336',
+        'model_class': CLIPTextModel,
+        'tokenizer_class': CLIPTokenizer,
+        'dim': 768,
         'max_length': 77,
     },
 
@@ -141,7 +200,53 @@ MODEL_REGISTRY = {
         'max_length': 77,
     },
 
-    # T5
+    # OpenCLIP variants
+    'openclip_h': {
+        'type': 'text',
+        'hf_path': 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K',
+        'model_class': CLIPTextModelWithProjection,
+        'tokenizer_class': CLIPTokenizer,
+        'dim': 1024,
+        'max_length': 77,
+    },
+    'openclip_g': {
+        'type': 'text',
+        'hf_path': 'laion/CLIP-ViT-bigG-14-laion2B-39B-b160k',
+        'model_class': CLIPTextModelWithProjection,
+        'tokenizer_class': CLIPTokenizer,
+        'dim': 1280,
+        'max_length': 77,
+    },
+
+    # SigLIP text
+    'siglip_base': {
+        'type': 'text',
+        'hf_path': 'google/siglip-base-patch16-224',
+        'dim': 768,
+        'max_length': 64,
+    },
+    'siglip_large': {
+        'type': 'text',
+        'hf_path': 'google/siglip-large-patch16-256',
+        'dim': 1024,
+        'max_length': 64,
+    },
+    'siglip_so400m': {
+        'type': 'text',
+        'hf_path': 'google/siglip-so400m-patch14-384',
+        'dim': 1152,
+        'max_length': 64,
+    },
+
+    # =========================================================================
+    # T5 ENCODERS
+    # =========================================================================
+    't5_small': {
+        'type': 'text',
+        'hf_path': 'google-t5/t5-small',
+        'dim': 512,
+        'max_length': 512,
+    },
     't5_base': {
         'type': 'text',
         'hf_path': 'google-t5/t5-base',
@@ -156,12 +261,53 @@ MODEL_REGISTRY = {
     },
     't5_xl': {
         'type': 'text',
+        'hf_path': 'google-t5/t5-3b',
+        'dim': 2048,
+        'max_length': 512,
+    },
+    't5_xxl': {
+        'type': 'text',
+        'hf_path': 'google-t5/t5-11b',
+        'dim': 4096,
+        'max_length': 512,
+    },
+
+    # Flan-T5 (instruction-tuned)
+    'flan_t5_small': {
+        'type': 'text',
+        'hf_path': 'google/flan-t5-small',
+        'dim': 512,
+        'max_length': 512,
+    },
+    'flan_t5_base': {
+        'type': 'text',
+        'hf_path': 'google/flan-t5-base',
+        'dim': 768,
+        'max_length': 512,
+    },
+    'flan_t5_large': {
+        'type': 'text',
+        'hf_path': 'google/flan-t5-large',
+        'dim': 1024,
+        'max_length': 512,
+    },
+    'flan_t5_xl': {
+        'type': 'text',
         'hf_path': 'google/flan-t5-xl',
         'dim': 2048,
         'max_length': 512,
     },
+    'flan_t5_xxl': {
+        'type': 'text',
+        'hf_path': 'google/flan-t5-xxl',
+        'dim': 4096,
+        'max_length': 512,
+    },
 
-    # Qwen
+    # =========================================================================
+    # QWEN MODELS
+    # =========================================================================
+    # Qwen2 Base
     'qwen2_0.5b': {
         'type': 'text',
         'hf_path': 'Qwen/Qwen2-0.5B',
@@ -176,8 +322,188 @@ MODEL_REGISTRY = {
         'max_length': 2048,
         'is_decoder': True,
     },
+    'qwen2_7b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2-7B',
+        'dim': 3584,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
 
-    # DINO v2
+    # Qwen2 Instruct
+    'qwen2_0.5b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2-0.5B-Instruct',
+        'dim': 896,
+        'max_length': 2048,
+        'is_decoder': True,
+    },
+    'qwen2_1.5b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2-1.5B-Instruct',
+        'dim': 1536,
+        'max_length': 2048,
+        'is_decoder': True,
+    },
+    'qwen2_7b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2-7B-Instruct',
+        'dim': 3584,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+
+    # Qwen2.5 Base
+    'qwen2.5_0.5b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-0.5B',
+        'dim': 896,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_1.5b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-1.5B',
+        'dim': 1536,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_3b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-3B',
+        'dim': 2048,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_7b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-7B',
+        'dim': 3584,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_14b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-14B',
+        'dim': 5120,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_32b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-32B',
+        'dim': 5120,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+
+    # Qwen2.5 Instruct
+    'qwen2.5_0.5b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-0.5B-Instruct',
+        'dim': 896,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_1.5b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-1.5B-Instruct',
+        'dim': 1536,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_3b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-3B-Instruct',
+        'dim': 2048,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_7b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-7B-Instruct',
+        'dim': 3584,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_14b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-14B-Instruct',
+        'dim': 5120,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_32b_instruct': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-32B-Instruct',
+        'dim': 5120,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+
+    # Qwen2.5 Coder
+    'qwen2.5_coder_1.5b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-Coder-1.5B',
+        'dim': 1536,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+    'qwen2.5_coder_7b': {
+        'type': 'text',
+        'hf_path': 'Qwen/Qwen2.5-Coder-7B',
+        'dim': 3584,
+        'max_length': 4096,
+        'is_decoder': True,
+    },
+
+    # =========================================================================
+    # BERT ENCODERS
+    # =========================================================================
+    'bert_base': {
+        'type': 'text',
+        'hf_path': 'google-bert/bert-base-uncased',
+        'dim': 768,
+        'max_length': 512,
+    },
+    'bert_large': {
+        'type': 'text',
+        'hf_path': 'google-bert/bert-large-uncased',
+        'dim': 1024,
+        'max_length': 512,
+    },
+
+    # =========================================================================
+    # DINO V1 VISION ENCODERS
+    # =========================================================================
+    'dino_vit_small': {
+        'type': 'vision',
+        'hf_path': 'facebook/dino-vits16',
+        'dim': 384,
+        'patch_size': 16,
+    },
+    'dino_vit_small_8': {
+        'type': 'vision',
+        'hf_path': 'facebook/dino-vits8',
+        'dim': 384,
+        'patch_size': 8,
+    },
+    'dino_vit_base': {
+        'type': 'vision',
+        'hf_path': 'facebook/dino-vitb16',
+        'dim': 768,
+        'patch_size': 16,
+    },
+    'dino_vit_base_8': {
+        'type': 'vision',
+        'hf_path': 'facebook/dino-vitb8',
+        'dim': 768,
+        'patch_size': 8,
+    },
+
+    # =========================================================================
+    # DINO V2 VISION ENCODERS
+    # =========================================================================
     'dinov2_small': {
         'type': 'vision',
         'hf_path': 'facebook/dinov2-small',
@@ -203,31 +529,588 @@ MODEL_REGISTRY = {
         'patch_size': 14,
     },
 
-    # DINO v3 (ConvNeXt)
-    'dinov3_small': {
+    # DINOv2 with registers (improved)
+    'dinov2_small_reg': {
         'type': 'vision',
-        'hf_path': 'facebook/dinov3-convnext-small-pretrain-lvd1689m',
-        'dim': 768,
+        'hf_path': 'facebook/dinov2-small-imagenet1k-1-layer',
+        'dim': 384,
+        'patch_size': 14,
     },
-    'dinov3_base': {
+    'dinov2_base_reg': {
         'type': 'vision',
-        'hf_path': 'facebook/dinov3-convnext-base-pretrain-lvd1689m',
+        'hf_path': 'facebook/dinov2-base-imagenet1k-1-layer',
+        'dim': 768,
+        'patch_size': 14,
+    },
+    'dinov2_large_reg': {
+        'type': 'vision',
+        'hf_path': 'facebook/dinov2-large-imagenet1k-1-layer',
         'dim': 1024,
+        'patch_size': 14,
+    },
+    'dinov2_giant_reg': {
+        'type': 'vision',
+        'hf_path': 'facebook/dinov2-giant-imagenet1k-1-layer',
+        'dim': 1536,
+        'patch_size': 14,
     },
 
-    # CLIP Vision
+    # =========================================================================
+    # CLIP VISION ENCODERS
+    # =========================================================================
+    'clip_vit_b16': {
+        'type': 'vision',
+        'hf_path': 'openai/clip-vit-base-patch16',
+        'dim': 768,
+        'patch_size': 16,
+    },
+    'clip_vit_b32': {
+        'type': 'vision',
+        'hf_path': 'openai/clip-vit-base-patch32',
+        'dim': 768,
+        'patch_size': 32,
+    },
     'clip_vit_large': {
         'type': 'vision',
         'hf_path': 'openai/clip-vit-large-patch14',
         'dim': 1024,
         'patch_size': 14,
     },
+    'clip_vit_large_336': {
+        'type': 'vision',
+        'hf_path': 'openai/clip-vit-large-patch14-336',
+        'dim': 1024,
+        'patch_size': 14,
+    },
+    'clip_vit_h': {
+        'type': 'vision',
+        'hf_path': 'laion/CLIP-ViT-H-14-laion2B-s32B-b79K',
+        'dim': 1280,
+        'patch_size': 14,
+    },
+    'clip_vit_g': {
+        'type': 'vision',
+        'hf_path': 'laion/CLIP-ViT-bigG-14-laion2B-39B-b160k',
+        'dim': 1664,
+        'patch_size': 14,
+    },
+
+    # =========================================================================
+    # SIGLIP VISION ENCODERS
+    # =========================================================================
+    'siglip_vit_base': {
+        'type': 'vision',
+        'hf_path': 'google/siglip-base-patch16-224',
+        'dim': 768,
+        'patch_size': 16,
+    },
+    'siglip_vit_large': {
+        'type': 'vision',
+        'hf_path': 'google/siglip-large-patch16-256',
+        'dim': 1024,
+        'patch_size': 16,
+    },
+    'siglip_vit_so400m': {
+        'type': 'vision',
+        'hf_path': 'google/siglip-so400m-patch14-384',
+        'dim': 1152,
+        'patch_size': 14,
+    },
+
+    # =========================================================================
+    # EVA VISION ENCODERS
+    # =========================================================================
+    'eva_vit_g': {
+        'type': 'vision',
+        'hf_path': 'BAAI/EVA-CLIP-8B',
+        'dim': 1024,
+        'patch_size': 14,
+    },
+    'eva02_base': {
+        'type': 'vision',
+        'hf_path': 'Salesforce/eva02-base-patch14-224',
+        'dim': 768,
+        'patch_size': 14,
+    },
+    'eva02_large': {
+        'type': 'vision',
+        'hf_path': 'Salesforce/eva02-large-patch14-224',
+        'dim': 1024,
+        'patch_size': 14,
+    },
+
+    # =========================================================================
+    # CONVNEXT VISION ENCODERS (for DINOv2 style)
+    # =========================================================================
+    'convnext_tiny': {
+        'type': 'vision',
+        'hf_path': 'facebook/convnext-tiny-224',
+        'dim': 768,
+    },
+    'convnext_small': {
+        'type': 'vision',
+        'hf_path': 'facebook/convnext-small-224',
+        'dim': 768,
+    },
+    'convnext_base': {
+        'type': 'vision',
+        'hf_path': 'facebook/convnext-base-224',
+        'dim': 1024,
+    },
+    'convnext_large': {
+        'type': 'vision',
+        'hf_path': 'facebook/convnext-large-224',
+        'dim': 1536,
+    },
 }
 
 
 # =============================================================================
-# CACHE MANAGER
+# STAGED CACHE BUILDER
 # =============================================================================
+
+class StagedCacheBuilder:
+    """
+    Staged caching utility for sequential model encoding with VRAM management.
+
+    Workflow:
+        1. Load model A → encode all data → cache to disk → unload A
+        2. Load model B → encode all data → cache to disk → unload B
+        3. Training: CachedDataset yields from disk, no models needed
+
+    Usage:
+        builder = StagedCacheBuilder(
+            dataset_name='danbooru_100k',
+            cache_dir='./cache',
+        )
+
+        # Stage 1: Small fast model
+        builder.add_stage('clip_l_illustrious', texts=all_texts)
+        builder.add_stage('clip_g_illustrious', texts=all_texts)
+
+        # Stage 2: Large slow model
+        builder.add_stage('dinov2_large', images=all_images)
+
+        # Execute all stages sequentially (models unloaded between stages)
+        builder.build()
+
+        # Get dataset that yields only cached tensors (no models needed)
+        dataset = builder.get_cached_dataset()
+    """
+
+    def __init__(
+        self,
+        dataset_name: str,
+        cache_dir: str = './encoder_cache',
+        device: str = 'cuda',
+    ):
+        self.dataset_name = dataset_name
+        self.cache_dir = Path(cache_dir) / dataset_name
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.device = device
+
+        # Stages to execute
+        self.stages: List[Dict] = []
+
+        # Metadata about completed caches
+        self.cache_manifest: Dict[str, Dict] = {}
+        self._load_manifest()
+
+    def _manifest_path(self) -> Path:
+        return self.cache_dir / 'manifest.json'
+
+    def _load_manifest(self) -> None:
+        """Load existing cache manifest."""
+        if self._manifest_path().exists():
+            with open(self._manifest_path()) as f:
+                self.cache_manifest = json.load(f)
+
+    def _save_manifest(self) -> None:
+        """Save cache manifest."""
+        with open(self._manifest_path(), 'w') as f:
+            json.dump(self.cache_manifest, f, indent=2)
+
+    def add_stage(
+        self,
+        encoder_name: str,
+        texts: Optional[List[str]] = None,
+        images: Optional[Tensor] = None,
+        batch_size: int = 32,
+        clip_skip: int = 2,
+        force_rebuild: bool = False,
+    ) -> 'StagedCacheBuilder':
+        """
+        Add an encoding stage.
+
+        Args:
+            encoder_name: Model from registry
+            texts: Text inputs (for text encoders)
+            images: Image inputs (for vision encoders)
+            batch_size: Encoding batch size
+            clip_skip: CLIP skip layers
+            force_rebuild: Rebuild even if cache exists
+        """
+        self.stages.append({
+            'encoder_name': encoder_name,
+            'texts': texts,
+            'images': images,
+            'batch_size': batch_size,
+            'clip_skip': clip_skip,
+            'force_rebuild': force_rebuild,
+        })
+        return self
+
+    def _get_cache_path(self, encoder_name: str) -> Path:
+        """Get cache file path for encoder."""
+        return self.cache_dir / f'{encoder_name}.safetensors'
+
+    def _is_cached(self, encoder_name: str, num_samples: int) -> bool:
+        """Check if encoder output is already cached with correct count."""
+        if encoder_name not in self.cache_manifest:
+            return False
+
+        meta = self.cache_manifest[encoder_name]
+        cache_path = self._get_cache_path(encoder_name)
+
+        return (
+            cache_path.exists() and
+            meta.get('num_samples') == num_samples and
+            meta.get('complete', False)
+        )
+
+    def build(self, show_progress: bool = True) -> 'StagedCacheBuilder':
+        """
+        Execute all stages sequentially.
+
+        Each stage:
+            1. Checks if cache exists (skips if so)
+            2. Loads model
+            3. Encodes all data
+            4. Saves to disk
+            5. Unloads model (frees VRAM)
+        """
+        print(f"\n{'='*60}")
+        print(f"StagedCacheBuilder: {self.dataset_name}")
+        print(f"{'='*60}")
+        print(f"Stages: {len(self.stages)}")
+        print(f"Cache dir: {self.cache_dir}")
+
+        for i, stage in enumerate(self.stages):
+            encoder_name = stage['encoder_name']
+            texts = stage['texts']
+            images = stage['images']
+            batch_size = stage['batch_size']
+            force_rebuild = stage['force_rebuild']
+
+            num_samples = len(texts) if texts is not None else len(images)
+
+            print(f"\n--- Stage {i+1}/{len(self.stages)}: {encoder_name} ---")
+
+            # Check cache
+            if not force_rebuild and self._is_cached(encoder_name, num_samples):
+                print(f"  ✓ Already cached ({num_samples} samples)")
+                continue
+
+            # Get encoder config
+            if encoder_name not in MODEL_REGISTRY:
+                raise ValueError(f"Unknown encoder: {encoder_name}")
+
+            config = MODEL_REGISTRY[encoder_name]
+            encoder_type = config['type']
+
+            # Create appropriate encoder
+            if encoder_type == 'text':
+                encoder = MultiTextEncode(
+                    encoders=[encoder_name],
+                    dataset_name=self.dataset_name,
+                    device=self.device,
+                    cache_enabled=False,  # We handle caching ourselves
+                    concatenate=True,
+                    clip_skip=stage['clip_skip'],
+                )
+            else:
+                encoder = MultiVisionEncode(
+                    encoders=[encoder_name],
+                    dataset_name=self.dataset_name,
+                    device=self.device,
+                    cache_enabled=False,
+                    concatenate=True,
+                )
+
+            # Encode in batches
+            print(f"  Encoding {num_samples} samples...")
+            all_embeddings = []
+
+            if texts is not None:
+                iterator = range(0, len(texts), batch_size)
+                if show_progress:
+                    iterator = tqdm(iterator, desc=f"  {encoder_name}")
+
+                for j in iterator:
+                    batch = texts[j:j + batch_size]
+                    emb = encoder.encode(batch)
+                    all_embeddings.append(emb.cpu())
+
+            elif images is not None:
+                iterator = range(0, len(images), batch_size)
+                if show_progress:
+                    iterator = tqdm(iterator, desc=f"  {encoder_name}")
+
+                for j in iterator:
+                    batch = images[j:j + batch_size]
+                    emb = encoder.encode(batch)
+                    all_embeddings.append(emb.cpu())
+
+            # Concatenate and save
+            embeddings = torch.cat(all_embeddings, dim=0)
+            cache_path = self._get_cache_path(encoder_name)
+
+            save_safetensors({'embeddings': embeddings}, str(cache_path))
+
+            # Update manifest
+            self.cache_manifest[encoder_name] = {
+                'num_samples': num_samples,
+                'shape': list(embeddings.shape),
+                'dtype': str(embeddings.dtype),
+                'dim': config.get('dim'),
+                'complete': True,
+            }
+            self._save_manifest()
+
+            print(f"  ✓ Saved: {cache_path.name} {list(embeddings.shape)}")
+
+            # CRITICAL: Unload model to free VRAM
+            encoder.unload_all()
+            del encoder
+            torch.cuda.empty_cache()
+            print(f"  ✓ Unloaded {encoder_name} from VRAM")
+
+        print(f"\n{'='*60}")
+        print(f"✓ All stages complete")
+        print(f"{'='*60}\n")
+
+        return self
+
+    def get_cached_dataset(
+        self,
+        encoder_names: Optional[List[str]] = None,
+    ) -> 'CachedEmbeddingDataset':
+        """
+        Get a dataset that yields cached embeddings only.
+
+        No models loaded - pure tensor retrieval from disk.
+
+        Args:
+            encoder_names: Which encoders to include (None = all cached)
+        """
+        if encoder_names is None:
+            encoder_names = list(self.cache_manifest.keys())
+
+        return CachedEmbeddingDataset(
+            cache_dir=self.cache_dir,
+            encoder_names=encoder_names,
+            manifest=self.cache_manifest,
+        )
+
+    def get_encoder_dim(self, encoder_name: str) -> int:
+        """Get dimension of cached encoder."""
+        if encoder_name in self.cache_manifest:
+            return self.cache_manifest[encoder_name].get('dim', 0)
+        if encoder_name in MODEL_REGISTRY:
+            return MODEL_REGISTRY[encoder_name].get('dim', 0)
+        return 0
+
+    def get_combined_dim(self, encoder_names: Optional[List[str]] = None) -> int:
+        """Get combined dimension of multiple encoders."""
+        if encoder_names is None:
+            encoder_names = list(self.cache_manifest.keys())
+        return sum(self.get_encoder_dim(n) for n in encoder_names)
+
+    @property
+    def is_complete(self) -> bool:
+        """Check if all stages are cached."""
+        for stage in self.stages:
+            encoder_name = stage['encoder_name']
+            if encoder_name not in self.cache_manifest:
+                return False
+            if not self.cache_manifest[encoder_name].get('complete', False):
+                return False
+        return True
+
+    def status(self) -> Dict:
+        """Get build status."""
+        return {
+            'dataset_name': self.dataset_name,
+            'cache_dir': str(self.cache_dir),
+            'stages': len(self.stages),
+            'cached': list(self.cache_manifest.keys()),
+            'complete': self.is_complete,
+        }
+
+
+class CachedEmbeddingDataset(Dataset):
+    """
+    Dataset that yields pre-cached embeddings.
+
+    No models required - loads from safetensors on disk.
+    Memory-mapped for efficiency with large caches.
+    """
+
+    def __init__(
+        self,
+        cache_dir: Path,
+        encoder_names: List[str],
+        manifest: Dict[str, Dict],
+        concatenate: bool = True,
+        mmap: bool = True,
+    ):
+        self.cache_dir = Path(cache_dir)
+        self.encoder_names = encoder_names
+        self.manifest = manifest
+        self.concatenate = concatenate
+
+        # Load all cached tensors
+        self.embeddings: Dict[str, Tensor] = {}
+
+        for name in encoder_names:
+            cache_path = self.cache_dir / f'{name}.safetensors'
+            if not cache_path.exists():
+                raise FileNotFoundError(f"Cache not found: {cache_path}")
+
+            # Load with memory mapping for large files
+            loaded = load_safetensors(str(cache_path))
+            self.embeddings[name] = loaded['embeddings']
+
+        # Verify all same length
+        lengths = [len(e) for e in self.embeddings.values()]
+        if len(set(lengths)) > 1:
+            raise ValueError(f"Mismatched cache lengths: {dict(zip(encoder_names, lengths))}")
+
+        self.num_samples = lengths[0] if lengths else 0
+
+        # Pre-compute combined dimension
+        self.dims = {name: self.embeddings[name].shape[-1] for name in encoder_names}
+        self.combined_dim = sum(self.dims.values())
+
+        print(f"CachedEmbeddingDataset: {self.num_samples} samples")
+        print(f"  Encoders: {self.dims}")
+        print(f"  Combined dim: {self.combined_dim}")
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __getitem__(self, idx: int) -> Union[Tensor, Dict[str, Tensor]]:
+        if self.concatenate:
+            # Return concatenated tensor
+            parts = [self.embeddings[name][idx] for name in self.encoder_names]
+            return torch.cat(parts, dim=-1)
+        else:
+            # Return dict of separate tensors
+            return {name: self.embeddings[name][idx] for name in self.encoder_names}
+
+    def get_encoder(self, encoder_name: str) -> Tensor:
+        """Get all embeddings for a specific encoder."""
+        return self.embeddings[encoder_name]
+
+    def get_batch(self, indices: List[int]) -> Union[Tensor, Dict[str, Tensor]]:
+        """Get batch by indices."""
+        if self.concatenate:
+            parts = [self.embeddings[name][indices] for name in self.encoder_names]
+            return torch.cat(parts, dim=-1)
+        else:
+            return {name: self.embeddings[name][indices] for name in self.encoder_names}
+
+
+# =============================================================================
+# CACHE MANAGER (for runtime use)
+# =============================================================================
+
+class CacheManager:
+    """
+    Runtime cache manager for yielding pre-built caches.
+
+    No models loaded - pure cache retrieval.
+
+    Usage:
+        # After building with StagedCacheBuilder
+        manager = CacheManager('./encoder_cache')
+
+        # Get dataset for training
+        dataset = manager.get_dataset('danbooru_100k')
+        loader = DataLoader(dataset, batch_size=32, shuffle=True)
+
+        for batch in loader:
+            # batch is pure tensors, no encoding needed
+            ...
+    """
+
+    def __init__(self, cache_root: str = './encoder_cache'):
+        self.cache_root = Path(cache_root)
+        self.datasets: Dict[str, Dict] = {}
+        self._scan_caches()
+
+    def _scan_caches(self) -> None:
+        """Scan for available cached datasets."""
+        if not self.cache_root.exists():
+            return
+
+        for dataset_dir in self.cache_root.iterdir():
+            if dataset_dir.is_dir():
+                manifest_path = dataset_dir / 'manifest.json'
+                if manifest_path.exists():
+                    with open(manifest_path) as f:
+                        manifest = json.load(f)
+                    self.datasets[dataset_dir.name] = {
+                        'path': dataset_dir,
+                        'manifest': manifest,
+                        'encoders': list(manifest.keys()),
+                    }
+
+    def list_datasets(self) -> List[str]:
+        """List available cached datasets."""
+        return list(self.datasets.keys())
+
+    def get_info(self, dataset_name: str) -> Dict:
+        """Get info about a cached dataset."""
+        if dataset_name not in self.datasets:
+            raise ValueError(f"Dataset not found: {dataset_name}")
+        return self.datasets[dataset_name]
+
+    def get_dataset(
+        self,
+        dataset_name: str,
+        encoder_names: Optional[List[str]] = None,
+        concatenate: bool = True,
+    ) -> CachedEmbeddingDataset:
+        """
+        Get a cached dataset ready for DataLoader.
+
+        No models loaded - pure tensor retrieval.
+        """
+        if dataset_name not in self.datasets:
+            raise ValueError(f"Dataset not found: {dataset_name}. Available: {self.list_datasets()}")
+
+        info = self.datasets[dataset_name]
+
+        if encoder_names is None:
+            encoder_names = info['encoders']
+
+        return CachedEmbeddingDataset(
+            cache_dir=info['path'],
+            encoder_names=encoder_names,
+            manifest=info['manifest'],
+            concatenate=concatenate,
+        )
+
+    def get_dim(self, dataset_name: str, encoder_names: Optional[List[str]] = None) -> int:
+        """Get combined dimension for dataset."""
+        info = self.datasets[dataset_name]
+        manifest = info['manifest']
+
+        if encoder_names is None:
+            encoder_names = info['encoders']
+
+        return sum(manifest[n].get('dim', manifest[n]['shape'][-1]) for n in encoder_names)
 
 class EmbeddingCache:
     """
@@ -1343,6 +2226,97 @@ def create_multimodal_encoder(
     )
 
 
+def build_staged_cache(
+    dataset_name: str,
+    texts: Optional[List[str]] = None,
+    images: Optional[Tensor] = None,
+    text_encoders: List[str] = ['clip_l_illustrious', 'clip_g_illustrious'],
+    vision_encoders: List[str] = ['dinov2_base'],
+    cache_dir: str = './encoder_cache',
+    device: str = 'cuda',
+    batch_size: int = 32,
+    clip_skip: int = 2,
+) -> CachedEmbeddingDataset:
+    """
+    Build staged cache and return dataset ready for training.
+
+    Sequential workflow:
+        1. For each text encoder: load → encode → cache → unload
+        2. For each vision encoder: load → encode → cache → unload
+        3. Return dataset yielding cached tensors only
+
+    Example:
+        # Prep 10k text embeddings with CLIP-L + CLIP-G (sequential, VRAM efficient)
+        dataset = build_staged_cache(
+            dataset_name='my_prompts',
+            texts=all_prompts,
+            text_encoders=['clip_l_illustrious', 'clip_g_illustrious'],
+            vision_encoders=[],  # No vision
+        )
+
+        # Now train with no encoder models in memory
+        loader = DataLoader(dataset, batch_size=64, shuffle=True)
+        for embeddings in loader:
+            # embeddings: [B, 77, 2048] - pure cached tensors
+            model(embeddings)
+    """
+    builder = StagedCacheBuilder(
+        dataset_name=dataset_name,
+        cache_dir=cache_dir,
+        device=device,
+    )
+
+    # Add text stages
+    if texts is not None:
+        for enc_name in text_encoders:
+            builder.add_stage(
+                encoder_name=enc_name,
+                texts=texts,
+                batch_size=batch_size,
+                clip_skip=clip_skip,
+            )
+
+    # Add vision stages
+    if images is not None:
+        for enc_name in vision_encoders:
+            builder.add_stage(
+                encoder_name=enc_name,
+                images=images,
+                batch_size=batch_size,
+            )
+
+    # Build all stages (models loaded/unloaded sequentially)
+    builder.build()
+
+    # Return dataset (no models in memory)
+    return builder.get_cached_dataset()
+
+
+def load_cached_dataset(
+    dataset_name: str,
+    cache_dir: str = './encoder_cache',
+    encoder_names: Optional[List[str]] = None,
+    concatenate: bool = True,
+) -> CachedEmbeddingDataset:
+    """
+    Load a pre-built cached dataset.
+
+    No models loaded - immediate tensor access.
+
+    Example:
+        # Load previously cached embeddings
+        dataset = load_cached_dataset('danbooru_100k')
+        print(f"Samples: {len(dataset)}, Dim: {dataset.combined_dim}")
+
+        loader = DataLoader(dataset, batch_size=64)
+        for batch in loader:
+            # Pure tensors, no encoding
+            ...
+    """
+    manager = CacheManager(cache_dir)
+    return manager.get_dataset(dataset_name, encoder_names, concatenate)
+
+
 # =============================================================================
 # TEST
 # =============================================================================
@@ -1354,10 +2328,10 @@ if __name__ == '__main__':
 
     # Test EmbeddingCache
     print("=" * 60)
-    print("Testing EmbeddingCache")
+    print("Testing EmbeddingCache with Dataset Namespacing")
     print("=" * 60)
 
-    cache = EmbeddingCache(max_memory_mb=100)
+    cache = EmbeddingCache(dataset_name='test_dataset', max_memory_mb=100)
 
     # Put and get
     key1 = cache.hash_key("test text 1")
@@ -1368,20 +2342,121 @@ if __name__ == '__main__':
     print(f"Cache put/get: {retrieved is not None}")
     print(f"Stats: {cache.stats}")
 
-    # Test MultiTextEncode (with mock - real test needs HF models)
+    # Test dataset switching
+    cache.set_dataset('other_dataset')
+    retrieved2 = cache.get(key1)  # Should miss - different namespace
+    print(f"After dataset switch, same key found: {retrieved2 is not None}")
+
+    # Test StagedCacheBuilder structure
     print("\n" + "=" * 60)
-    print("MultiTextEncode Structure Test")
+    print("StagedCacheBuilder Structure")
     print("=" * 60)
 
-    # Would run this with actual models:
-    # text_enc = MultiTextEncode(
-    #     encoders=['clip_l', 'clip_g'],
-    #     device=device,
-    # )
-    # emb = text_enc.encode("1girl, blue hair")
-    # print(f"Encoded: {emb.shape}")
+    print("""
+STAGED CACHING WORKFLOW:
+========================
 
-    print("\n✓ Structure tests passed!")
-    print("\nTo test with actual models, run:")
-    print("  text_enc = create_illustrious_text_encoder()")
-    print("  emb = text_enc.encode_batch(['1girl, blue hair', '1boy, armor'])")
+# 1. Build cache (models loaded/unloaded sequentially)
+builder = StagedCacheBuilder(
+    dataset_name='danbooru_100k',
+    cache_dir='./cache',
+)
+
+# Add stages - each model loaded, encodes, saves, unloads
+builder.add_stage('clip_l_illustrious', texts=all_texts)
+builder.add_stage('clip_g_illustrious', texts=all_texts)
+builder.add_stage('dinov2_large', images=all_images)
+
+# Execute (VRAM efficient - one model at a time)
+builder.build()
+
+# 2. Training (NO MODELS IN MEMORY)
+dataset = builder.get_cached_dataset()
+loader = DataLoader(dataset, batch_size=64, shuffle=True)
+
+for batch in loader:
+    # batch: [B, combined_dim] - pure cached tensors
+    model(batch)  # Your model, not encoders
+
+
+# OR use convenience function:
+dataset = build_staged_cache(
+    dataset_name='my_prompts',
+    texts=prompts_8500,
+    text_encoders=['clip_l_illustrious', 'clip_g_illustrious'],
+)
+
+# Later, load existing cache (no rebuild):
+dataset = load_cached_dataset('my_prompts')
+""")
+
+    # Test CacheManager structure
+    print("=" * 60)
+    print("CacheManager (Runtime Cache Retrieval)")
+    print("=" * 60)
+
+    print("""
+RUNTIME USAGE:
+==============
+
+manager = CacheManager('./encoder_cache')
+
+# List available datasets
+print(manager.list_datasets())
+# ['danbooru_100k', 'gelbooru_50k', 'cifar100']
+
+# Get dataset info
+info = manager.get_info('danbooru_100k')
+# {'encoders': ['clip_l_illustrious', 'clip_g_illustrious'], ...}
+
+# Get dataset for training
+dataset = manager.get_dataset('danbooru_100k')
+# CachedEmbeddingDataset: 100000 samples, dim=2048
+
+# No models loaded - pure tensor retrieval from safetensors
+loader = DataLoader(dataset, batch_size=128, num_workers=4)
+""")
+
+    # Test MODEL_REGISTRY
+    print("=" * 60)
+    print(f"MODEL_REGISTRY: {len(MODEL_REGISTRY)} models")
+    print("=" * 60)
+
+    text_models = [k for k, v in MODEL_REGISTRY.items() if v['type'] == 'text']
+    vision_models = [k for k, v in MODEL_REGISTRY.items() if v['type'] == 'vision']
+
+    print(f"\nText encoders ({len(text_models)}):")
+    for name in sorted(text_models)[:10]:
+        dim = MODEL_REGISTRY[name].get('dim', '?')
+        print(f"  {name}: {dim}d")
+    print(f"  ... and {len(text_models) - 10} more")
+
+    print(f"\nVision encoders ({len(vision_models)}):")
+    for name in sorted(vision_models)[:10]:
+        dim = MODEL_REGISTRY[name].get('dim', '?')
+        print(f"  {name}: {dim}d")
+    print(f"  ... and {len(vision_models) - 10} more")
+
+    print("\n" + "=" * 60)
+    print("✓ All structure tests passed!")
+    print("=" * 60)
+
+    print("""
+TO TEST WITH ACTUAL MODELS:
+===========================
+
+# Quick test
+texts = ['1girl, blue hair', '1boy, armor', 'landscape, mountains']
+
+# Build staged cache
+dataset = build_staged_cache(
+    dataset_name='test_3_samples',
+    texts=texts,
+    text_encoders=['clip_l', 'clip_g'],  # Or illustrious variants
+)
+
+# Check output
+print(f"Samples: {len(dataset)}")
+print(f"Combined dim: {dataset.combined_dim}")
+print(f"Sample shape: {dataset[0].shape}")
+""")
