@@ -1690,6 +1690,204 @@ class CantorRoPE(BaseEmbedding):
 
 
 # =============================================================================
+# SINUSOIDAL ROPE - Pure Harmonic Position Encoding
+# =============================================================================
+
+class SinusoidalRoPE(BaseEmbedding):
+    """
+    Rotary Position Embedding with explicit sinusoidal harmonic control.
+
+    Unlike Cantor (staircase) or Beatrix (continuous warping), SinusoidalRoPE provides:
+    - Explicit harmonic frequency bands (fundamental + overtones)
+    - Learnable phase offsets per frequency band
+    - Learnable amplitude per harmonic
+    - Pure sine/cosine encoding without fractal transformation
+
+    Mathematical Foundation:
+        Standard RoPE: freq_d = 1 / (theta^(2d/D))
+        Sinusoidal RoPE: freq_d = base_freq * harmonic_d
+
+        Where:
+            - harmonic_d distributes harmonics [1, 2, 3, ...] across dimensions
+            - phase_d is a learnable offset per dimension pair
+            - amplitude_d is a learnable scaling per harmonic
+
+        encoding = amplitude * [cos(pos * freq + phase), sin(pos * freq + phase)]
+
+    Key Properties:
+        - Clean harmonic baseline for geometric comparison
+        - Explicit cosine control via learnable phase offsets
+        - Amplitude modulation per frequency band
+        - No Cantor staircase, no continuous warping
+
+    Args:
+        name: Component identifier
+        head_dim: Dimension of attention heads (must be even)
+        base_freq: Fundamental frequency multiplier. Default 1.0
+        num_harmonics: Number of harmonic bands. Default None (auto = head_dim//2)
+        learnable_phase: Whether phase offsets are learnable. Default True
+        learnable_amplitude: Whether per-harmonic amplitudes are learnable. Default True
+        max_seq_len: Maximum sequence length. Default 8192
+        uuid: Optional unique identifier
+
+    Example:
+        rope = SinusoidalRoPE('sinusoidal', head_dim=64, base_freq=1.0)
+        q_rot, k_rot = rope.rotate(q, k, seq_len=128)
+
+        # Access learned parameters:
+        print(rope.phase)      # Phase offsets per frequency
+        print(rope.amplitude)  # Amplitude per harmonic
+    """
+
+    def __init__(
+        self,
+        name: str,
+        head_dim: int,
+        base_freq: float = 1.0,
+        num_harmonics: Optional[int] = None,
+        learnable_phase: bool = True,
+        learnable_amplitude: bool = True,
+        max_seq_len: int = 8192,
+        uuid: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(name, head_dim, uuid, **kwargs)
+
+        self.head_dim = head_dim
+        self.base_freq = base_freq
+        self.max_seq_len = max_seq_len
+
+        # Number of frequency bands (pairs of dimensions)
+        n_freqs = head_dim // 2
+        self.n_freqs = n_freqs
+        num_harmonics = num_harmonics or n_freqs
+
+        # Harmonic frequencies distributed across dimensions
+        # Creates series: base_freq * [1, 1.5, 2, 2.5, ...] / max_seq_len * 2π
+        harmonic_indices = torch.linspace(1, num_harmonics, n_freqs)
+        base_frequencies = base_freq * harmonic_indices / max_seq_len * 2 * 3.14159265358979
+        self.register_buffer('_base_freq_tensor', base_frequencies)
+
+        # Learnable phase offsets [n_freqs]
+        if learnable_phase:
+            self.phase = nn.Parameter(torch.zeros(n_freqs))
+        else:
+            self.register_buffer('phase', torch.zeros(n_freqs))
+
+        # Learnable amplitude per harmonic [n_freqs]
+        if learnable_amplitude:
+            self.amplitude = nn.Parameter(torch.ones(n_freqs))
+        else:
+            self.register_buffer('amplitude', torch.ones(n_freqs))
+
+        # Build initial cache
+        self._build_cache(max_seq_len)
+
+    @property
+    def dimension(self) -> int:
+        return 1
+
+    def _build_cache(self, seq_len: int) -> None:
+        """Build cos/sin cache for positions."""
+        device = self._base_freq_tensor.device
+        positions = torch.arange(seq_len, dtype=torch.float32, device=device)
+
+        # [seq_len, n_freqs] = [seq_len, 1] * [1, n_freqs] + [1, n_freqs]
+        freq = self._base_freq_tensor.unsqueeze(0)  # [1, n_freqs]
+        pos = positions.unsqueeze(1)                 # [seq_len, 1]
+
+        # Detach learnable params for cache (will recompute in forward if needed)
+        phase_offset = self.phase.detach().unsqueeze(0)  # [1, n_freqs]
+        amp = self.amplitude.detach().unsqueeze(0)       # [1, n_freqs]
+
+        angles = pos * freq + phase_offset  # [seq_len, n_freqs]
+
+        # Apply amplitude and compute cos/sin
+        cos_vals = amp * torch.cos(angles)  # [seq_len, n_freqs]
+        sin_vals = amp * torch.sin(angles)  # [seq_len, n_freqs]
+
+        # Duplicate to full head_dim: [seq_len, head_dim]
+        cos_full = torch.cat([cos_vals, cos_vals], dim=-1)
+        sin_full = torch.cat([sin_vals, sin_vals], dim=-1)
+
+        self.register_buffer('_cos', cos_full, persistent=False)
+        self.register_buffer('_sin', sin_full, persistent=False)
+        self._cached_seq_len = seq_len
+
+    def _ensure_cache(self, seq_len: int) -> None:
+        """Expand cache if needed."""
+        if not hasattr(self, '_cached_seq_len') or seq_len > self._cached_seq_len:
+            self._build_cache(max(seq_len, self.max_seq_len))
+
+    def embed(self, seq_len: int) -> Tuple[Tensor, Tensor]:
+        """Get cos/sin embeddings for sequence length."""
+        self._ensure_cache(seq_len)
+        return self._cos[:seq_len], self._sin[:seq_len]
+
+    def modulate(self, x: Tensor, modulator: Tensor) -> Tensor:
+        """Modulate embedding with external signal (identity for sinusoidal)."""
+        return x * modulator
+
+    def augment(self, x: Tensor, augmentation: Tensor) -> Tensor:
+        """Augment embedding (identity for sinusoidal)."""
+        return x
+
+    def rotate(
+        self,
+        q: Tensor,
+        k: Tensor,
+        cos: Tensor = None,
+        sin: Tensor = None,
+        seq_len: int = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Apply rotary embedding to query and key tensors.
+
+        Args:
+            q: Query tensor [..., seq_len, head_dim]
+            k: Key tensor [..., seq_len, head_dim]
+            cos: Precomputed cosine (optional)
+            sin: Precomputed sine (optional)
+            seq_len: Sequence length (optional, inferred from q)
+
+        Returns:
+            Rotated (q, k) tuple
+        """
+        if cos is None or sin is None:
+            L = seq_len or q.shape[-2]
+            cos, sin = self.embed(L)
+
+        return self._apply_rope(q, cos, sin), self._apply_rope(k, cos, sin)
+
+    def _apply_rope(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        """Apply rotation to a single tensor."""
+        if x.dim() == 4:
+            cos = cos.unsqueeze(0).unsqueeze(0)
+            sin = sin.unsqueeze(0).unsqueeze(0)
+        elif x.dim() == 3:
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+
+        return self._rotate_half(x, cos, sin)
+
+    def _rotate_half(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+        """Rotate using the half-dimension method."""
+        half = x.shape[-1] // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        rotated = torch.cat([-x2, x1], dim=-1)
+        return (x * cos) + (rotated * sin)
+
+    def forward(self, seq_len: int) -> Tuple[Tensor, Tensor]:
+        return self.embed(seq_len)
+
+    def extra_repr(self) -> str:
+        return (
+            f"head_dim={self.head_dim}, base_freq={self.base_freq}, "
+            f"n_harmonics={self.n_freqs}"
+        )
+
+
+# =============================================================================
 # TEST
 # =============================================================================
 
@@ -2057,6 +2255,7 @@ if __name__ == '__main__':
     print(f"{'ScaledRoPE':<20} {0:>12,}")
     print(f"{'YaRNRoPE':<20} {0:>12,}")
     print(f"{'PartialRoPE':<20} {0:>12,}")
+    print(f"{'SinusoidalRoPE':<20} {count_params(SinusoidalRoPE('sin_test', 64)):>12,}")
     print(f"{'BeatrixRoPE':<20} {count_params(beatrix):>12,}")
     print(f"{'CantorRoPE':<20} {count_params(cantor):>12,}")
     print(f"{'DualRoPE (lean)':<20} {count_params(dual_lean):>12,}")
@@ -2100,6 +2299,7 @@ if __name__ == '__main__':
         ('DualRoPE', DualRoPE('d', 64)),
         ('TriRoPE', TriRoPE('t', 64)),
         ('QuadRoPE', QuadRoPE('q', 64)),
+        ('SinusoidalRoPE', SinusoidalRoPE('sin', 64))
     ]
 
     for name, r in variants:
@@ -2243,15 +2443,16 @@ if __name__ == '__main__':
     # -------------------------------------------------------------------------
 
     print("\nRoPE variants ready:")
-    print("  RoPE         - Standard rotary embedding")
-    print("  ScaledRoPE   - Linear and NTK-aware scaling")
-    print("  YaRNRoPE     - State-of-the-art length extension")
-    print("  PartialRoPE  - Apply to subset of dimensions")
-    print("  BeatrixRoPE  - Devil's Staircase position encoding (NEW)")
-    print("  CantorRoPE   - Branch path alignment for wormholes (NEW)")
-    print("  DualRoPE     - Two configs with modulation/augmentation")
-    print("  TriRoPE      - Three configs with barycentric combination")
-    print("  QuadRoPE     - Four configs with quaternionic/simplex combination")
+    print("  RoPE           - Standard rotary embedding")
+    print("  ScaledRoPE     - Linear and NTK-aware scaling")
+    print("  YaRNRoPE       - State-of-the-art length extension")
+    print("  PartialRoPE    - Apply to subset of dimensions")
+    print("  BeatrixRoPE    - Devil's Staircase position encoding")
+    print("  CantorRoPE     - Branch path alignment for wormholes")
+    print("  SinusoidalRoPE - Pure harmonic control (NEW)")
+    print("  DualRoPE       - Two configs with modulation/augmentation")
+    print("  TriRoPE        - Three configs with barycentric combination")
+    print("  QuadRoPE       - Four configs with quaternionic/simplex combination")
 
     print("\nKey features:")
     print("  - Pre-computed cache for efficiency")
@@ -2263,7 +2464,7 @@ if __name__ == '__main__':
     print("  - Geometric modulation: phase_blend, complex, quaternion")
     print("  - Geometric augmentation: lerp, barycentric, simplex, hierarchical")
 
-    print("\nCantor-family RoPE (NEW):")
+    print("\nCantor-family RoPE:")
     print("  BeatrixRoPE:")
     print("    - Non-uniform positions via Cantor function C(x)")
     print("    - Learnable alpha (middle third density)")
@@ -2273,6 +2474,14 @@ if __name__ == '__main__':
     print("    - Enables long-range information teleportation")
     print("    - Three modes: path_encoding, hybrid, hierarchical")
     print("    - Learnable blend factor for hybrid mode")
+
+    print("\nSinusoidal RoPE (NEW):")
+    print("  SinusoidalRoPE:")
+    print("    - Pure harmonic frequency bands (fundamental + overtones)")
+    print("    - Learnable phase offsets per frequency")
+    print("    - Learnable amplitude per harmonic")
+    print("    - Clean reference baseline for geometric comparison")
+    print("    - Explicit cosine control without fractal warping")
     print()
     print("Key insight: 'Distance is an illusion.'")
     print("  Cantor routing doesn't care about sequential distance.")
