@@ -251,12 +251,11 @@ def build_address(name: str, address_type: AddressType, fingerprint_dim: int, **
         )
 
     elif address_type == AddressType.BEATRIX:
-        return CantorAddressComponent(
+        # Beatrix RoPE already has Devil's Staircase - use learned address for unique identity
+        return AddressComponent(
             f'{name}_addr',
-            k_simplex=kwargs.get('k_simplex', 4),
             fingerprint_dim=fingerprint_dim,
-            mode='staircase',
-            tau=kwargs.get('tau', 0.25),
+            init_scale=kwargs.get('init_scale', 0.02),
         )
 
     elif address_type == AddressType.SIMPLEX:
@@ -693,7 +692,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    configs = preset_pos_neg_pairs(['cantor', 'beatrix', 'helix', 'simplex', 'sinusoidal'])
+    configs = preset_pos_neg_pairs(['cantor', 'beatrix', 'helix', 'simplex'])
     print(f"Towers: {len(configs)}")
 
     collective = build_tower_collective(configs, dim=256, default_depth=1)
