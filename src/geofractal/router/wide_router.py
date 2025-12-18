@@ -812,6 +812,7 @@ class WideRouter(BaseRouter):
 
         # Tower tracking
         self.objects['_tower_names'] = []
+        self.objects['_tower_signatures'] = {}  # name -> cached signature
         self.objects['_alignments'] = {}
         self.objects['_analyzed'] = False
         self.objects['_auto_discover'] = auto_discover
@@ -863,12 +864,15 @@ class WideRouter(BaseRouter):
 
         if name not in self.objects['_tower_names']:
             self.objects['_tower_names'].append(name)
+            # Cache signature at registration time
+            self.objects['_tower_signatures'][name] = self._compute_tower_signature(self.components[name])
             self.objects['_analyzed'] = False  # Require re-analysis
 
     def unregister_tower(self, name: str) -> None:
         """Remove tower from wide execution."""
         if name in self.objects['_tower_names']:
             self.objects['_tower_names'].remove(name)
+            self.objects['_tower_signatures'].pop(name, None)
             self.objects['_analyzed'] = False
 
     @torch.compiler.disable
@@ -878,6 +882,8 @@ class WideRouter(BaseRouter):
             if isinstance(component, BaseTower):
                 if name not in self.objects['_tower_names']:
                     self.objects['_tower_names'].append(name)
+                    # Cache signature at discovery time
+                    self.objects['_tower_signatures'][name] = self._compute_tower_signature(component)
 
     # =========================================================================
     # STRUCTURE ANALYSIS (isolated from compile path)
@@ -971,8 +977,7 @@ class WideRouter(BaseRouter):
         structure_groups: Dict[str, List[str]] = {}
 
         for name in tower_names:
-            tower = self[name]
-            sig = self._tower_signature(tower)
+            sig = self._tower_signature(name)  # Uses cached signature
             if sig not in structure_groups:
                 structure_groups[sig] = []
             structure_groups[sig].append(name)
@@ -1002,8 +1007,21 @@ class WideRouter(BaseRouter):
 
         return outputs
 
-    def _tower_signature(self, tower: nn.Module) -> str:
-        """Get structural signature for a tower."""
+    def _tower_signature(self, name: str) -> str:
+        """Get cached structural signature for a tower by name."""
+        # Fast path: lookup cached signature
+        sig = self.objects['_tower_signatures'].get(name)
+        if sig is not None:
+            return sig
+        # Fallback: compute and cache (shouldn't happen if properly registered)
+        tower = self[name]
+        sig = self._compute_tower_signature(tower)
+        self.objects['_tower_signatures'][name] = sig
+        return sig
+
+    @torch.compiler.disable
+    def _compute_tower_signature(self, tower: nn.Module) -> str:
+        """Compute structural signature for a tower (cached at registration)."""
         # Use class name + total params as signature
         param_count = sum(p.numel() for p in tower.parameters())
 
