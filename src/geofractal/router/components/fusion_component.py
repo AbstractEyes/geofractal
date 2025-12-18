@@ -189,21 +189,15 @@ class GatedFusion(FusionComponent):
         self.gate_proj = nn.Linear(in_features, num_inputs)
 
     def fuse(self, *inputs: Tensor) -> Tensor:
-        # Compute gates from mean of inputs
-        stacked = torch.stack(inputs, dim=0)  # [N, B, ..., D]
-        pooled = stacked.mean(dim=0)  # [B, ..., D]
+        # Stack to [B, N, D] - compile-friendly, no movedim
+        stacked = torch.stack(inputs, dim=1)  # [B, N, D]
+        pooled = stacked.mean(dim=1)  # [B, D]
 
-        gates = torch.sigmoid(self.gate_proj(pooled))  # [B, ..., N]
+        gates = torch.sigmoid(self.gate_proj(pooled))  # [B, N]
+        gates = gates.unsqueeze(-1)  # [B, N, 1]
 
-        # Apply gates
-        # Move gate dim to front for broadcasting
-        gates = gates.movedim(-1, 0)  # [N, B, ...]
-
-        # Add feature dim for broadcasting
-        gates = gates.unsqueeze(-1)  # [N, B, ..., 1]
-
-        gated = stacked * gates
-        return gated.sum(dim=0)
+        gated = stacked * gates  # [B, N, D]
+        return gated.sum(dim=1)  # [B, D]
 
 
 # =============================================================================
@@ -390,10 +384,10 @@ class ResidualFusion(FusionComponent):
             w_shape = [self.num_inputs] + [1] * (stacked.dim() - 1)
             x = (stacked * weights.view(*w_shape)).sum(dim=0)
         elif self.fusion_type == 'gated':
-            stacked = torch.stack(inputs, dim=0)
-            gates = torch.sigmoid(self.inner(stacked.mean(dim=0)))
-            gates = gates.movedim(-1, 0).unsqueeze(-1)
-            x = (stacked * gates).sum(dim=0)
+            stacked = torch.stack(inputs, dim=1)  # [B, N, D]
+            gates = torch.sigmoid(self.inner(stacked.mean(dim=1)))  # [B, N]
+            gates = gates.unsqueeze(-1)  # [B, N, 1]
+            x = (stacked * gates).sum(dim=1)  # [B, D]
 
         return residual + x
 
