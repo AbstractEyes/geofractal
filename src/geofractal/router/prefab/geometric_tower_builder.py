@@ -38,6 +38,7 @@ from geofractal.router.components.rope_component import (
     QuadRoPE,
     BeatrixRoPE,
     CantorRoPE,
+    SinusoidalRoPE,
 )
 from geofractal.router.components.address_component import (
     AddressComponent,
@@ -69,6 +70,7 @@ class RoPEType(str, Enum):
     HELIX = "helix"      # -> TriRoPE
     SIMPLEX = "simplex"  # -> QuadRoPE
     FRACTAL = "fractal"  # -> DualRoPE
+    SINUSOIDAL = "sinusoidal"  # -> SinusoidalRoPE (pure harmonic)
 
 
 class AddressType(str, Enum):
@@ -79,6 +81,7 @@ class AddressType(str, Enum):
     CANTOR = "cantor"
     BEATRIX = "beatrix"  # -> CantorAddressComponent with mode='staircase'
     HELIX = "helix"      # -> SphericalAddressComponent
+    SINUSOIDAL = "sinusoidal"  # -> AddressComponent (standard, pairs with SinusoidalRoPE)
 
 
 class FusionType(str, Enum):
@@ -205,6 +208,17 @@ def build_rope(name: str, rope_type: RoPEType, head_dim: int, **kwargs) -> nn.Mo
             augmentation=kwargs.get('augmentation', 'lerp'),
         )
 
+    elif rope_type == RoPEType.SINUSOIDAL:
+        # SinusoidalRoPE - pure harmonic control with learnable phase/amplitude
+        return SinusoidalRoPE(
+            f'{name}_rope',
+            head_dim=head_dim,
+            base_freq=kwargs.get('base_freq', 1.0),
+            num_harmonics=kwargs.get('num_harmonics', None),
+            learnable_phase=kwargs.get('learnable_phase', True),
+            learnable_amplitude=kwargs.get('learnable_amplitude', True),
+        )
+
     else:  # STANDARD
         # RoPE(name, head_dim, theta, theta_scale, ...)
         return RoPE(
@@ -266,6 +280,14 @@ def build_address(name: str, address_type: AddressType, fingerprint_dim: int, **
             region=kwargs.get('region', 'seahorse'),
             orbit_length=fingerprint_dim,
             learnable=kwargs.get('learnable', True),
+        )
+
+    elif address_type == AddressType.SINUSOIDAL:
+        # Sinusoidal uses standard learned address
+        return AddressComponent(
+            f'{name}_addr',
+            fingerprint_dim=fingerprint_dim,
+            init_scale=kwargs.get('init_scale', 0.02),
         )
 
     else:  # STANDARD
@@ -635,7 +657,7 @@ def build_tower_collective(
 # =============================================================================
 
 def preset_pos_neg_pairs(
-    geometries: List[str] = ['cantor', 'beatrix', 'helix', 'simplex'],
+    geometries: List[str] = ['cantor', 'beatrix', 'helix', 'simplex', 'sinusoidal'],
 ) -> List[TowerConfig]:
     """Create pos/neg pairs for each geometry."""
     configs = []
@@ -671,7 +693,7 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
-    configs = preset_pos_neg_pairs(['cantor', 'beatrix', 'helix', 'simplex'])
+    configs = preset_pos_neg_pairs(['cantor', 'beatrix', 'helix', 'simplex', 'sinusoidal'])
     print(f"Towers: {len(configs)}")
 
     collective = build_tower_collective(configs, dim=256, default_depth=1)
