@@ -120,6 +120,8 @@ VISION_ENCODER_TYPES = Literal[
     # DINO v2
     'dinov2_small', 'dinov2_base', 'dinov2_large', 'dinov2_giant',
     'dinov2_small_reg', 'dinov2_base_reg', 'dinov2_large_reg', 'dinov2_giant_reg',
+    # DINO v3 (ConvNeXt backbone)
+    'dinov3_small', 'dinov3_base', 'dinov3_large',
     # CLIP vision
     'clip_vit_b16', 'clip_vit_b32', 'clip_vit_large', 'clip_vit_large_336',
     'clip_vit_h', 'clip_vit_g',
@@ -127,7 +129,7 @@ VISION_ENCODER_TYPES = Literal[
     'siglip_vit_base', 'siglip_vit_large', 'siglip_vit_so400m',
     # EVA
     'eva_vit_g', 'eva02_base', 'eva02_large',
-    # ConvNeXt
+    # ConvNeXt (standalone, not DINO)
     'convnext_tiny', 'convnext_small', 'convnext_base', 'convnext_large',
 ]
 
@@ -667,6 +669,25 @@ MODEL_REGISTRY = {
     'convnext_large': {
         'type': 'vision',
         'hf_path': 'facebook/convnext-large-224',
+        'dim': 1536,
+    },
+
+    # =========================================================================
+    # DINO V3 VISION ENCODERS (ConvNeXt backbone, LVD-142M pretraining)
+    # =========================================================================
+    'dinov3_small': {
+        'type': 'vision',
+        'hf_path': 'facebook/dinov3-convnext-small-pretrain-lvd1689m',
+        'dim': 768,
+    },
+    'dinov3_base': {
+        'type': 'vision',
+        'hf_path': 'facebook/dinov3-convnext-base-pretrain-lvd1689m',
+        'dim': 1024,
+    },
+    'dinov3_large': {
+        'type': 'vision',
+        'hf_path': 'facebook/dinov3-convnext-large-pretrain-lvd1689m',
         'dim': 1536,
     },
 }
@@ -1358,7 +1379,7 @@ class EncoderDataComponent(DataComponent):
         self.model_configs: Dict[str, Dict] = {}
 
     # =========================================================================
-    # PROPERTY OVERRIDES (use _device/_dtype when no parameters)
+    # PROPERTY OVERRIDES (use _device/_dtype since no learnable parameters)
     # =========================================================================
 
     @property
