@@ -234,7 +234,7 @@ def build_rope(name: str, rope_type: RoPEType, head_dim: int, **kwargs) -> nn.Mo
             head_dim=head_dim,
             theta_primary=theta_primary,
             theta_secondary=theta_secondary,
-            augmentation=kwargs.get('augmentation', 'golden'),  # lerp with golden blend
+            augmentation=kwargs.get('augmentation', 'lerp'),  # Valid: add, lerp, residual
         )
 
     elif rope_type == RoPEType.FIBONACCI:
@@ -248,7 +248,7 @@ def build_rope(name: str, rope_type: RoPEType, head_dim: int, **kwargs) -> nn.Mo
             theta_alpha=theta_base,                    # F_n
             theta_beta=theta_base / PHI,              # F_{n-1} ratio ≈ 6180
             theta_gamma=theta_base / (PHI * PHI),     # F_{n-2} ratio ≈ 3820
-            augmentation=kwargs.get('augmentation', 'fibonacci'),
+            augmentation=kwargs.get('augmentation', 'barycentric'),  # Valid: barycentric, sum, attention
         )
 
     else:  # STANDARD
@@ -322,13 +322,14 @@ def build_address(name: str, address_type: AddressType, fingerprint_dim: int, **
         )
 
     elif address_type == AddressType.GOLDEN:
-        # Golden uses SimplexAddressComponent with golden ratio k
+        # Golden uses SimplexAddressComponent with k=5 (pentagon geometry)
         # k=5 gives pentagonal geometry (golden ratio appears in pentagons)
+        # Use 'regular' method - regular simplices have golden ratio properties
         return SimplexAddressComponent(
             f'{name}_addr',
             k=kwargs.get('k', 5),  # Pentagon - golden ratio geometry
             embed_dim=fingerprint_dim,
-            method=kwargs.get('method', 'golden'),
+            method='regular',  # Regular simplex (valid method)
             learnable=kwargs.get('learnable', True),
         )
 
