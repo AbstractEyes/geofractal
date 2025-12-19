@@ -71,6 +71,8 @@ class RoPEType(str, Enum):
     SIMPLEX = "simplex"  # -> QuadRoPE
     FRACTAL = "fractal"  # -> DualRoPE
     SINUSOIDAL = "sinusoidal"  # -> SinusoidalRoPE (pure harmonic)
+    GOLDEN = "golden"    # -> DualRoPE with golden ratio theta spacing
+    FIBONACCI = "fibonacci"  # -> TriRoPE with Fibonacci sequence theta spacing
 
 
 class AddressType(str, Enum):
@@ -82,6 +84,8 @@ class AddressType(str, Enum):
     BEATRIX = "beatrix"  # -> CantorAddressComponent with mode='staircase'
     HELIX = "helix"      # -> SphericalAddressComponent
     SINUSOIDAL = "sinusoidal"  # -> AddressComponent (standard, pairs with SinusoidalRoPE)
+    GOLDEN = "golden"    # -> SimplexAddressComponent with golden ratio params
+    FIBONACCI = "fibonacci"  # -> SphericalAddressComponent (spiral geometry)
 
 
 class FusionType(str, Enum):
@@ -219,6 +223,34 @@ def build_rope(name: str, rope_type: RoPEType, head_dim: int, **kwargs) -> nn.Mo
             learnable_amplitude=kwargs.get('learnable_amplitude', True),
         )
 
+    elif rope_type == RoPEType.GOLDEN:
+        # Golden ratio spacing: θ_secondary = θ_primary / φ
+        # φ = (1 + √5) / 2 ≈ 1.618033988749895
+        PHI = 1.618033988749895
+        theta_primary = kwargs.get('theta_primary', 10000.0)
+        theta_secondary = kwargs.get('theta_secondary', theta_primary / PHI)
+        return DualRoPE(
+            f'{name}_rope',
+            head_dim=head_dim,
+            theta_primary=theta_primary,
+            theta_secondary=theta_secondary,
+            augmentation=kwargs.get('augmentation', 'golden'),  # lerp with golden blend
+        )
+
+    elif rope_type == RoPEType.FIBONACCI:
+        # Fibonacci sequence ratios: 1, 1, 2, 3, 5, 8, 13...
+        # Ratios converge to 1/φ ≈ 0.618, 1/φ² ≈ 0.382
+        PHI = 1.618033988749895
+        theta_base = kwargs.get('theta_base', 10000.0)
+        return TriRoPE(
+            f'{name}_rope',
+            head_dim=head_dim,
+            theta_alpha=theta_base,                    # F_n
+            theta_beta=theta_base / PHI,              # F_{n-1} ratio ≈ 6180
+            theta_gamma=theta_base / (PHI * PHI),     # F_{n-2} ratio ≈ 3820
+            augmentation=kwargs.get('augmentation', 'fibonacci'),
+        )
+
     else:  # STANDARD
         # RoPE(name, head_dim, theta, theta_scale, ...)
         return RoPE(
@@ -287,6 +319,25 @@ def build_address(name: str, address_type: AddressType, fingerprint_dim: int, **
             f'{name}_addr',
             fingerprint_dim=fingerprint_dim,
             init_scale=kwargs.get('init_scale', 0.02),
+        )
+
+    elif address_type == AddressType.GOLDEN:
+        # Golden uses SimplexAddressComponent with golden ratio k
+        # k=5 gives pentagonal geometry (golden ratio appears in pentagons)
+        return SimplexAddressComponent(
+            f'{name}_addr',
+            k=kwargs.get('k', 5),  # Pentagon - golden ratio geometry
+            embed_dim=fingerprint_dim,
+            method=kwargs.get('method', 'golden'),
+            learnable=kwargs.get('learnable', True),
+        )
+
+    elif address_type == AddressType.FIBONACCI:
+        # Fibonacci uses SphericalAddressComponent (spiral geometry)
+        # Fibonacci spirals appear in spherical/golden angle arrangements
+        return SphericalAddressComponent(
+            f'{name}_addr',
+            fingerprint_dim=fingerprint_dim,
         )
 
     else:  # STANDARD
@@ -656,7 +707,7 @@ def build_tower_collective(
 # =============================================================================
 
 def preset_pos_neg_pairs(
-    geometries: List[str] = ['cantor', 'beatrix', 'helix', 'simplex', 'sinusoidal'],
+    geometries: List[str] = ['cantor', 'beatrix', 'helix', 'simplex', 'sinusoidal', 'golden', 'fibonacci'],
 ) -> List[TowerConfig]:
     """Create pos/neg pairs for each geometry."""
     configs = []
@@ -676,6 +727,28 @@ def preset_all_six() -> List[TowerConfig]:
         TowerConfig('fractal', rope='fractal', address='fractal'),
         TowerConfig('standard', rope='standard', address='standard'),
     ]
+
+
+def preset_all_eight() -> List[TowerConfig]:
+    """Extended 8-tower config with golden and fibonacci."""
+    return [
+        TowerConfig('cantor', rope='cantor', address='cantor'),
+        TowerConfig('beatrix', rope='beatrix', address='beatrix'),
+        TowerConfig('helix', rope='helix', address='helix'),
+        TowerConfig('simplex', rope='simplex', address='simplex'),
+        TowerConfig('fractal', rope='fractal', address='fractal'),
+        TowerConfig('standard', rope='standard', address='standard'),
+        TowerConfig('golden', rope='golden', address='golden'),
+        TowerConfig('fibonacci', rope='fibonacci', address='fibonacci'),
+    ]
+
+
+def preset_dual_stack_full() -> List[TowerConfig]:
+    """Full dual stack: 8 geometries × 2 (pos/neg) = 16 towers."""
+    return preset_pos_neg_pairs([
+        'cantor', 'beatrix', 'helix', 'simplex',
+        'golden', 'fibonacci', 'sinusoidal', 'fractal'
+    ])
 
 
 # =============================================================================

@@ -41,11 +41,16 @@ from geofractal.router.components.fusion_component import AdaptiveFusion
 # =============================================================================
 
 class ConvTowerType(str, Enum):
-    DEPTH = "depth"
-    FREQUENCY = "frequency"
-    COLOR_PATTERN = "color_pattern"
-    COARSE_FINE = "coarse_fine"
-    WIDE_RESNET = "wide_resnet"
+    DEPTH = "depth"              # Multi-scale dilated (legacy alias)
+    DILATED = "dilated"          # Explicit dilated convolutions
+    FREQUENCY = "frequency"      # Spatial frequency filtering
+    COLOR_PATTERN = "color_pattern"  # Interpolated IN/BN normalization
+    COARSE_FINE = "coarse_fine"  # Parallel resolution streams
+    WIDE_RESNET = "wide_resnet"  # Wide residual blocks
+    BOTTLENECK = "bottleneck"    # Bottleneck residual blocks (ResNet-style)
+    SQUEEZE_EXCITE = "squeeze_excite"  # SE blocks with channel attention
+    INVERTED_BOTTLENECK = "inverted_bottleneck"  # MobileNetV2-style
+    SPATIAL_ATTENTION = "spatial_attention"  # Spatial self-attention
 
 
 # =============================================================================
@@ -227,6 +232,126 @@ class WideResComponent(TorchComponent):
         return out + x
 
 
+class BottleneckComponent(TorchComponent):
+    """Bottleneck residual block (ResNet-style)."""
+
+    def __init__(self, name: str, channels: int, reduction: int = 4, **kwargs):
+        super().__init__(name, **kwargs)
+        self.channels = channels
+        mid_channels = channels // reduction
+
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv1 = nn.Conv2d(channels, mid_channels, 1, bias=False)  # Reduce
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False)  # Process
+        self.bn3 = nn.BatchNorm2d(mid_channels)
+        self.conv3 = nn.Conv2d(mid_channels, channels, 1, bias=False)  # Expand
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = F.gelu(self.bn1(x))
+        out = self.conv1(out)
+        out = F.gelu(self.bn2(out))
+        out = self.conv2(out)
+        out = F.gelu(self.bn3(out))
+        out = self.conv3(out)
+        return out + x
+
+
+class SqueezeExciteComponent(TorchComponent):
+    """Squeeze-and-Excitation block with channel attention."""
+
+    def __init__(self, name: str, channels: int, reduction: int = 16, **kwargs):
+        super().__init__(name, **kwargs)
+        self.channels = channels
+        mid_channels = max(channels // reduction, 8)
+
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+        # SE module
+        self.se_pool = nn.AdaptiveAvgPool2d(1)
+        self.se_fc1 = nn.Linear(channels, mid_channels)
+        self.se_fc2 = nn.Linear(mid_channels, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = F.gelu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+
+        # SE attention
+        B, C, _, _ = out.shape
+        se = self.se_pool(out).view(B, C)
+        se = F.gelu(self.se_fc1(se))
+        se = torch.sigmoid(self.se_fc2(se)).view(B, C, 1, 1)
+
+        return F.gelu(out * se) + x
+
+
+class InvertedBottleneckComponent(TorchComponent):
+    """Inverted bottleneck (MobileNetV2-style): expand -> depthwise -> project."""
+
+    def __init__(self, name: str, channels: int, expansion: int = 4, **kwargs):
+        super().__init__(name, **kwargs)
+        self.channels = channels
+        exp_channels = channels * expansion
+
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.conv1 = nn.Conv2d(channels, exp_channels, 1, bias=False)  # Expand
+        self.bn2 = nn.BatchNorm2d(exp_channels)
+        self.conv2 = nn.Conv2d(exp_channels, exp_channels, 3, padding=1, groups=exp_channels, bias=False)  # Depthwise
+        self.bn3 = nn.BatchNorm2d(exp_channels)
+        self.conv3 = nn.Conv2d(exp_channels, channels, 1, bias=False)  # Project
+
+    def forward(self, x: Tensor) -> Tensor:
+        out = F.gelu(self.bn1(x))
+        out = self.conv1(out)
+        out = F.gelu(self.bn2(out))
+        out = self.conv2(out)
+        out = F.gelu(self.bn3(out))
+        out = self.conv3(out)
+        return out + x
+
+
+class SpatialAttentionComponent(TorchComponent):
+    """Spatial self-attention for conv features."""
+
+    def __init__(self, name: str, channels: int, num_heads: int = 4, **kwargs):
+        super().__init__(name, **kwargs)
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.qkv = nn.Conv2d(channels, channels * 3, 1, bias=False)
+        self.proj = nn.Conv2d(channels, channels, 1, bias=False)
+        self.bn2 = nn.BatchNorm2d(channels)
+
+        self.scale = self.head_dim ** -0.5
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+        L = H * W
+
+        out = self.bn1(x)
+        qkv = self.qkv(out).view(B, 3, self.num_heads, self.head_dim, L)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # [B, heads, head_dim, L]
+
+        # Attention
+        q = q.transpose(-2, -1)  # [B, heads, L, head_dim]
+        k = k  # [B, heads, head_dim, L]
+        v = v.transpose(-2, -1)  # [B, heads, L, head_dim]
+
+        attn = torch.matmul(q, k) * self.scale  # [B, heads, L, L]
+        attn = F.softmax(attn, dim=-1)
+
+        out = torch.matmul(attn, v)  # [B, heads, L, head_dim]
+        out = out.transpose(-2, -1).reshape(B, C, H, W)
+
+        out = self.bn2(self.proj(out))
+        return out + x
+
+
 # =============================================================================
 # PROJECTION COMPONENTS
 # =============================================================================
@@ -325,6 +450,13 @@ class ConfigurableConvTower(BaseTower):
                 dilation = dilations[i % len(dilations)]
                 self.append(DilatedConvComponent(f'{tower_name}_dilated_{i}', channels, dilation))
 
+        elif tower_type == ConvTowerType.DILATED:
+            # Explicit dilated conv (same as DEPTH, clearer name)
+            dilations = params.get('dilations', [1, 2, 4, 8])
+            for i in range(depth):
+                dilation = dilations[i % len(dilations)]
+                self.append(DilatedConvComponent(f'{tower_name}_dil_{i}', channels, dilation))
+
         elif tower_type == ConvTowerType.FREQUENCY:
             for i in range(depth):
                 self.append(FrequencyComponent(f'{tower_name}_freq_{i}', channels, spatial_size))
@@ -341,6 +473,26 @@ class ConfigurableConvTower(BaseTower):
             dropout = params.get('dropout', 0.1)
             for i in range(depth):
                 self.append(WideResComponent(f'{tower_name}_wrn_{i}', channels, dropout))
+
+        elif tower_type == ConvTowerType.BOTTLENECK:
+            reduction = params.get('reduction', 4)
+            for i in range(depth):
+                self.append(BottleneckComponent(f'{tower_name}_bn_{i}', channels, reduction))
+
+        elif tower_type == ConvTowerType.SQUEEZE_EXCITE:
+            reduction = params.get('se_reduction', 16)
+            for i in range(depth):
+                self.append(SqueezeExciteComponent(f'{tower_name}_se_{i}', channels, reduction))
+
+        elif tower_type == ConvTowerType.INVERTED_BOTTLENECK:
+            expansion = params.get('expansion', 4)
+            for i in range(depth):
+                self.append(InvertedBottleneckComponent(f'{tower_name}_inv_{i}', channels, expansion))
+
+        elif tower_type == ConvTowerType.SPATIAL_ATTENTION:
+            num_heads = params.get('num_heads', 4)
+            for i in range(depth):
+                self.append(SpatialAttentionComponent(f'{tower_name}_sa_{i}', channels, num_heads))
 
     @property
     def fingerprint(self) -> Tensor:
@@ -513,19 +665,36 @@ def preset_conv_towers() -> List[ConvTowerConfig]:
     """One tower of each type."""
     return [
         ConvTowerConfig('depth', tower_type='depth'),
+        ConvTowerConfig('dilated', tower_type='dilated'),
         ConvTowerConfig('frequency', tower_type='frequency'),
         ConvTowerConfig('color_pattern', tower_type='color_pattern'),
         ConvTowerConfig('coarse_fine', tower_type='coarse_fine'),
         ConvTowerConfig('wide_resnet', tower_type='wide_resnet'),
+        ConvTowerConfig('bottleneck', tower_type='bottleneck'),
+        ConvTowerConfig('squeeze_excite', tower_type='squeeze_excite'),
+        ConvTowerConfig('inverted_bottleneck', tower_type='inverted_bottleneck'),
+        ConvTowerConfig('spatial_attention', tower_type='spatial_attention'),
     ]
 
 
-def preset_conv_pos_neg() -> List[ConvTowerConfig]:
-    """Pos/neg pairs for conv towers."""
+def preset_conv_pos_neg(
+    tower_types: List[str] = ['wide_resnet', 'frequency', 'bottleneck', 'squeeze_excite']
+) -> List[ConvTowerConfig]:
+    """Pos/neg pairs for specified conv towers."""
     configs = []
-    for tower_type in ['depth', 'frequency', 'coarse_fine', 'wide_resnet']:
+    for tower_type in tower_types:
         configs.append(ConvTowerConfig(f'{tower_type}_pos', tower_type=tower_type, inverted=False))
         configs.append(ConvTowerConfig(f'{tower_type}_neg', tower_type=tower_type, inverted=True))
+    return configs
+
+
+def preset_conv_full_stack() -> List[ConvTowerConfig]:
+    """Full dual stack: all conv types × pos/neg = 20 towers."""
+    return preset_conv_pos_neg([
+        'wide_resnet', 'frequency', 'bottleneck', 'squeeze_excite',
+        'dilated', 'coarse_fine', 'inverted_bottleneck', 'spatial_attention',
+        'depth', 'color_pattern'
+    ])
     return configs
 
 
