@@ -52,9 +52,10 @@ import torch
 from torch import Tensor
 
 from geofractal.router.base_component import BaseComponent
+from geofractal.router.components.torch_component import TorchComponent
 
 
-class DataComponent(BaseComponent):
+class DataComponent(TorchComponent):
     """
     Data mover.
 
