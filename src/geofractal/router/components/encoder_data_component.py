@@ -1338,8 +1338,9 @@ class EncoderDataComponent(DataComponent):
     ):
         super().__init__(name, target_device=device, target_dtype=dtype)
 
-        self.device = torch.device(device)
-        self.dtype = dtype
+        # Use _device/_dtype to avoid shadowing TorchComponent properties
+        self._device = torch.device(device)
+        self._dtype = dtype
         self.cache_enabled = cache_enabled
         self.dataset_name = dataset_name
 
@@ -1355,6 +1356,20 @@ class EncoderDataComponent(DataComponent):
         self.tokenizers: Dict[str, Any] = {}
         self.processors: Dict[str, Any] = {}
         self.model_configs: Dict[str, Dict] = {}
+
+    # =========================================================================
+    # PROPERTY OVERRIDES (use _device/_dtype when no parameters)
+    # =========================================================================
+
+    @property
+    def device(self) -> torch.device:
+        """Device for encoding. Returns _device (no parameters in this component)."""
+        return self._device
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """Dtype for encoding. Returns _dtype."""
+        return self._dtype
 
     def set_dataset(self, dataset_name: str) -> 'EncoderDataComponent':
         """
