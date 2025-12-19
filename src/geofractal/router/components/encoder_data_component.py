@@ -122,6 +122,8 @@ VISION_ENCODER_TYPES = Literal[
     'dinov2_small_reg', 'dinov2_base_reg', 'dinov2_large_reg', 'dinov2_giant_reg',
     # DINO v3 (ConvNeXt backbone)
     'dinov3_small', 'dinov3_base', 'dinov3_large',
+    # DINO v3 (ViT backbone)
+    'dinov3_vits16', 'dinov3_vitb16', 'dinov3_vitl16',
     # CLIP vision
     'clip_vit_b16', 'clip_vit_b32', 'clip_vit_large', 'clip_vit_large_336',
     'clip_vit_h', 'clip_vit_g',
@@ -689,6 +691,23 @@ MODEL_REGISTRY = {
         'type': 'vision',
         'hf_path': 'facebook/dinov3-convnext-large-pretrain-lvd1689m',
         'dim': 1536,
+    },
+    # DINO V3 VISION ENCODERS (ViT backbone)
+    # =========================================================================
+    'dinov3_vits16': {
+        'type': 'vision',
+        'hf_path': 'facebook/dinov3-vits16-pretrain-lvd1689m',
+        'dim': 384,
+    },
+    'dinov3_vitb16': {
+        'type': 'vision',
+        'hf_path': 'facebook/dinov3-vitb16-pretrain-lvd1689m',
+        'dim': 768,
+    },
+    'dinov3_vitl16': {
+        'type': 'vision',
+        'hf_path': 'facebook/dinov3-vitl16-pretrain-lvd1689m',
+        'dim': 1024,
     },
 }
 
