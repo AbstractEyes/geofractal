@@ -1,8 +1,7 @@
 """
 BEATRIX OSCILLATOR
 ==================
-geofractal.router.prefab.agatha.beatrix_oscillator
---------------------------
+
 A covariant differential dynamics engine for flow-matching diffusion.
 
 Tesla understood that energy doesn't flow linearly - it oscillates, resonates,
@@ -46,9 +45,7 @@ Geodesic integration:
 No drift off manifold. Deterministic orbital trajectories.
 
 Author: AbstractPhil + Claude
-Date: December 2025
-License: Apache-2.0
-
+Date: December 2024
 """
 
 import torch
