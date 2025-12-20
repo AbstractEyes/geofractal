@@ -1,5 +1,5 @@
 """
-geofractal.router.agatha.head_router
+geofractal.router.prefab.agatha.head_router
 ====================================
 
 Agatha Head Router - Block 1 vector extraction with fingerprinting.
