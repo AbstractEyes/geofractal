@@ -1,5 +1,5 @@
 """
-geofractal.router.prefab.wide_router
+geofractal.router.wide_router
 ====================================
 
 WideRouter - Autonomous caching and batched execution for wide models.

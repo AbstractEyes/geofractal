@@ -1505,8 +1505,18 @@ class EncoderDataComponent(DataComponent):
             raise ValueError(f"No path specified for {encoder_name}")
 
         # Load tokenizer/processor
+        # For vision models, ALWAYS try to load processor first (critical for proper preprocessing)
+        model_type = config.get('type', 'unknown')
         tokenizer_class = config.get('tokenizer_class')
-        if tokenizer_class:
+
+        if model_type == 'vision':
+            # Vision models need processor for correct normalization
+            try:
+                self.processors[encoder_name] = AutoProcessor.from_pretrained(hf_path)
+                print(f"    ✓ Loaded processor for {encoder_name}")
+            except Exception as e:
+                print(f"    ⚠ No processor for {encoder_name}: {e}")
+        elif tokenizer_class:
             self.tokenizers[encoder_name] = tokenizer_class.from_pretrained(hf_path)
         else:
             try:
@@ -1872,7 +1882,7 @@ class MultiVisionEncode(EncoderDataComponent):
         print(f"{'='*60}\n")
 
     def _preprocess_images(self, images: Tensor) -> Tensor:
-        """Preprocess images for encoding."""
+        """Preprocess images for encoding (tensor path only)."""
         # Ensure [B, 3, H, W]
         if images.dim() == 3:
             images = images.unsqueeze(0)
@@ -1887,6 +1897,25 @@ class MultiVisionEncode(EncoderDataComponent):
             )
 
         return images.to(self.device, self.dtype)
+
+    def _tensor_to_pil(self, images: Tensor) -> List:
+        """Convert tensor images to PIL for processor."""
+        from PIL import Image
+        import numpy as np
+
+        # Ensure [B, 3, H, W]
+        if images.dim() == 3:
+            images = images.unsqueeze(0)
+
+        pil_images = []
+        for img in images:
+            # Convert [C, H, W] to [H, W, C] and to numpy
+            img_np = img.cpu().numpy().transpose(1, 2, 0)
+            # Clip to [0, 1] and convert to uint8
+            img_np = (np.clip(img_np, 0, 1) * 255).astype(np.uint8)
+            pil_images.append(Image.fromarray(img_np))
+
+        return pil_images
 
     @torch.no_grad()
     def encode_single(
@@ -1905,24 +1934,28 @@ class MultiVisionEncode(EncoderDataComponent):
             Tensor [B, dim] if pool_output else [B, N, dim]
         """
         model = self.models[encoder_name]
-        images = self._preprocess_images(images)
 
         # Get processor if available
         processor = self.processors.get(encoder_name)
         if processor:
-            # Some models need special preprocessing
-            inputs = processor(images=images, return_tensors='pt')
+            # Processor expects PIL images, convert from tensor
+            pil_images = self._tensor_to_pil(images)
+            inputs = processor(images=pil_images, return_tensors='pt')
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             output = model(**inputs)
         else:
+            # No processor - preprocess tensor directly
+            # WARNING: This may not apply correct normalization for some models
+            images = self._preprocess_images(images)
             output = model(pixel_values=images)
 
-        # Extract features
-        if hasattr(output, 'pooler_output') and self.pool_output:
+        # Extract features - prefer pooler_output for pooled features
+        if hasattr(output, 'pooler_output') and output.pooler_output is not None and self.pool_output:
             return output.pooler_output
         elif hasattr(output, 'last_hidden_state'):
             features = output.last_hidden_state
             if self.pool_output:
+                # Mean pool over sequence dimension (skip CLS token if present)
                 return features.mean(dim=1)
             return features
         else:
@@ -1949,6 +1982,137 @@ class MultiVisionEncode(EncoderDataComponent):
             return torch.cat(list(embeddings.values()), dim=-1)
 
         return embeddings
+
+    @torch.no_grad()
+    def encode_pil_single(
+        self,
+        encoder_name: str,
+        pil_images: List,
+    ) -> Tensor:
+        """
+        Encode PIL images with a single encoder (preferred for best quality).
+
+        Args:
+            encoder_name: Which encoder to use
+            pil_images: List of PIL Images
+
+        Returns:
+            Tensor [B, dim] if pool_output else [B, N, dim]
+        """
+        model = self.models[encoder_name]
+        processor = self.processors.get(encoder_name)
+
+        if processor:
+            inputs = processor(images=pil_images, return_tensors='pt')
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            output = model(**inputs)
+        else:
+            # Fallback: convert PIL to tensor (may lose quality without proper normalization)
+            from torchvision import transforms
+            to_tensor = transforms.ToTensor()
+            images = torch.stack([to_tensor(img) for img in pil_images])
+            images = self._preprocess_images(images)
+            output = model(pixel_values=images)
+
+        # Extract features
+        if hasattr(output, 'pooler_output') and output.pooler_output is not None and self.pool_output:
+            return output.pooler_output
+        elif hasattr(output, 'last_hidden_state'):
+            features = output.last_hidden_state
+            if self.pool_output:
+                return features.mean(dim=1)
+            return features
+        else:
+            return output[0] if isinstance(output, tuple) else output
+
+    @torch.no_grad()
+    def encode_pil(self, pil_images: List) -> Union[Tensor, Dict[str, Tensor]]:
+        """
+        Encode PIL images with all encoders (preferred for best quality).
+
+        Args:
+            pil_images: List of PIL Images
+
+        Returns:
+            If concatenate=True: Tensor [B, combined_dim]
+            If concatenate=False: Dict[encoder_name, Tensor]
+        """
+        embeddings = {}
+
+        for enc_name in self.encoder_names:
+            embeddings[enc_name] = self.encode_pil_single(enc_name, pil_images)
+
+        if self.concatenate:
+            return torch.cat(list(embeddings.values()), dim=-1)
+
+        return embeddings
+
+    @torch.no_grad()
+    def encode_pil_batch(
+        self,
+        pil_images: List,
+        batch_size: int = 32,
+        show_progress: bool = True,
+    ) -> Tensor:
+        """
+        Encode batch of PIL images (preferred for best quality).
+
+        Args:
+            pil_images: List of PIL Images
+            batch_size: Batch size for encoding
+            show_progress: Show progress bar
+
+        Returns:
+            Tensor [N, combined_dim]
+        """
+        all_embeddings = []
+
+        iterator = range(0, len(pil_images), batch_size)
+        if show_progress:
+            iterator = tqdm(iterator, desc="Encoding PIL images")
+
+        for i in iterator:
+            batch = pil_images[i:i + batch_size]
+            emb = self.encode_pil(batch)
+            all_embeddings.append(emb.cpu())
+
+        return torch.cat(all_embeddings, dim=0)
+
+    @staticmethod
+    def validate_features(features: Tensor, name: str = "features") -> bool:
+        """
+        Validate that features are not collapsed.
+
+        Args:
+            features: Tensor [N, dim]
+            name: Name for logging
+
+        Returns:
+            True if features look valid, False if collapsed
+        """
+        if features.dim() != 2:
+            print(f"⚠ {name}: Expected 2D tensor, got {features.dim()}D")
+            return False
+
+        # Check inter-sample similarity
+        sample_size = min(100, len(features))
+        sample = F.normalize(features[:sample_size], dim=-1)
+        sim_matrix = sample @ sample.T
+        off_diag = sim_matrix[~torch.eye(sample_size, dtype=bool, device=features.device)].mean()
+
+        # Check variance
+        per_feat_var = features.var(dim=0).mean()
+
+        is_valid = off_diag < 0.8 and per_feat_var > 0.01
+
+        if not is_valid:
+            print(f"⚠ {name} COLLAPSED:")
+            print(f"  Inter-sample similarity: {off_diag:.4f} (should be < 0.5)")
+            print(f"  Per-feature variance: {per_feat_var:.6f} (should be > 0.01)")
+        else:
+            print(f"✓ {name} valid: similarity={off_diag:.4f}, variance={per_feat_var:.6f}")
+
+        return is_valid
 
     @torch.no_grad()
     def encode_batch(
@@ -2024,6 +2188,81 @@ class MultiVisionEncode(EncoderDataComponent):
             all_features.append(features.cpu())
 
         features = torch.cat(all_features, dim=0)
+
+        # Validate features before saving
+        is_valid = self.validate_features(features, f"{self.dataset_name} features")
+        if not is_valid:
+            print("⚠ WARNING: Features appear collapsed! Cache may be corrupt.")
+            print("  This usually means the processor was not loaded correctly.")
+            print("  Try using encode_pil_batch() with PIL images instead.")
+
+        # Save cache
+        if cache_path:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            torch.save(features, cache_path)
+            print(f"✓ Cached {len(features)} features [{self.dataset_name}] to {cache_path}")
+
+        return features
+
+    @torch.no_grad()
+    def encode_dataset_pil(
+        self,
+        dataset: Dataset,
+        batch_size: int = 64,
+        cache_path: Optional[str] = None,
+    ) -> Tensor:
+        """
+        Encode entire dataset using PIL images (preferred for best quality).
+
+        This method extracts PIL images from the dataset and uses the processor
+        directly, ensuring correct preprocessing.
+
+        Args:
+            dataset: Dataset returning (PIL image, ...) tuples (NO transforms applied)
+            batch_size: Batch size
+            cache_path: Path to save/load cache
+
+        Returns:
+            Tensor [N, combined_dim]
+        """
+        # Build cache path with dataset name
+        if cache_path:
+            cache_path = Path(cache_path)
+            if self.dataset_name not in str(cache_path):
+                cache_path = cache_path.parent / f"{self.dataset_name}_{cache_path.name}"
+            cache_path = str(cache_path)
+
+        # Try to load from cache
+        if cache_path and Path(cache_path).exists():
+            print(f"Loading cached features [{self.dataset_name}] from {cache_path}")
+            features = torch.load(cache_path, weights_only=True)
+            # Validate loaded features
+            self.validate_features(features, f"{self.dataset_name} (loaded)")
+            return features
+
+        all_features = []
+        for i in tqdm(range(0, len(dataset), batch_size), desc=f"Caching [{self.dataset_name}] PIL features"):
+            # Extract PIL images directly
+            pil_images = []
+            for j in range(i, min(i + batch_size, len(dataset))):
+                item = dataset[j]
+                if isinstance(item, (tuple, list)):
+                    pil_images.append(item[0])
+                else:
+                    pil_images.append(item)
+
+            features = self.encode_pil(pil_images)
+            all_features.append(features.cpu())
+
+        features = torch.cat(all_features, dim=0)
+
+        # Validate features before saving
+        is_valid = self.validate_features(features, f"{self.dataset_name} features")
+        if not is_valid:
+            raise ValueError(
+                f"Features are collapsed! This indicates a serious preprocessing issue. "
+                f"Check that the processor is loaded correctly for your encoder."
+            )
 
         # Save cache
         if cache_path:
