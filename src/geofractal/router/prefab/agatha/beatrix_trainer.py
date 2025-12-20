@@ -279,9 +279,18 @@ class SinusoidalPosEmb(nn.Module):
 
 class BeatrixDenoiser(nn.Module):
     """
-    Trainable denoiser component.
+    Trainable denoiser with flow matching velocity prediction.
 
-    Takes HeadMail from AgathaHeadRouter and denoises z_noisy.
+    Predicts velocity field v that transports z_0 (noise) → z_1 (data).
+
+    Flow Matching Formulation:
+        z_t = (1-t)·z_0 + t·z_1           # Linear interpolation
+        v_target = z_1 - z_0               # Target velocity (constant)
+        v_pred = network(z_t, t, cond)     # Predicted velocity
+        loss = ||v_pred - v_target||²      # Velocity matching
+
+    The oscillator integrates tower forces to produce velocity,
+    NOT position. This is the key difference from standard diffusion.
     """
 
     def __init__(self, config: BeatrixConfig):
@@ -330,44 +339,70 @@ class BeatrixDenoiser(nn.Module):
             nn.Linear(config.head_embed_dim * 2, config.latent_dim),
         )
 
-        self.sigma_embed = nn.Sequential(
+        # Timestep embedding (t ∈ [0,1], not sigma)
+        self.time_embed = nn.Sequential(
             SinusoidalPosEmb(config.head_embed_dim),
             nn.Linear(config.head_embed_dim, config.head_embed_dim),
             nn.GELU(),
             nn.Linear(config.head_embed_dim, config.head_embed_dim),
         )
 
+        # Velocity output projection (oscillator output → velocity)
+        self.velocity_proj = nn.Sequential(
+            nn.Linear(config.latent_dim, config.latent_dim),
+            nn.GELU(),
+            nn.Linear(config.latent_dim, config.latent_dim),
+        )
+
     def forward(
         self,
-        z_noisy: Tensor,
-        mail: HeadMail,
-        sigma: Tensor,
+        z_t: Tensor,                    # [B, C, H, W] interpolated latent
+        mail: HeadMail,                 # Conditioning from head router
+        t: Tensor,                      # [B] timestep in [0, 1]
         num_steps: Optional[int] = None,
     ) -> Tensor:
-        """Denoise z_noisy using HeadMail conditioning."""
-        B = z_noisy.shape[0]
+        """
+        Predict velocity field at z_t.
+
+        Args:
+            z_t: Interpolated latent z_t = (1-t)·z_0 + t·z_1
+            mail: HeadMail containing fused conditioning
+            t: Timestep in [0, 1] (0=noise, 1=data)
+
+        Returns:
+            v_pred: Predicted velocity [B, C, H, W]
+        """
+        B = z_t.shape[0]
         num_steps = num_steps or self.config.num_training_steps
 
-        sigma_emb = self.sigma_embed(sigma)
+        # Embed timestep
+        t_emb = self.time_embed(t)  # [B, embed_dim]
 
-        fused_cond = mail.fused + sigma_emb if mail.fused is not None else sigma_emb
+        # Condition fused representation with timestep
+        fused_cond = mail.fused + t_emb if mail.fused is not None else t_emb
 
-        x_ref = self.anchor_proj(fused_cond)
+        # Anchor: where we want to go (data manifold direction)
+        x_ref = self.anchor_proj(fused_cond)  # [B, latent_dim]
 
+        # Guidance from DINO
         guidance_flat = None
         if 'dino' in mail.streams:
             dino_content = mail.streams['dino'].content
             if dino_content.dim() == 3:
                 dino_content = dino_content.mean(dim=1)
-            guidance_flat = self.guidance_proj(dino_content + sigma_emb)
+            guidance_flat = self.guidance_proj(dino_content + t_emb)
 
+        # Get tower forces from collective
         collective_result = self.collective(fused_cond, return_all=True)
         tower_outputs = collective_result['outputs']
         fingerprint = collective_result['fingerprint']
 
-        z_flat = z_noisy.reshape(B, -1)
+        # Flatten z_t for oscillator
+        z_flat = z_t.reshape(B, -1)  # [B, latent_dim]
 
-        z_pred_flat = self.oscillator(
+        # Oscillator computes the integrated force field
+        # This represents the "push" from current position toward data
+        osc_out = self.oscillator(
             x_init=z_flat,
             x_ref=x_ref,
             tower_outputs=tower_outputs,
@@ -376,7 +411,11 @@ class BeatrixDenoiser(nn.Module):
             num_steps=num_steps,
         )
 
-        return z_pred_flat.reshape(B, *self.config.latent_shape)
+        # The velocity is the difference: where oscillator wants to go - where we are
+        # v = f(z_t, t, cond) that predicts the direction toward data
+        v_flat = self.velocity_proj(osc_out - z_flat)
+
+        return v_flat.reshape(B, *self.config.latent_shape)
 
     def network_to(self, device: torch.device):
         self.to(device)
@@ -460,46 +499,79 @@ class Beatrix(nn.Module):
     def forward(
         self,
         inputs: Dict[str, Tensor],
-        sigma: Optional[Tensor] = None,
+        t: Optional[Tensor] = None,
+        z_0: Optional[Tensor] = None,       # Noise (if provided)
         num_steps: Optional[int] = None,
-    ) -> Tuple[Tensor, HeadMail]:
-        """Forward pass for training."""
+    ) -> Tuple[Tensor, Tensor, HeadMail]:
+        """
+        Forward pass for flow matching training.
+
+        Flow Matching:
+            z_t = (1-t)·z_0 + t·z_1
+            v_target = z_1 - z_0
+            v_pred = denoiser(z_t, mail, t)
+
+        Args:
+            inputs: Dict for head router (must include 'flux_ae')
+            t: Timestep in [0,1] (sampled if None)
+            z_0: Noise tensor (sampled if None)
+
+        Returns:
+            v_pred: Predicted velocity [B, C, H, W]
+            v_target: Target velocity [B, C, H, W]
+            mail: HeadMail for inspection
+        """
         mail = self.head(inputs)
 
         if 'flux_ae' not in mail.streams:
             raise ValueError("flux_ae stream required")
 
-        z_clean = mail.streams['flux_ae'].metadata.get('raw')
-        if z_clean is None:
+        z_1 = mail.streams['flux_ae'].metadata.get('raw')  # Data (clean)
+        if z_1 is None:
             raise ValueError("flux_ae missing raw latent - use attach_flux_ae()")
 
-        B = z_clean.shape[0]
-        device = z_clean.device
+        B = z_1.shape[0]
+        device = z_1.device
 
-        if sigma is None:
-            sigma = torch.rand(B, device=device) * (
-                self.config.sigma_max - self.config.sigma_min
-            ) + self.config.sigma_min
+        # Sample timestep t ~ Uniform(0, 1)
+        if t is None:
+            t = torch.rand(B, device=device)
 
-        noise = torch.randn_like(z_clean)
-        z_noisy = z_clean + sigma.view(-1, 1, 1, 1) * noise
+        # Sample noise z_0 ~ N(0, I)
+        if z_0 is None:
+            z_0 = torch.randn_like(z_1)
 
-        z_pred = self.denoiser(z_noisy, mail, sigma, num_steps)
+        # Flow matching interpolation: z_t = (1-t)·z_0 + t·z_1
+        t_expand = t.view(-1, 1, 1, 1)
+        z_t = (1 - t_expand) * z_0 + t_expand * z_1
 
-        return z_pred, mail
+        # Target velocity: v = z_1 - z_0 (constant along path)
+        v_target = z_1 - z_0
+
+        # Predict velocity
+        v_pred = self.denoiser(z_t, mail, t, num_steps)
+
+        return v_pred, v_target, mail
 
     def compute_loss(self, inputs: Dict[str, Tensor]) -> Tuple[Tensor, Dict[str, float]]:
-        """Compute training loss."""
-        z_pred, mail = self.forward(inputs)
-        z_clean = mail.streams['flux_ae'].metadata['raw']
+        """
+        Compute flow matching loss.
 
-        loss = F.mse_loss(z_pred, z_clean)
+        Loss = E_t,z_0 [ ||v_pred(z_t, t) - v_target||² ]
+        """
+        v_pred, v_target, mail = self.forward(inputs)
+
+        # Velocity matching loss
+        loss = F.mse_loss(v_pred, v_target)
 
         with torch.no_grad():
             mse = loss.item()
-            psnr = -10 * math.log10(mse) if mse > 0 else float('inf')
+            # Cosine similarity between predicted and target velocity
+            v_pred_flat = v_pred.reshape(v_pred.shape[0], -1)
+            v_target_flat = v_target.reshape(v_target.shape[0], -1)
+            cos_sim = F.cosine_similarity(v_pred_flat, v_target_flat, dim=-1).mean().item()
 
-        return loss, {'loss': mse, 'psnr': psnr}
+        return loss, {'loss': mse, 'cos_sim': cos_sim}
 
     @torch.no_grad()
     def sample(
@@ -507,28 +579,71 @@ class Beatrix(nn.Module):
         inputs: Dict[str, Tensor],
         num_steps: Optional[int] = None,
     ) -> Tensor:
-        """Generate from noise."""
+        """
+        Generate via flow matching ODE integration.
+
+        Integrate: dz/dt = v_pred(z_t, t)
+        From t=0 (noise) to t=1 (data)
+
+        Uses Euler method: z_{t+dt} = z_t + dt · v_pred(z_t, t)
+        """
+        num_steps = num_steps or self.config.num_steps
+
+        # Get conditioning mail
+        mail = self.head(inputs)
+        B = mail.batch_size
+        device = mail.fused.device if mail.fused is not None else next(self.parameters()).device
+
+        # Start from pure noise at t=0
+        z = torch.randn(B, *self.config.latent_shape, device=device)
+
+        # Time schedule: t goes from 0 (noise) to 1 (data)
+        dt = 1.0 / num_steps
+
+        for i in range(num_steps):
+            t = torch.full((B,), i / num_steps, device=device)
+
+            # Predict velocity at current (z, t)
+            v_pred = self.denoiser(z, mail, t, num_steps=1)
+
+            # Euler step: z = z + dt * v
+            z = z + dt * v_pred
+
+        return z
+
+    @torch.no_grad()
+    def sample_midpoint(
+        self,
+        inputs: Dict[str, Tensor],
+        num_steps: Optional[int] = None,
+    ) -> Tensor:
+        """
+        Generate via midpoint ODE integration (2nd order, more accurate).
+
+        Midpoint method:
+            v_mid = v_pred(z + 0.5·dt·v_pred(z,t), t + 0.5·dt)
+            z_{t+dt} = z_t + dt · v_mid
+        """
         num_steps = num_steps or self.config.num_steps
 
         mail = self.head(inputs)
         B = mail.batch_size
         device = mail.fused.device if mail.fused is not None else next(self.parameters()).device
 
-        z = torch.randn(B, *self.config.latent_shape, device=device) * self.config.sigma_max
-
-        sigmas = torch.linspace(
-            self.config.sigma_max, self.config.sigma_min,
-            num_steps + 1, device=device
-        )
+        z = torch.randn(B, *self.config.latent_shape, device=device)
+        dt = 1.0 / num_steps
 
         for i in range(num_steps):
-            sigma = sigmas[i].expand(B)
-            sigma_next = sigmas[i + 1].expand(B)
+            t = torch.full((B,), i / num_steps, device=device)
+            t_mid = torch.full((B,), (i + 0.5) / num_steps, device=device)
 
-            z_denoised = self.denoiser(z, mail, sigma, num_steps=1)
+            # Euler predictor
+            v1 = self.denoiser(z, mail, t, num_steps=1)
+            z_mid = z + 0.5 * dt * v1
 
-            d = (z - z_denoised) / sigma.view(-1, 1, 1, 1)
-            z = z_denoised + sigma_next.view(-1, 1, 1, 1) * d
+            # Midpoint corrector
+            v_mid = self.denoiser(z_mid, mail, t_mid, num_steps=1)
+            z = z + dt * v_mid
 
         return z
 
@@ -629,7 +744,7 @@ class BeatrixTrainer:
             if batch_idx % log_interval == 0:
                 pbar.set_postfix({
                     'loss': f"{metrics['loss']:.4f}",
-                    'psnr': f"{metrics['psnr']:.1f}dB",
+                    'cos': f"{metrics.get('cos_sim', 0):.3f}",
                 })
 
         avg = {k: sum(v) / len(v) for k, v in epoch_metrics.items()}
@@ -659,7 +774,7 @@ class BeatrixTrainer:
 
             metrics = self.train_epoch(dataloader)
 
-            print(f"  Loss: {metrics['loss']:.6f}, PSNR: {metrics['psnr']:.1f}dB")
+            print(f"  Loss: {metrics['loss']:.6f}, Cos: {metrics.get('cos_sim', 0):.3f}")
             if metrics.get('is_best'):
                 print("  ★ New best!")
                 self.save(f"{save_dir}/beatrix_best.pt")
@@ -790,13 +905,13 @@ if __name__ == '__main__':
 
     loss, metrics = model.compute_loss(inputs)
     print(f"Loss: {metrics['loss']:.6f}")
-    print(f"PSNR: {metrics['psnr']:.1f}dB")
+    print(f"Cos sim: {metrics['cos_sim']:.4f}")
 
     # Test trainer
     print("\n--- Trainer Test ---")
     trainer = BeatrixTrainer(model, device=device)
     metrics = trainer.train_step(inputs)
-    print(f"Step {trainer.global_step}: loss={metrics['loss']:.6f}")
+    print(f"Step {trainer.global_step}: loss={metrics['loss']:.6f}, cos={metrics['cos_sim']:.3f}")
 
     # Test sampling
     print("\n--- Sampling ---")

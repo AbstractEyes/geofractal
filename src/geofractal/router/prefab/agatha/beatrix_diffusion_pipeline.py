@@ -121,13 +121,17 @@ class BeatrixInference:
         self,
         reference_images: Tensor,
         num_steps: Optional[int] = None,
+        use_midpoint: bool = True,
     ) -> Tensor:
         """
         Generate images conditioned on reference images.
 
+        Uses flow matching ODE integration.
+
         Args:
             reference_images: [B, 3, H, W] in [0, 1]
             num_steps: Sampling steps (default: config.num_steps)
+            use_midpoint: Use midpoint method (more accurate)
 
         Returns:
             Generated images [B, 3, H, W] in [0, 1]
@@ -139,7 +143,10 @@ class BeatrixInference:
             'dino': reference_images,
         }
 
-        return self.model.generate(inputs, num_steps=num_steps)
+        if use_midpoint:
+            return self.model.sample_midpoint(inputs, num_steps=num_steps)
+        else:
+            return self.model.sample(inputs, num_steps=num_steps)
 
     @torch.no_grad()
     def generate_unconditional(
