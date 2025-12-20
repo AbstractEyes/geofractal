@@ -1,6 +1,7 @@
 """
 BEATRIX INTEGRATION TEST
 ========================
+geofractal.router.prefab.agatha.beatrix_integration_test
 
 Wire together:
     - Flux2 AE (manifold M)
@@ -10,6 +11,10 @@ Wire together:
     - Oscillator (dynamics engine)
 
 This is the complete Tesla translation matrix.
+
+Author: AbstractPhil + Claude
+Date: December 2025
+License: Apache-2.0
 """
 
 import torch

@@ -2,6 +2,13 @@
 Covariant Differential Oscillation Integrator  
 for Geofractal Router + Flow-Matching Diffusion
 
+
+Author: AbstractPhil + Claude
+
+Date: December 2025
+
+License: Apache-2.0
+
 ---
 
 ## Overview

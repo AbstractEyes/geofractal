@@ -1,7 +1,7 @@
 # AgathaHeadRouter Real Model Integration Test
 # Run in Colab with geofractal repo installed
 # pip install git+https://github.com/huggingface/diffusers -U
-# geofractal.router.prefab.agatha.head_router_tester.py
+# geofractal.router.prefab.agatha.head_router_tester
 
 import torch
 from transformers import (
@@ -171,7 +171,7 @@ text_encoded = qwen_tokenizer(
     return_tensors="pt",
     padding=True,
     truncation=True,
-    max_length=77,
+    max_length=1024,
 )
 
 fake_images_dino = torch.randn(2, 3, 224, 224, device=device, dtype=dtype)
