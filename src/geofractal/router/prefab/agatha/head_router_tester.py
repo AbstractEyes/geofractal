@@ -1,6 +1,7 @@
 """
 Test Flux2 AE Integration with Agatha Head Router
 ==================================================
+geofractal.router.prefab.agatha.head_router_tester
 
 Validates that Flux2's VAE can encode images into latent space M,
 where x(t) will live for the Beatrix oscillator.
