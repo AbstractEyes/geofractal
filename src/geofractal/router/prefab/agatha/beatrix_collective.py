@@ -1,24 +1,28 @@
 """
-BEATRIX COLLECTIVE (Using Existing Tower Builders)
-==================================================
+BEATRIX COLLECTIVE (WideRouter)
+===============================
 
-Integrates with:
+Tower ensemble for the Beatrix oscillator, built on WideRouter
+for automatic batched execution and torch.compile optimization.
+
+Integrates:
 - geometric_tower_builder.py (ConfigurableCollective, RoPE variants)
 - geometric_conv_tower_builder.py (ConvTowerCollective, WideResNet etc.)
 
 Architecture:
     Head Router → Fused Mail [B, D]
                      ↓
+              BeatrixCollective (WideRouter)
          ┌──────────┴──────────┐
          ↓                     ↓
     Geometric Towers      Conv Towers
-    (Transformer-based)   (CNN-based)
     - cantor ±           - wide_resnet ±
     - beatrix ±          - frequency ±
     - simplex ±          - squeeze_excite ±
     - helix ±            - bottleneck ±
-         │                     │
          └──────────┬──────────┘
+                    ↓
+              + θ probes
                     ↓
               Tower Forces
                     ↓
@@ -32,36 +36,38 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Optional, Dict, List, Tuple, Any, Union
-from enum import Enum
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-# Import existing tower builders
+# Base classes
+from geofractal.router.wide_router import WideRouter
+from geofractal.router.base_tower import BaseTower
+
+# Tower builders
 from geofractal.router.prefab.geometric_tower_builder import (
     TowerConfig,
     RoPEType,
     AddressType,
-    FusionType,
-    ConfigurableCollective,
-    build_tower_collective,
+    ConfigurableTower,
+    build_rope,
+    build_address,
     preset_pos_neg_pairs,
-    preset_all_eight,
 )
 from geofractal.router.prefab.geometric_conv_tower_builder import (
     ConvTowerConfig,
     ConvTowerType,
-    ConvTowerCollective,
-    build_conv_collective,
+    ConfigurableConvTower,
     preset_conv_pos_neg,
 )
 from geofractal.router.components.fusion_component import AdaptiveFusion
+from geofractal.router.components.address_component import AddressComponent
 
 
 # =============================================================================
-# BEATRIX COLLECTIVE CONFIG
+# CONFIGURATION
 # =============================================================================
 
 @dataclass
@@ -92,7 +98,7 @@ class BeatrixCollectiveConfig:
     # Whether to use pos/neg pairs
     use_signed_pairs: bool = True
 
-    # Theta probe config (lightweight MLPs)
+    # Theta probe config
     num_theta_probes: int = 4
     theta_hidden_dim: int = 128
 
@@ -115,135 +121,190 @@ class BeatrixCollectiveConfig:
 
 
 # =============================================================================
-# THETA PROBE (Lightweight MLP)
+# THETA PROBE TOWER
 # =============================================================================
 
-class ThetaProbe(nn.Module):
+class ThetaProbeTower(BaseTower):
     """
-    Lightweight auxiliary probe for fine control signals.
+    Lightweight theta probe as a proper BaseTower.
 
-    These don't have geometric structure - just simple MLPs
-    that provide additional degrees of freedom for the oscillator.
+    Simple MLP for fine control signals.
     """
 
     def __init__(
         self,
         name: str,
-        input_dim: int,
-        hidden_dim: int,
-        output_dim: int,
+        dim: int,
+        hidden_dim: int = 128,
         fingerprint_dim: int = 64,
     ):
-        super().__init__()
-        self.name = name
+        super().__init__(name, strict=False)
+
+        self.dim = dim
         self._fingerprint_dim = fingerprint_dim
 
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+        # MLP stages
+        self.append(nn.Sequential(
+            nn.Linear(dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
+        ))
+        self.append(nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, output_dim),
-        )
+        ))
+        self.append(nn.Linear(hidden_dim, dim))
 
-        # Learnable fingerprint
-        self._fingerprint = nn.Parameter(
-            torch.randn(fingerprint_dim) * 0.02
-        )
+        # Address component for fingerprint
+        self.attach('address', AddressComponent(
+            f'{name}_addr',
+            fingerprint_dim=fingerprint_dim,
+        ))
+
+        # Cache for WideRouter integration
+        self.objects['_cached_features'] = None
 
     @property
     def fingerprint(self) -> Tensor:
-        return F.normalize(self._fingerprint, dim=-1)
+        return self['address'].fingerprint
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self.net(x)
+    @property
+    def cached_features(self) -> Optional[Tensor]:
+        return self.objects.get('_cached_features')
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        # Pool if sequence
+        if x.dim() == 3:
+            x = x.mean(dim=1)
+
+        h = x
+        for stage in self.stages:
+            h = stage(h)
+
+        self.objects['_cached_features'] = h
+        return h
 
 
 # =============================================================================
-# BEATRIX COLLECTIVE
+# BEATRIX COLLECTIVE (WideRouter)
 # =============================================================================
 
-class BeatrixCollective(nn.Module):
+class BeatrixCollective(WideRouter):
     """
     Complete tower ensemble for the Beatrix oscillator.
 
-    Combines:
-        - Geometric towers (transformer-based with RoPE variants)
-        - Conv towers (CNN-based with various architectures)
-        - Theta probes (lightweight MLPs)
+    Extends WideRouter for automatic batched execution and
+    torch.compile optimization.
 
-    All towers produce forces that the oscillator integrates.
+    Usage:
+        collective = BeatrixCollective(config)
+        collective.network_to(device)
+        collective.prepare_and_compile()
+
+        outputs = collective.get_tower_forces(fused)  # List[Tensor]
     """
 
     def __init__(self, config: BeatrixCollectiveConfig):
-        super().__init__()
-        self.config = config
+        super().__init__('beatrix_collective', strict=False, auto_discover=False)
 
-        # Build geometric tower configs
+        self.config = config
+        self._tower_order = []  # Track tower order for consistent output
+
+        # Store config in objects
+        self.objects['collective_config'] = config
+
+        # Build geometric towers
+        self._build_geometric_towers(config)
+
+        # Build conv towers
+        self._build_conv_towers(config)
+
+        # Build theta probes
+        self._build_theta_probes(config)
+
+        # Fusion for cross-tower aggregation
+        num_towers = len(self._tower_order)
+        self.attach('fusion', AdaptiveFusion(
+            'beatrix_fusion',
+            num_inputs=num_towers,
+            in_features=config.dim,
+        ))
+
+        # Input projection
+        self.attach('input_proj', nn.Linear(config.dim, config.dim))
+
+        # Fingerprint aggregation
+        self.attach('fp_proj', nn.Linear(
+            config.fingerprint_dim * num_towers,
+            config.fingerprint_dim
+        ))
+
+        # Discover towers for WideRouter
+        self.discover_towers()
+
+    def _build_geometric_towers(self, config: BeatrixCollectiveConfig):
+        """Build and attach geometric (transformer) towers."""
         if config.use_signed_pairs:
-            geom_configs = preset_pos_neg_pairs(config.geometric_types)
+            tower_configs = preset_pos_neg_pairs(config.geometric_types)
         else:
-            geom_configs = [
+            tower_configs = [
                 TowerConfig(name, rope=name, address=name)
                 for name in config.geometric_types
             ]
 
-        # Build geometric collective
-        self.geometric_collective = build_tower_collective(
-            configs=geom_configs,
-            dim=config.dim,
-            default_depth=config.geometric_depth,
-            num_heads=config.geometric_num_heads,
-            ffn_mult=config.geometric_ffn_mult,
-            fingerprint_dim=config.fingerprint_dim,
-            fusion_type=config.fusion_type,
-            name='beatrix_geometric',
-        )
+        for cfg in tower_configs:
+            tower = ConfigurableTower(
+                config=cfg,
+                default_dim=config.dim,
+                default_depth=config.geometric_depth,
+                default_num_heads=config.geometric_num_heads,
+                default_ffn_mult=config.geometric_ffn_mult,
+                default_fingerprint_dim=config.fingerprint_dim,
+            )
+            self.attach(cfg.name, tower)
+            self.register_tower(cfg.name)
+            self._tower_order.append(cfg.name)
 
-        # Build conv tower configs
+    def _build_conv_towers(self, config: BeatrixCollectiveConfig):
+        """Build and attach convolutional towers."""
         if config.use_signed_pairs:
-            conv_configs = preset_conv_pos_neg(config.conv_types)
+            tower_configs = preset_conv_pos_neg(config.conv_types)
         else:
-            conv_configs = [
+            tower_configs = [
                 ConvTowerConfig(name, tower_type=name)
                 for name in config.conv_types
             ]
 
-        # Build conv collective
-        self.conv_collective = build_conv_collective(
-            configs=conv_configs,
-            dim=config.dim,
-            default_depth=config.conv_depth,
-            fingerprint_dim=config.fingerprint_dim,
-            spatial_size=config.conv_spatial_size,
-            name='beatrix_conv',
-        )
+        for cfg in tower_configs:
+            tower = ConfigurableConvTower(
+                config=cfg,
+                default_dim=config.dim,
+                default_depth=config.conv_depth,
+                default_fingerprint_dim=config.fingerprint_dim,
+                spatial_size=config.conv_spatial_size,
+            )
+            self.attach(cfg.name, tower)
+            self.register_tower(cfg.name)
+            self._tower_order.append(cfg.name)
 
-        # Theta probes
-        self.theta_probes = nn.ModuleList([
-            ThetaProbe(
-                name=f'theta_{i}',
-                input_dim=config.dim,
+    def _build_theta_probes(self, config: BeatrixCollectiveConfig):
+        """Build and attach theta probe towers."""
+        for i in range(config.num_theta_probes):
+            name = f'theta_{i}'
+            tower = ThetaProbeTower(
+                name=name,
+                dim=config.dim,
                 hidden_dim=config.theta_hidden_dim,
-                output_dim=config.dim,
                 fingerprint_dim=config.fingerprint_dim,
             )
-            for i in range(config.num_theta_probes)
-        ])
+            self.attach(name, tower)
+            self.register_tower(name)
+            self._tower_order.append(name)
 
-        # Cross-collective fusion (3 inputs: geom_fused, conv_fused, theta_combined)
-        self.cross_fusion = AdaptiveFusion(
-            'beatrix_cross_fusion',
-            num_inputs=3,
-            in_features=config.dim,
-        )
-
-        # Fingerprint aggregation (3 fingerprints: geom, conv, theta)
-        self.fp_proj = nn.Linear(
-            config.fingerprint_dim * 3,
-            config.fingerprint_dim
-        )
+    @property
+    def tower_names(self) -> List[str]:
+        """Ordered list of tower names."""
+        return self._tower_order.copy()
 
     def forward(
         self,
@@ -252,138 +313,75 @@ class BeatrixCollective(nn.Module):
         return_all: bool = False,
     ) -> Union[List[Tensor], Dict[str, Any]]:
         """
-        Compute tower outputs for oscillator.
+        Forward pass through all towers.
 
         Args:
-            x: Input tensor [B, D] or [B, L, D]
+            x: Input [B, D] or [B, L, D]
             mask: Optional attention mask
-            return_all: If True, return full diagnostics
+            return_all: If True, return diagnostics dict
 
         Returns:
-            If return_all=False: List of tower force tensors
-            If return_all=True: Dict with outputs, fingerprints, diagnostics
+            If return_all=False: List of tower output tensors
+            If return_all=True: Dict with outputs, fused, fingerprint, etc.
         """
-        # Ensure 3D for collectives
+        # Ensure 3D for tower processing
         if x.dim() == 2:
-            x_seq = x.unsqueeze(1)  # [B, 1, D]
-        else:
-            x_seq = x
+            x = x.unsqueeze(1)  # [B, 1, D]
 
-        B = x_seq.shape[0]
+        B = x.shape[0]
 
-        # Run geometric collective
-        geom_result = self.geometric_collective(x_seq, mask=mask)
-        geom_fused = geom_result.fused  # [B, L, D] or [B, D]
-        geom_opinions = geom_result.opinions  # Dict[name, TowerOpinion]
-        geom_fp = geom_result.collective_fingerprint
+        # Input projection
+        x = self['input_proj'](x)
 
-        # Run conv collective
-        conv_fused, conv_opinions = self.conv_collective(x_seq, mask=mask)
-        # Get conv fingerprints
-        conv_fps = [self.conv_collective[name].fingerprint
-                    for name in self.conv_collective.tower_names]
-        conv_fp = torch.stack(conv_fps, dim=0).mean(dim=0)  # Aggregate
+        # Execute all towers via WideRouter
+        opinions_dict = self.wide_forward(x, mask=mask)
 
-        # Run theta probes
-        x_pooled = x_seq.mean(dim=1) if x_seq.dim() == 3 else x_seq  # [B, D]
-        theta_outputs = [probe(x_pooled) for probe in self.theta_probes]
-        theta_fps = [probe.fingerprint for probe in self.theta_probes]
-        theta_fp = torch.stack(theta_fps, dim=0).mean(dim=0)
+        # Collect outputs in consistent order
+        outputs = []
+        fingerprints = []
 
-        # Collect all tower outputs for oscillator
-        all_outputs = []
+        for name in self._tower_order:
+            opinion = opinions_dict[name]
 
-        # Geometric tower outputs (in order)
-        for name in self.geometric_collective.tower_names:
-            opinion = geom_opinions[name].opinion
             # Pool if sequence
             if opinion.dim() == 3:
                 opinion = opinion.mean(dim=1)
-            all_outputs.append(opinion)
 
-        # Conv tower outputs (in order)
-        for name in self.conv_collective.tower_names:
-            opinion = conv_opinions[name]
-            if opinion.dim() == 3:
-                opinion = opinion.mean(dim=1)
-            all_outputs.append(opinion)
+            outputs.append(opinion)
 
-        # Theta outputs
-        all_outputs.extend(theta_outputs)
+            # Get fingerprint
+            tower = self[name]
+            fp = tower.fingerprint
+            if fp.dim() == 1:
+                fp = fp.unsqueeze(0).expand(B, -1)
+            fingerprints.append(fp)
 
         if not return_all:
-            return all_outputs
+            return outputs
 
-        # Cross-collective fusion
-        geom_pooled = geom_fused.mean(dim=1) if geom_fused.dim() == 3 else geom_fused
-        conv_pooled = conv_fused.mean(dim=1) if conv_fused.dim() == 3 else conv_fused
-        theta_combined = torch.stack(theta_outputs, dim=0).mean(dim=0)
-
-        cross_fused = self.cross_fusion(geom_pooled, conv_pooled, theta_combined)
+        # Fuse all opinions
+        fused = self['fusion'](*outputs)
 
         # Aggregate fingerprints
-        # Handle different fingerprint shapes
-        if geom_fp.dim() == 1:
-            geom_fp = geom_fp.unsqueeze(0).expand(B, -1)
-        if conv_fp.dim() == 1:
-            conv_fp = conv_fp.unsqueeze(0).expand(B, -1)
-        if theta_fp.dim() == 1:
-            theta_fp = theta_fp.unsqueeze(0).expand(B, -1)
-
-        fp_cat = torch.cat([geom_fp, conv_fp, theta_fp], dim=-1)
-        collective_fp = F.normalize(self.fp_proj(fp_cat), dim=-1)
+        fp_cat = torch.cat(fingerprints, dim=-1)
+        collective_fp = F.normalize(self['fp_proj'](fp_cat), dim=-1)
 
         return {
-            'outputs': all_outputs,
-            'fused': cross_fused,
+            'outputs': outputs,
+            'fused': fused,
             'fingerprint': collective_fp,
-            'geometric': {
-                'fused': geom_fused,
-                'opinions': geom_opinions,
-                'fingerprint': geom_fp,
-            },
-            'conv': {
-                'fused': conv_fused,
-                'opinions': conv_opinions,
-                'fingerprint': conv_fp,
-            },
-            'theta': {
-                'outputs': theta_outputs,
-                'fingerprint': theta_fp,
-            },
-            'num_towers': len(all_outputs),
+            'opinions': opinions_dict,
+            'num_towers': len(outputs),
         }
 
     def get_tower_forces(self, x: Tensor, mask: Optional[Tensor] = None) -> List[Tensor]:
-        """Alias for forward() with return_all=False."""
+        """Get tower outputs as force vectors for oscillator."""
         return self.forward(x, mask=mask, return_all=False)
 
     def get_fingerprint(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
         """Get collective fingerprint for routing."""
         result = self.forward(x, mask=mask, return_all=True)
         return result['fingerprint']
-
-    @property
-    def tower_names(self) -> List[str]:
-        """List of all tower names in output order."""
-        names = []
-        names.extend(self.geometric_collective.tower_names)
-        names.extend(self.conv_collective.tower_names)
-        names.extend([f'theta_{i}' for i in range(len(self.theta_probes))])
-        return names
-
-    def network_to(self, device: torch.device):
-        """Move entire network to device (for WideRouter compatibility)."""
-        self.to(device)
-        self.geometric_collective.network_to(device=device)
-        self.conv_collective.network_to(device=device)
-        return self
-
-    def prepare_and_compile(self):
-        """Compile sub-collectives for optimized execution."""
-        self.geometric_collective.prepare_and_compile()
-        self.conv_collective.prepare_and_compile()
-        return self
 
 
 # =============================================================================
@@ -400,14 +398,6 @@ def create_beatrix_collective(
 ) -> BeatrixCollective:
     """
     Factory function for creating a Beatrix collective.
-
-    Args:
-        dim: Embedding dimension
-        fingerprint_dim: Fingerprint dimension
-        geometric_types: List of geometric tower types (default: cantor, beatrix, simplex, helix)
-        conv_types: List of conv tower types (default: wide_resnet, frequency, squeeze_excite, bottleneck)
-        num_theta_probes: Number of theta probes
-        use_signed_pairs: Whether to use pos/neg pairs
     """
     config = BeatrixCollectiveConfig(
         dim=dim,
@@ -420,19 +410,19 @@ def create_beatrix_collective(
     return BeatrixCollective(config)
 
 
-def create_minimal_beatrix_collective(dim: int = 256) -> BeatrixCollective:
-    """Minimal collective for testing (4 geometric + 4 conv + 2 theta = 10 towers)."""
+def create_minimal_collective(dim: int = 256) -> BeatrixCollective:
+    """Minimal collective for testing."""
     config = BeatrixCollectiveConfig(
         dim=dim,
         geometric_types=['cantor', 'beatrix'],
-        conv_types=['wide_resnet', 'frequency'],
+        conv_types=['wide_resnet'],
         num_theta_probes=2,
         use_signed_pairs=True,
     )
     return BeatrixCollective(config)
 
 
-def create_full_beatrix_collective(dim: int = 256) -> BeatrixCollective:
+def create_full_collective(dim: int = 256) -> BeatrixCollective:
     """Full collective with all tower types."""
     config = BeatrixCollectiveConfig(
         dim=dim,
@@ -455,8 +445,10 @@ def create_full_beatrix_collective(dim: int = 256) -> BeatrixCollective:
 # =============================================================================
 
 if __name__ == '__main__':
+    import time
+
     print("=" * 60)
-    print("  BEATRIX COLLECTIVE TEST (Using Tower Builders)")
+    print("  BEATRIX COLLECTIVE (WideRouter)")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -472,7 +464,7 @@ if __name__ == '__main__':
     )
 
     collective = BeatrixCollective(config)
-    collective.network_to(device)
+    collective.network_to(device=device)
 
     print(f"\nConfig:")
     print(f"  Geometric towers: {config.num_geometric_towers}")
@@ -490,7 +482,7 @@ if __name__ == '__main__':
     print("\n--- Tower Outputs ---")
     outputs = collective.get_tower_forces(x)
     print(f"Number of outputs: {len(outputs)}")
-    for i, (name, out) in enumerate(zip(collective.tower_names, outputs)):
+    for name, out in zip(collective.tower_names, outputs):
         print(f"  {name}: {out.shape}, norm={out.norm():.4f}")
 
     print("\n--- Full Diagnostics ---")
@@ -499,25 +491,28 @@ if __name__ == '__main__':
     print(f"Fingerprint: {result['fingerprint'].shape}")
     print(f"Num towers: {result['num_towers']}")
 
-    # Compile test
-    print("\n--- Compile Test ---")
-    collective.prepare_and_compile()
+    # Compile and benchmark
+    print("\n--- Compile & Benchmark ---")
+    collective.analyze_structure()
+    compiled = collective.prepare_and_compile()
 
     # Warmup
-    for _ in range(3):
-        _ = collective(x)
+    for _ in range(5):
+        _ = compiled(x)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
 
-    import time
-    torch.cuda.synchronize() if device.type == 'cuda' else None
+    # Benchmark
     t0 = time.perf_counter()
-    for _ in range(20):
-        outputs = collective.get_tower_forces(x)
-    torch.cuda.synchronize() if device.type == 'cuda' else None
-    elapsed = (time.perf_counter() - t0) / 20 * 1000
+    for _ in range(50):
+        outputs = compiled.get_tower_forces(x)
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+    elapsed = (time.perf_counter() - t0) / 50 * 1000
 
-    print(f"Forward time: {elapsed:.2f}ms")
+    print(f"Compiled forward: {elapsed:.2f}ms")
     print(f"Throughput: {B / (elapsed/1000):.0f} samples/sec")
 
     print("\n" + "=" * 60)
-    print("  ✓ BEATRIX COLLECTIVE (TOWER BUILDERS) READY")
+    print("  ✓ BEATRIX COLLECTIVE READY")
     print("=" * 60)

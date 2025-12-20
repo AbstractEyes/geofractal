@@ -1,11 +1,39 @@
 """
-BEATRIX TRAINER (Full Integration)
-==================================
+BEATRIX TRAINER
+===============
 
-Complete training pipeline using:
-- Head Router (Flux2 AE + DINO)
-- Tower Builders (geometric + conv collectives)
-- Beatrix Oscillator
+Complete training system for Beatrix diffusion.
+
+Contains:
+    - Encoder wrappers (FluxVAEWrapper, DINOWrapper, FluxVAEDecoder)
+    - FluxAEStream (specialized EncoderStream preserving raw latent)
+    - BeatrixDenoiser (trainable component)
+    - Beatrix (full model wrapping head router + denoiser)
+    - BeatrixTrainer (training manager)
+
+Architecture:
+    ┌─────────────────────────────────────────────────────────────┐
+    │                    AGATHA HEAD ROUTER                        │
+    │                                                              │
+    │  Image ──→ flux_ae stream ──→ EncoderMail                   │
+    │            │                   ├─ content: projected [B,L,D] │
+    │            │                   └─ metadata['raw']: [B,C,H,W] │
+    │            │                                                 │
+    │  Image ──→ dino stream ─────→ EncoderMail                   │
+    │                                                              │
+    │            All streams ──→ AdaptiveFusion ──→ mail.fused    │
+    └─────────────────────────────────────────────────────────────┘
+                                       ↓
+    ┌─────────────────────────────────────────────────────────────┐
+    │  z_clean = mail['flux_ae'].metadata['raw']                  │
+    │  z_noisy = z_clean + σ·ε                                    │
+    │                                                              │
+    │  mail.fused ──→ BeatrixCollective ──→ Tower Forces          │
+    │                                             ↓                │
+    │  (z_noisy, x_ref, forces) ──→ Oscillator ──→ z_pred         │
+    │                                                              │
+    │  Loss = ||z_pred - z_clean||²                               │
+    └─────────────────────────────────────────────────────────────┘
 
 Author: AbstractPhil + Claude
 Date: December 2024
@@ -14,18 +42,25 @@ Date: December 2024
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Tuple, Callable, Any
+from typing import Optional, Dict, List, Tuple, Any, Callable
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
-# Local imports - adjust paths as needed
+from geofractal.router.prefab.agatha.head_router import (
+    AgathaHeadRouter,
+    create_agatha_head,
+    HeadMail,
+    EncoderMail,
+    EncoderStream,
+    StreamType,
+)
 from geofractal.router.prefab.agatha.beatrix_oscillator import (
     BeatrixOscillator,
     ScheduleType,
@@ -33,8 +68,137 @@ from geofractal.router.prefab.agatha.beatrix_oscillator import (
 from geofractal.router.prefab.agatha.beatrix_collective import (
     BeatrixCollective,
     BeatrixCollectiveConfig,
-    create_beatrix_collective,
 )
+
+
+# =============================================================================
+# ENCODER WRAPPERS
+# =============================================================================
+
+class FluxVAEWrapper(nn.Module):
+    """
+    Wraps Flux VAE encoder for head router integration.
+    Returns [B, C, H, W] latent.
+    """
+
+    def __init__(self, vae, scale: float = 1.0, shift: float = 0.0):
+        super().__init__()
+        self.vae = vae
+        self.scale = scale
+        self.shift = shift
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Encode [B, 3, H, W] image in [0,1] to latent."""
+        x = 2 * x - 1  # Scale to [-1, 1]
+        with torch.no_grad():
+            latent = self.vae.encode(x).latent_dist.sample()
+        return (latent - self.shift) * self.scale
+
+
+class FluxVAEDecoder(nn.Module):
+    """Wraps Flux VAE decoder for image generation."""
+
+    def __init__(self, vae, scale: float = 1.0, shift: float = 0.0):
+        super().__init__()
+        self.vae = vae
+        self.scale = scale
+        self.shift = shift
+
+    def forward(self, z: Tensor) -> Tensor:
+        """Decode latent to [B, 3, H, W] image in [0,1]."""
+        z = z / self.scale + self.shift
+        with torch.no_grad():
+            image = self.vae.decode(z).sample
+        return ((image + 1) / 2).clamp(0, 1)
+
+
+class DINOWrapper(nn.Module):
+    """Wraps DINO for head router integration."""
+
+    def __init__(self, dino):
+        super().__init__()
+        self.dino = dino
+        self.hidden_size = 768
+
+    def forward(self, x: Tensor) -> Tensor:
+        """Extract [B, 768] CLS token from [B, 3, H, W] image."""
+        x = F.interpolate(x, size=(224, 224), mode='bilinear', align_corners=False)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+        x = (x - mean) / std
+        with torch.no_grad():
+            return self.dino(x).last_hidden_state[:, 0]
+
+
+# =============================================================================
+# FLUX AE STREAM (preserves raw latent in metadata)
+# =============================================================================
+
+class FluxAEStream(EncoderStream):
+    """
+    Specialized encoder stream for Flux VAE.
+
+    Stores raw latent [B, C, H, W] in EncoderMail.metadata['raw']
+    while projecting content [B, L, D] for fusion.
+    """
+
+    def __init__(
+        self,
+        name: str = 'flux_ae',
+        latent_channels: int = 32,
+        latent_size: int = 64,
+        embed_dim: int = 256,
+        fingerprint_dim: int = 64,
+        **kwargs,
+    ):
+        latent_dim = latent_channels * latent_size * latent_size
+
+        super().__init__(
+            name=name,
+            stream_type=StreamType.IMAGE,
+            embed_dim=latent_dim,
+            fingerprint_dim=fingerprint_dim,
+            project_dim=embed_dim,
+            frozen=True,
+            **kwargs,
+        )
+
+        self.latent_channels = latent_channels
+        self.latent_size = latent_size
+        self.latent_dim = latent_dim
+
+    def forward(self, x: Any, **kwargs) -> EncoderMail:
+        """Extract and create mail with raw latent in metadata."""
+        raw_latent = self.extract(x, **kwargs)
+
+        if raw_latent.dim() == 4:
+            B, C, H, W = raw_latent.shape
+            features = raw_latent.reshape(B, -1)
+        else:
+            features = raw_latent
+            B = features.shape[0]
+            raw_latent = features.reshape(B, self.latent_channels,
+                                          self.latent_size, self.latent_size)
+
+        features = features.unsqueeze(1)
+
+        if self.projection is not None:
+            features = self.projection(features.to(self.projection.weight.dtype))
+
+        B = features.shape[0]
+        fingerprint = self.address.fingerprint.unsqueeze(0).expand(B, -1)
+        fingerprint = fingerprint + self.stream_identity
+
+        return EncoderMail(
+            content=features,
+            fingerprint=fingerprint,
+            stream_type=self.stream_type,
+            source=self.name,
+            metadata={
+                'raw': raw_latent,
+                'latent_shape': (self.latent_channels, self.latent_size, self.latent_size),
+            },
+        )
 
 
 # =============================================================================
@@ -42,19 +206,20 @@ from geofractal.router.prefab.agatha.beatrix_collective import (
 # =============================================================================
 
 @dataclass
-class BeatrixTrainingConfig:
-    """Complete configuration for Beatrix training."""
+class BeatrixConfig:
+    """Configuration for Beatrix."""
 
-    # Manifold dimensions (Flux2 VAE)
+    # Latent space (Flux2 VAE)
     latent_channels: int = 32
     latent_height: int = 64
     latent_width: int = 64
 
-    # Embedding dimensions
-    embed_dim: int = 256
+    # Head router
+    head_embed_dim: int = 256
     fingerprint_dim: int = 64
+    fusion_type: str = 'adaptive'
 
-    # Collective config
+    # Collective
     geometric_types: List[str] = field(default_factory=lambda: [
         'cantor', 'beatrix', 'simplex', 'helix'
     ])
@@ -64,34 +229,21 @@ class BeatrixTrainingConfig:
     num_theta_probes: int = 4
     use_signed_pairs: bool = True
 
-    # Oscillator config
+    # Oscillator
     num_steps: int = 50
-    beta_start: float = 0.1
-    beta_end: float = 2.0
-    omega_start: float = 1.0
-    omega_end: float = 0.1
-    kappa_start: float = 1.0
-    kappa_end: float = 0.5
-    gamma_start: float = 1.0
-    gamma_end: float = 0.0
+    num_training_steps: int = 10
+    beta_range: Tuple[float, float] = (0.1, 2.0)
+    omega_range: Tuple[float, float] = (1.0, 0.1)
+    kappa_range: Tuple[float, float] = (1.0, 0.5)
+    gamma_range: Tuple[float, float] = (1.0, 0.0)
     schedule_type: str = "tesla_369"
 
-    # Training config
-    batch_size: int = 8
+    # Training
     learning_rate: float = 1e-4
     weight_decay: float = 0.01
-    num_epochs: int = 100
-    warmup_steps: int = 1000
     gradient_clip: float = 1.0
-
-    # Loss weights
-    flow_weight: float = 1.0
-    velocity_weight: float = 0.5
-    consistency_weight: float = 0.1
-
-    # Noise schedule
-    sigma_min: float = 0.001
-    sigma_max: float = 1.0
+    sigma_min: float = 0.002
+    sigma_max: float = 80.0
 
     @property
     def latent_dim(self) -> int:
@@ -103,146 +255,119 @@ class BeatrixTrainingConfig:
 
 
 # =============================================================================
-# TIMESTEP EMBEDDING
+# SIGMA EMBEDDING
 # =============================================================================
 
 class SinusoidalPosEmb(nn.Module):
-    """Sinusoidal positional embedding for timesteps."""
+    """Sinusoidal embedding for sigma/timestep."""
 
     def __init__(self, dim: int):
         super().__init__()
         self.dim = dim
 
     def forward(self, t: Tensor) -> Tensor:
-        device = t.device
         half_dim = self.dim // 2
         emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = torch.exp(torch.arange(half_dim, device=t.device) * -emb)
         emb = t.unsqueeze(-1) * emb.unsqueeze(0)
-        emb = torch.cat([emb.sin(), emb.cos()], dim=-1)
-        return emb
+        return torch.cat([emb.sin(), emb.cos()], dim=-1)
 
 
 # =============================================================================
-# BEATRIX MODEL
+# BEATRIX DENOISER
 # =============================================================================
 
-class Beatrix(nn.Module):
+class BeatrixDenoiser(nn.Module):
     """
-    Complete Beatrix system.
+    Trainable denoiser component.
 
-    Flow:
-        fused (from head router) → Collective → Tower forces
-                                               ↓
-        z_noisy ──────────────────────→ Oscillator → z_pred
-                                               ↑
-        condition ─────────────────────────────┘
-        guidance ──────────────────────────────┘
+    Takes HeadMail from AgathaHeadRouter and denoises z_noisy.
     """
 
-    def __init__(self, config: BeatrixTrainingConfig):
+    def __init__(self, config: BeatrixConfig):
         super().__init__()
         self.config = config
 
-        # Build collective config
+        # Tower collective (WideRouter)
         collective_config = BeatrixCollectiveConfig(
-            dim=config.embed_dim,
+            dim=config.head_embed_dim,
             fingerprint_dim=config.fingerprint_dim,
             geometric_types=config.geometric_types,
             conv_types=config.conv_types,
             num_theta_probes=config.num_theta_probes,
             use_signed_pairs=config.use_signed_pairs,
         )
-
-        # Tower collective
         self.collective = BeatrixCollective(collective_config)
 
-        # Count towers for oscillator
-        num_tower_pairs = (
-                len(config.geometric_types) + len(config.conv_types)
-        ) if config.use_signed_pairs else 0
-
         # Oscillator
+        num_tower_pairs = len(config.geometric_types) + len(config.conv_types)
         self.oscillator = BeatrixOscillator(
             manifold_dim=config.latent_dim,
-            tower_dim=config.embed_dim,
+            tower_dim=config.head_embed_dim,
             num_tower_pairs=num_tower_pairs,
             num_theta_probes=config.num_theta_probes,
-            beta_start=config.beta_start,
-            beta_end=config.beta_end,
-            omega_start=config.omega_start,
-            omega_end=config.omega_end,
-            kappa_start=config.kappa_start,
-            kappa_end=config.kappa_end,
-            gamma_start=config.gamma_start,
-            gamma_end=config.gamma_end,
+            beta_start=config.beta_range[0],
+            beta_end=config.beta_range[1],
+            omega_start=config.omega_range[0],
+            omega_end=config.omega_range[1],
+            kappa_start=config.kappa_range[0],
+            kappa_end=config.kappa_range[1],
+            gamma_start=config.gamma_range[0],
+            gamma_end=config.gamma_range[1],
             kappa_schedule=ScheduleType(config.schedule_type),
         )
 
         # Projections
-        self.condition_proj = nn.Sequential(
-            nn.Linear(config.embed_dim, config.embed_dim * 2),
+        self.anchor_proj = nn.Sequential(
+            nn.Linear(config.head_embed_dim, config.head_embed_dim * 2),
             nn.GELU(),
-            nn.Linear(config.embed_dim * 2, config.latent_dim),
+            nn.Linear(config.head_embed_dim * 2, config.latent_dim),
         )
 
         self.guidance_proj = nn.Sequential(
-            nn.Linear(config.embed_dim, config.embed_dim * 2),
+            nn.Linear(config.head_embed_dim, config.head_embed_dim * 2),
             nn.GELU(),
-            nn.Linear(config.embed_dim * 2, config.latent_dim),
+            nn.Linear(config.head_embed_dim * 2, config.latent_dim),
         )
 
-        # Timestep embedding
-        self.time_embed = nn.Sequential(
-            SinusoidalPosEmb(config.embed_dim),
-            nn.Linear(config.embed_dim, config.embed_dim * 2),
+        self.sigma_embed = nn.Sequential(
+            SinusoidalPosEmb(config.head_embed_dim),
+            nn.Linear(config.head_embed_dim, config.head_embed_dim),
             nn.GELU(),
-            nn.Linear(config.embed_dim * 2, config.embed_dim),
+            nn.Linear(config.head_embed_dim, config.head_embed_dim),
         )
 
     def forward(
-            self,
-            z_noisy: Tensor,  # [B, C, H, W] noisy latent
-            fused: Tensor,  # [B, D] from head router
-            condition: Tensor,  # [B, D] text/conditioning embedding
-            guidance: Optional[Tensor] = None,  # [B, D] DINO guidance
-            t: Optional[Tensor] = None,  # [B] timestep
-            num_steps: Optional[int] = None,
+        self,
+        z_noisy: Tensor,
+        mail: HeadMail,
+        sigma: Tensor,
+        num_steps: Optional[int] = None,
     ) -> Tensor:
-        """
-        Denoise z_noisy toward clean latent.
-
-        Returns:
-            z_pred: Predicted clean latent [B, C, H, W]
-        """
+        """Denoise z_noisy using HeadMail conditioning."""
         B = z_noisy.shape[0]
-        device = z_noisy.device
-        num_steps = num_steps or self.config.num_steps
+        num_steps = num_steps or self.config.num_training_steps
 
-        # Add timestep info to condition if provided
-        if t is not None:
-            t_emb = self.time_embed(t)
-            condition = condition + t_emb
-            fused = fused + t_emb  # Also condition the towers
+        sigma_emb = self.sigma_embed(sigma)
 
-        # Flatten latent for oscillator
-        z_flat = z_noisy.reshape(B, -1)
+        fused_cond = mail.fused + sigma_emb if mail.fused is not None else sigma_emb
 
-        # Project condition to anchor
-        x_ref = self.condition_proj(condition)
+        x_ref = self.anchor_proj(fused_cond)
 
-        # Project guidance
         guidance_flat = None
-        if guidance is not None:
-            guidance_flat = self.guidance_proj(guidance)
+        if 'dino' in mail.streams:
+            dino_content = mail.streams['dino'].content
+            if dino_content.dim() == 3:
+                dino_content = dino_content.mean(dim=1)
+            guidance_flat = self.guidance_proj(dino_content + sigma_emb)
 
-        # Get tower outputs from collective
-        collective_result = self.collective(fused, return_all=True)
+        collective_result = self.collective(fused_cond, return_all=True)
         tower_outputs = collective_result['outputs']
         fingerprint = collective_result['fingerprint']
 
-        # Run oscillator
-        z_final = self.oscillator(
+        z_flat = z_noisy.reshape(B, -1)
+
+        z_pred_flat = self.oscillator(
             x_init=z_flat,
             x_ref=x_ref,
             tower_outputs=tower_outputs,
@@ -251,134 +376,186 @@ class Beatrix(nn.Module):
             num_steps=num_steps,
         )
 
-        # Reshape to spatial
-        z_pred = z_final.reshape(
-            B,
-            self.config.latent_channels,
-            self.config.latent_height,
-            self.config.latent_width,
-        )
-
-        return z_pred
-
-    def generate(
-            self,
-            fused: Tensor,
-            condition: Tensor,
-            guidance: Optional[Tensor] = None,
-            num_steps: Optional[int] = None,
-            noise_scale: float = 1.0,
-    ) -> Tensor:
-        """Generate from pure noise."""
-        B = fused.shape[0]
-        device = fused.device
-
-        z_noise = torch.randn(
-            B,
-            self.config.latent_channels,
-            self.config.latent_height,
-            self.config.latent_width,
-            device=device,
-        ) * noise_scale
-
-        return self.forward(
-            z_noisy=z_noise,
-            fused=fused,
-            condition=condition,
-            guidance=guidance,
-            num_steps=num_steps,
-        )
+        return z_pred_flat.reshape(B, *self.config.latent_shape)
 
     def network_to(self, device: torch.device):
-        """Move to device (WideRouter compatibility)."""
         self.to(device)
         self.collective.network_to(device)
         return self
 
 
 # =============================================================================
-# LOSS FUNCTIONS
+# BEATRIX MODEL
 # =============================================================================
 
-def flow_matching_loss(
-        model: Beatrix,
-        z_clean: Tensor,
-        fused: Tensor,
-        condition: Tensor,
-        guidance: Optional[Tensor] = None,
-        sigma_min: float = 0.001,
-        sigma_max: float = 1.0,
-        num_steps: int = 10,  # Fewer steps during training
-) -> Tuple[Tensor, Dict[str, float]]:
+class Beatrix(nn.Module):
     """
-    Flow matching loss: predict clean from noisy.
+    Complete Beatrix system: AgathaHeadRouter + BeatrixDenoiser.
     """
-    B = z_clean.shape[0]
-    device = z_clean.device
 
-    # Sample noise level
-    sigma = torch.rand(B, 1, 1, 1, device=device) * (sigma_max - sigma_min) + sigma_min
+    def __init__(
+        self,
+        config: BeatrixConfig,
+        head: Optional[AgathaHeadRouter] = None,
+    ):
+        super().__init__()
+        self.config = config
 
-    # Add noise
-    noise = torch.randn_like(z_clean)
-    z_noisy = z_clean + sigma * noise
+        self.head = head or AgathaHeadRouter(
+            name='agatha_head',
+            embed_dim=config.head_embed_dim,
+            fingerprint_dim=config.fingerprint_dim,
+            fusion_type=config.fusion_type,
+        )
 
-    # Timestep for conditioning
-    t = sigma.squeeze() / sigma_max
+        self.denoiser = BeatrixDenoiser(config)
+        self.vae_decoder: Optional[FluxVAEDecoder] = None
 
-    # Predict clean
-    z_pred = model(z_noisy, fused, condition, guidance, t=t, num_steps=num_steps)
+    def attach_flux_ae(
+        self,
+        encoder: nn.Module,
+        extract_fn: Optional[Callable] = None,
+    ) -> 'Beatrix':
+        """Attach Flux VAE using specialized FluxAEStream."""
+        stream = FluxAEStream(
+            name='flux_ae',
+            latent_channels=self.config.latent_channels,
+            latent_size=self.config.latent_height,
+            embed_dim=self.config.head_embed_dim,
+            fingerprint_dim=self.config.fingerprint_dim,
+        )
+        stream.attach_encoder(encoder, extract_fn)
 
-    # MSE loss
-    loss = F.mse_loss(z_pred, z_clean)
+        self.head.streams['flux_ae'] = stream
+        self.head.attach('flux_ae', stream)
+        self.head._rebuild_fusion()
 
-    # Metrics
-    with torch.no_grad():
-        mse = loss.item()
-        psnr = -10 * math.log10(mse) if mse > 0 else float('inf')
+        return self
 
-    return loss, {'flow_mse': mse, 'flow_psnr': psnr, 'sigma_mean': sigma.mean().item()}
+    def attach_encoder(
+        self,
+        name: str,
+        encoder: nn.Module,
+        embed_dim: int,
+        stream_type: StreamType = StreamType.GUIDANCE,
+        extract_fn: Optional[Callable] = None,
+        frozen: bool = True,
+    ) -> 'Beatrix':
+        """Attach any encoder to head router."""
+        self.head.attach_encoder(
+            name=name,
+            encoder=encoder,
+            embed_dim=embed_dim,
+            stream_type=stream_type,
+            extract_fn=extract_fn,
+            frozen=frozen,
+        )
+        return self
 
+    def set_vae_decoder(self, decoder: FluxVAEDecoder) -> 'Beatrix':
+        """Set VAE decoder for image generation."""
+        self.vae_decoder = decoder
+        return self
 
-def velocity_matching_loss(
-        model: Beatrix,
-        z_clean: Tensor,
-        fused: Tensor,
-        condition: Tensor,
-        guidance: Optional[Tensor] = None,
-) -> Tuple[Tensor, Dict[str, float]]:
-    """
-    Velocity field matching (rectified flow style).
-    """
-    B = z_clean.shape[0]
-    device = z_clean.device
+    def forward(
+        self,
+        inputs: Dict[str, Tensor],
+        sigma: Optional[Tensor] = None,
+        num_steps: Optional[int] = None,
+    ) -> Tuple[Tensor, HeadMail]:
+        """Forward pass for training."""
+        mail = self.head(inputs)
 
-    # Sample time
-    t = torch.rand(B, device=device)
+        if 'flux_ae' not in mail.streams:
+            raise ValueError("flux_ae stream required")
 
-    # Noise
-    z_noise = torch.randn_like(z_clean)
+        z_clean = mail.streams['flux_ae'].metadata.get('raw')
+        if z_clean is None:
+            raise ValueError("flux_ae missing raw latent - use attach_flux_ae()")
 
-    # Interpolate
-    t_expand = t.view(B, 1, 1, 1)
-    z_t = t_expand * z_clean + (1 - t_expand) * z_noise
+        B = z_clean.shape[0]
+        device = z_clean.device
 
-    # Target velocity (straight path)
-    v_target = z_clean - z_noise
+        if sigma is None:
+            sigma = torch.rand(B, device=device) * (
+                self.config.sigma_max - self.config.sigma_min
+            ) + self.config.sigma_min
 
-    # Model prediction (single step)
-    z_pred = model(z_t, fused, condition, guidance, t=t, num_steps=1)
+        noise = torch.randn_like(z_clean)
+        z_noisy = z_clean + sigma.view(-1, 1, 1, 1) * noise
 
-    # Predicted velocity
-    v_pred = z_pred - z_t
+        z_pred = self.denoiser(z_noisy, mail, sigma, num_steps)
 
-    # Normalize by expected step size
-    v_target_scaled = v_target / model.config.num_steps
+        return z_pred, mail
 
-    # Loss
-    loss = F.mse_loss(v_pred, v_target_scaled)
+    def compute_loss(self, inputs: Dict[str, Tensor]) -> Tuple[Tensor, Dict[str, float]]:
+        """Compute training loss."""
+        z_pred, mail = self.forward(inputs)
+        z_clean = mail.streams['flux_ae'].metadata['raw']
 
-    return loss, {'velocity_mse': loss.item()}
+        loss = F.mse_loss(z_pred, z_clean)
+
+        with torch.no_grad():
+            mse = loss.item()
+            psnr = -10 * math.log10(mse) if mse > 0 else float('inf')
+
+        return loss, {'loss': mse, 'psnr': psnr}
+
+    @torch.no_grad()
+    def sample(
+        self,
+        inputs: Dict[str, Tensor],
+        num_steps: Optional[int] = None,
+    ) -> Tensor:
+        """Generate from noise."""
+        num_steps = num_steps or self.config.num_steps
+
+        mail = self.head(inputs)
+        B = mail.batch_size
+        device = mail.fused.device if mail.fused is not None else next(self.parameters()).device
+
+        z = torch.randn(B, *self.config.latent_shape, device=device) * self.config.sigma_max
+
+        sigmas = torch.linspace(
+            self.config.sigma_max, self.config.sigma_min,
+            num_steps + 1, device=device
+        )
+
+        for i in range(num_steps):
+            sigma = sigmas[i].expand(B)
+            sigma_next = sigmas[i + 1].expand(B)
+
+            z_denoised = self.denoiser(z, mail, sigma, num_steps=1)
+
+            d = (z - z_denoised) / sigma.view(-1, 1, 1, 1)
+            z = z_denoised + sigma_next.view(-1, 1, 1, 1) * d
+
+        return z
+
+    @torch.no_grad()
+    def generate(
+        self,
+        inputs: Dict[str, Tensor],
+        num_steps: Optional[int] = None,
+    ) -> Tensor:
+        """Generate images (requires VAE decoder)."""
+        z = self.sample(inputs, num_steps)
+
+        if self.vae_decoder is not None:
+            return self.vae_decoder(z)
+        return z
+
+    def network_to(self, device: torch.device):
+        self.to(device)
+        self.head.to(device)
+        self.denoiser.network_to(device)
+        if self.vae_decoder is not None:
+            self.vae_decoder.to(device)
+        return self
+
+    def trainable_parameters(self):
+        """Only denoiser parameters (encoders stay frozen)."""
+        return self.denoiser.parameters()
 
 
 # =============================================================================
@@ -389,213 +566,173 @@ class BeatrixTrainer:
     """Training manager for Beatrix."""
 
     def __init__(
-            self,
-            model: Beatrix,
-            config: BeatrixTrainingConfig,
-            device: str = 'cuda',
+        self,
+        model: Beatrix,
+        device: str = 'cuda',
+        learning_rate: float = 1e-4,
+        weight_decay: float = 0.01,
+        gradient_clip: float = 1.0,
     ):
         self.model = model
-        self.config = config
         self.device = torch.device(device)
+        self.gradient_clip = gradient_clip
 
-        # Move model
-        self.model.network_to(self.device)
+        model.network_to(self.device)
 
-        # Optimizer
         self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=config.weight_decay,
+            model.trainable_parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay,
             betas=(0.9, 0.95),
         )
 
-        # Scheduler with warmup
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=config.num_epochs,
-        )
-
         self.global_step = 0
-        self.epoch = 0
         self.best_loss = float('inf')
 
-    def train_step(
-            self,
-            z_clean: Tensor,
-            fused: Tensor,
-            condition: Tensor,
-            guidance: Optional[Tensor] = None,
-    ) -> Dict[str, float]:
+    def train_step(self, inputs: Dict[str, Tensor]) -> Dict[str, float]:
         """Single training step."""
         self.model.train()
         self.optimizer.zero_grad()
 
-        # Move to device
-        z_clean = z_clean.to(self.device)
-        fused = fused.to(self.device)
-        condition = condition.to(self.device)
-        if guidance is not None:
-            guidance = guidance.to(self.device)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
-        # Flow matching loss
-        loss_flow, metrics_flow = flow_matching_loss(
-            self.model,
-            z_clean,
-            fused,
-            condition,
-            guidance,
-            self.config.sigma_min,
-            self.config.sigma_max,
-            num_steps=10,  # Fewer steps during training
-        )
-
-        # Velocity matching loss
-        loss_vel, metrics_vel = velocity_matching_loss(
-            self.model,
-            z_clean,
-            fused,
-            condition,
-            guidance,
-        )
-
-        # Combined loss
-        loss = (
-                self.config.flow_weight * loss_flow +
-                self.config.velocity_weight * loss_vel
-        )
-
-        # Backward
+        loss, metrics = self.model.compute_loss(inputs)
         loss.backward()
 
-        # Gradient clipping
-        if self.config.gradient_clip > 0:
+        if self.gradient_clip > 0:
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                self.config.gradient_clip,
+                self.model.trainable_parameters(),
+                self.gradient_clip,
             )
-        else:
-            grad_norm = 0.0
+            metrics['grad_norm'] = grad_norm.item()
 
-        # Step
         self.optimizer.step()
         self.global_step += 1
-
-        # Collect metrics
-        metrics = {
-            'loss': loss.item(),
-            'loss_flow': loss_flow.item(),
-            'loss_velocity': loss_vel.item(),
-            'grad_norm': grad_norm.item() if isinstance(grad_norm, Tensor) else grad_norm,
-            'lr': self.optimizer.param_groups[0]['lr'],
-            **metrics_flow,
-            **metrics_vel,
-        }
 
         return metrics
 
     def train_epoch(
-            self,
-            dataloader: DataLoader,
-            log_fn: Optional[Callable[[Dict], None]] = None,
-            log_interval: int = 10,
+        self,
+        dataloader: DataLoader,
+        log_interval: int = 10,
     ) -> Dict[str, float]:
         """Train for one epoch."""
         epoch_metrics = {}
 
-        for batch_idx, batch in enumerate(dataloader):
-            # Unpack batch
-            z_clean = batch['latent']
-            fused = batch['fused']
-            condition = batch['condition']
-            guidance = batch.get('guidance', None)
+        pbar = tqdm(dataloader, desc="Training")
+        for batch_idx, batch in enumerate(pbar):
+            metrics = self.train_step(batch)
 
-            metrics = self.train_step(z_clean, fused, condition, guidance)
-
-            # Accumulate
             for k, v in metrics.items():
-                if k not in epoch_metrics:
-                    epoch_metrics[k] = []
-                epoch_metrics[k].append(v)
+                epoch_metrics.setdefault(k, []).append(v)
 
-            # Log
             if batch_idx % log_interval == 0:
-                print(f"  Step {self.global_step}: "
-                      f"loss={metrics['loss']:.6f}, "
-                      f"psnr={metrics.get('flow_psnr', 0):.2f}dB, "
-                      f"lr={metrics['lr']:.2e}")
+                pbar.set_postfix({
+                    'loss': f"{metrics['loss']:.4f}",
+                    'psnr': f"{metrics['psnr']:.1f}dB",
+                })
 
-                if log_fn:
-                    log_fn(metrics)
+        avg = {k: sum(v) / len(v) for k, v in epoch_metrics.items()}
 
-        # Average
-        avg_metrics = {k: sum(v) / len(v) for k, v in epoch_metrics.items()}
+        if avg['loss'] < self.best_loss:
+            self.best_loss = avg['loss']
+            avg['is_best'] = True
 
-        # Scheduler step
-        self.scheduler.step()
-        self.epoch += 1
+        return avg
 
-        # Track best
-        if avg_metrics['loss'] < self.best_loss:
-            self.best_loss = avg_metrics['loss']
-            avg_metrics['is_best'] = True
-        else:
-            avg_metrics['is_best'] = False
+    def train(
+        self,
+        dataloader: DataLoader,
+        num_epochs: int = 100,
+        save_dir: str = "./checkpoints",
+        save_every: int = 10,
+    ):
+        """Full training loop."""
+        Path(save_dir).mkdir(exist_ok=True)
 
-        return avg_metrics
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.optimizer, T_max=num_epochs
+        )
 
-    def save_checkpoint(self, path: str, extra: Dict = None):
+        for epoch in range(num_epochs):
+            print(f"\nEpoch {epoch + 1}/{num_epochs}")
+
+            metrics = self.train_epoch(dataloader)
+
+            print(f"  Loss: {metrics['loss']:.6f}, PSNR: {metrics['psnr']:.1f}dB")
+            if metrics.get('is_best'):
+                print("  ★ New best!")
+                self.save(f"{save_dir}/beatrix_best.pt")
+
+            scheduler.step()
+
+            if (epoch + 1) % save_every == 0:
+                self.save(f"{save_dir}/beatrix_epoch_{epoch + 1}.pt")
+
+        self.save(f"{save_dir}/beatrix_final.pt")
+
+    def save(self, path: str):
         """Save checkpoint."""
-        checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'config': self.config,
+        torch.save({
+            'denoiser': self.model.denoiser.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
             'global_step': self.global_step,
-            'epoch': self.epoch,
             'best_loss': self.best_loss,
-        }
-        if extra:
-            checkpoint.update(extra)
+        }, path)
+        print(f"Saved: {path}")
 
-        torch.save(checkpoint, path)
-        print(f"Saved checkpoint: {path}")
-
-    def load_checkpoint(self, path: str) -> Dict:
+    def load(self, path: str):
         """Load checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
-
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.global_step = checkpoint['global_step']
-        self.epoch = checkpoint['epoch']
-        self.best_loss = checkpoint.get('best_loss', float('inf'))
-
-        print(f"Loaded checkpoint: {path} (epoch {self.epoch}, step {self.global_step})")
-        return checkpoint
+        ckpt = torch.load(path, map_location=self.device)
+        self.model.denoiser.load_state_dict(ckpt['denoiser'])
+        self.optimizer.load_state_dict(ckpt['optimizer'])
+        self.global_step = ckpt['global_step']
+        self.best_loss = ckpt['best_loss']
+        print(f"Loaded: {path} (step {self.global_step})")
 
 
 # =============================================================================
-# DUMMY DATASET
+# FACTORY: Load with real encoders
 # =============================================================================
 
-class DummyBeatrixDataset(Dataset):
-    """Dummy dataset for testing."""
+def load_beatrix_with_encoders(
+    config: BeatrixConfig,
+    vae_model: str = "black-forest-labs/FLUX.1-dev",
+    dino_model: str = "facebook/dinov2-base",
+    device: str = 'cuda',
+) -> Beatrix:
+    """
+    Create Beatrix with real Flux VAE and DINO encoders.
 
-    def __init__(self, config: BeatrixTrainingConfig, num_samples: int = 1000):
-        self.config = config
-        self.num_samples = num_samples
+    Returns model ready for training.
+    """
+    from diffusers import AutoencoderKL
+    from transformers import Dinov2Model
 
-    def __len__(self):
-        return self.num_samples
+    device = torch.device(device)
+    model = Beatrix(config)
 
-    def __getitem__(self, idx):
-        return {
-            'latent': torch.randn(*self.config.latent_shape),
-            'fused': torch.randn(self.config.embed_dim),
-            'condition': torch.randn(self.config.embed_dim),
-            'guidance': torch.randn(self.config.embed_dim),
-        }
+    print("Loading Flux VAE...")
+    vae = AutoencoderKL.from_pretrained(
+        vae_model, subfolder="vae", torch_dtype=torch.float32
+    ).to(device)
+
+    scale = getattr(vae.config, 'scaling_factor', 1.0)
+    shift = getattr(vae.config, 'shift_factor', 0.0) or 0.0
+
+    model.attach_flux_ae(FluxVAEWrapper(vae, scale, shift).to(device))
+    model.set_vae_decoder(FluxVAEDecoder(vae, scale, shift).to(device))
+
+    print("Loading DINO...")
+    dino = Dinov2Model.from_pretrained(dino_model).to(device)
+    model.attach_encoder('dino', DINOWrapper(dino).to(device), embed_dim=768)
+
+    model.network_to(device)
+
+    print(f"Streams: {list(model.head.streams.keys())}")
+    print(f"Trainable: {sum(p.numel() for p in model.trainable_parameters()):,}")
+
+    return model
 
 
 # =============================================================================
@@ -603,62 +740,70 @@ class DummyBeatrixDataset(Dataset):
 # =============================================================================
 
 if __name__ == '__main__':
+    from geofractal.router.prefab.agatha.head_router import MockEncoder
+
     print("=" * 60)
-    print("  BEATRIX TRAINING TEST")
+    print("  BEATRIX TRAINER TEST")
     print("=" * 60)
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"Device: {device}")
 
-    # Config
-    config = BeatrixTrainingConfig(
-        batch_size=4,
-        num_steps=10,
-        num_epochs=2,
+    config = BeatrixConfig(
+        latent_channels=32,
+        latent_height=16,
+        latent_width=16,
+        head_embed_dim=256,
         geometric_types=['cantor', 'beatrix'],
         conv_types=['wide_resnet'],
         num_theta_probes=2,
+        num_training_steps=5,
     )
 
-    print(f"\nConfig:")
-    print(f"  Latent shape: {config.latent_shape}")
-    print(f"  Embed dim: {config.embed_dim}")
-    print(f"  Oscillator steps: {config.num_steps}")
+    print(f"\nConfig: {config.latent_shape}")
 
-    # Model
-    print("\nBuilding model...")
+    # Build model with mock encoders
     model = Beatrix(config)
-    print(f"Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
-    # Trainer
-    trainer = BeatrixTrainer(model, config, device)
+    class MockVAE(nn.Module):
+        def __init__(self, shape):
+            super().__init__()
+            self.shape = shape
+        def forward(self, x):
+            B = x.shape[0]
+            return torch.randn(B, *self.shape, device=x.device)
 
-    # Dataset
-    dataset = DummyBeatrixDataset(config, num_samples=32)
-    dataloader = DataLoader(dataset, batch_size=config.batch_size, shuffle=True)
+    model.attach_flux_ae(MockVAE(config.latent_shape))
+    model.attach_encoder('dino', MockEncoder(128, 768), embed_dim=768)
+    model.network_to(torch.device(device))
 
-    print("\n--- Training ---")
-    for epoch in range(config.num_epochs):
-        print(f"\nEpoch {epoch + 1}/{config.num_epochs}")
-        metrics = trainer.train_epoch(dataloader, log_interval=2)
-        print(f"  Avg loss: {metrics['loss']:.6f}")
-        print(f"  Avg PSNR: {metrics.get('flow_psnr', 0):.2f}dB")
-        if metrics.get('is_best'):
-            print("  ★ New best!")
+    print(f"Streams: {list(model.head.streams.keys())}")
+    print(f"Trainable: {sum(p.numel() for p in model.trainable_parameters()):,}")
 
-    # Test generation
-    print("\n--- Generation Test ---")
-    model.eval()
+    # Test forward
+    print("\n--- Forward Test ---")
+    B = 2
+    inputs = {
+        'flux_ae': torch.randn(B, 64, device=device),
+        'dino': torch.randn(B, 128, device=device),
+    }
+
+    loss, metrics = model.compute_loss(inputs)
+    print(f"Loss: {metrics['loss']:.6f}")
+    print(f"PSNR: {metrics['psnr']:.1f}dB")
+
+    # Test trainer
+    print("\n--- Trainer Test ---")
+    trainer = BeatrixTrainer(model, device=device)
+    metrics = trainer.train_step(inputs)
+    print(f"Step {trainer.global_step}: loss={metrics['loss']:.6f}")
+
+    # Test sampling
+    print("\n--- Sampling ---")
     with torch.no_grad():
-        fused = torch.randn(2, config.embed_dim, device=device)
-        condition = torch.randn(2, config.embed_dim, device=device)
-        guidance = torch.randn(2, config.embed_dim, device=device)
-
-        z_gen = model.generate(fused, condition, guidance, num_steps=20)
-        print(f"Generated: {z_gen.shape}")
-        print(f"  Norm: {z_gen.norm():.4f}")
-        print(f"  Range: [{z_gen.min():.4f}, {z_gen.max():.4f}]")
+        z = model.sample(inputs, num_steps=5)
+        print(f"Sample: {z.shape}")
 
     print("\n" + "=" * 60)
-    print("  ✓ BEATRIX TRAINING READY")
+    print("  ✓ BEATRIX TRAINER READY")
     print("=" * 60)
