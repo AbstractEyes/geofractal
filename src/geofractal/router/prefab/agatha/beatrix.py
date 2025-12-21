@@ -29,6 +29,7 @@ Architecture:
 
 Author: AbstractPhil + Claude
 Date: December 2024
+License: Apache-2.0
 """
 
 from __future__ import annotations
