@@ -57,6 +57,9 @@ from dataclasses import dataclass
 from enum import Enum
 import math
 
+from geofractal.router.base_router import BaseRouter
+from geofractal.router.components.torch_component import TorchComponent
+
 
 # =============================================================================
 # GEOMETRIC OPERATIONS ON THE MANIFOLD
@@ -86,7 +89,6 @@ class ManifoldOps:
         if curvature == 0.0:
             return y - x
         else:
-            # Hyperbolic/spherical log map (future)
             raise NotImplementedError("Curved manifold not yet implemented")
 
     @staticmethod
@@ -133,7 +135,13 @@ class ScheduleType(Enum):
     LINEAR = "linear"
     COSINE = "cosine"
     SIGMOID = "sigmoid"
-    TESLA_369 = "tesla_369"  # Resonant harmonics
+    TESLA_369 = "tesla_369"
+    # todo: rig up the schedules below later
+    SURGE = "surge"
+    DELTA = "delta"
+    GAMMA = "gamma"
+    MULTI = "multi"
+    ADDITIVE = "additive"
 
 
 def create_schedule(
@@ -155,11 +163,9 @@ def create_schedule(
         return start + (end - start) * t
 
     def cosine_schedule(t: Tensor) -> Tensor:
-        # Smooth cosine interpolation
         return start + (end - start) * (1 - torch.cos(t * math.pi)) / 2
 
     def sigmoid_schedule(t: Tensor) -> Tensor:
-        # Sigmoid with controllable sharpness
         x = (t - 0.5) * 10 * power
         return start + (end - start) * torch.sigmoid(x)
 
@@ -169,11 +175,10 @@ def create_schedule(
         Creates natural "attention" points in the trajectory.
         """
         base = start + (end - start) * t
-        # Add resonant peaks at 3, 6, 9 positions (normalized to [0,1])
         resonance = (
-            0.1 * torch.sin(3 * math.pi * t) +  # 3
-            0.05 * torch.sin(6 * math.pi * t) +  # 6
-            0.025 * torch.sin(9 * math.pi * t)   # 9
+            0.1 * torch.sin(3 * math.pi * t) +
+            0.05 * torch.sin(6 * math.pi * t) +
+            0.025 * torch.sin(9 * math.pi * t)
         )
         return base * (1 + resonance)
 
@@ -204,9 +209,8 @@ class OscillatorState:
     v: Tensor           # Velocity in tangent space T_x M
     t: Tensor           # Current time [B] or scalar
 
-    # Optional diagnostics
-    energy: Optional[Tensor] = None      # Total energy (kinetic + potential)
-    forces: Optional[Dict[str, Tensor]] = None  # Individual force contributions
+    energy: Optional[Tensor] = None
+    forces: Optional[Dict[str, Tensor]] = None
 
     def clone(self) -> 'OscillatorState':
         return OscillatorState(
@@ -219,10 +223,10 @@ class OscillatorState:
 
 
 # =============================================================================
-# TOWER FORCE GENERATOR
+# TOWER FORCE GENERATOR (TorchComponent)
 # =============================================================================
 
-class TowerForceGenerator(nn.Module):
+class TowerForceGenerator(TorchComponent):
     """
     Converts tower outputs into tangent forces.
 
@@ -237,19 +241,22 @@ class TowerForceGenerator(nn.Module):
 
     def __init__(
         self,
+        name: str,
         tower_dim: int,
         manifold_dim: int,
-        num_tower_pairs: int = 4,  # Cantor, Simplex, Shape, Wide
+        num_tower_pairs: int = 4,
         num_theta_probes: int = 4,
         temperature: float = 1.0,
+        fingerprint_dim: int = 64,
     ):
-        super().__init__()
+        super().__init__(name)
 
         self.tower_dim = tower_dim
         self.manifold_dim = manifold_dim
         self.num_tower_pairs = num_tower_pairs
         self.num_theta_probes = num_theta_probes
         self.temperature = temperature
+        self.fingerprint_dim = fingerprint_dim
 
         # Project tower outputs to manifold dimension if needed
         if tower_dim != manifold_dim:
@@ -258,34 +265,30 @@ class TowerForceGenerator(nn.Module):
             self.tower_proj = nn.Identity()
 
         # Learnable confidence weights for each tower
-        # Pairs: [pos_1, neg_1, pos_2, neg_2, ...]
         num_paired = num_tower_pairs * 2
         num_total = num_paired + num_theta_probes
         self.confidence = nn.Parameter(torch.ones(num_total) / num_total)
 
         # Fingerprint matching for dynamic routing
-        self.fingerprint_dim = 64
         self.tower_fingerprints = nn.Parameter(
-            torch.randn(num_total, self.fingerprint_dim) * 0.02
+            torch.randn(num_total, fingerprint_dim) * 0.02
         )
 
     def compute_routing_weights(
         self,
-        state_fingerprint: Tensor,  # [B, fingerprint_dim]
+        state_fingerprint: Tensor,
     ) -> Tensor:
         """
         Compute routing weights based on fingerprint similarity.
 
         α_i ∝ exp(sim(fp_state, fp_tower_i) / τ) · confidence_i
         """
-        # [B, num_towers]
         similarities = F.cosine_similarity(
-            state_fingerprint.unsqueeze(1),  # [B, 1, fp_dim]
-            self.tower_fingerprints.unsqueeze(0),  # [1, num_towers, fp_dim]
+            state_fingerprint.unsqueeze(1),
+            self.tower_fingerprints.unsqueeze(0),
             dim=-1
         )
 
-        # Softmax with temperature and confidence weighting
         weights = F.softmax(similarities / self.temperature, dim=-1)
         weights = weights * F.softmax(self.confidence, dim=0)
         weights = weights / weights.sum(dim=-1, keepdim=True)
@@ -294,8 +297,8 @@ class TowerForceGenerator(nn.Module):
 
     def forward(
         self,
-        x: Tensor,                    # Current state [B, manifold_dim] or [B, ...]
-        tower_outputs: List[Tensor],  # List of tower opinions
+        x: Tensor,
+        tower_outputs: List[Tensor],
         state_fingerprint: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
@@ -308,14 +311,12 @@ class TowerForceGenerator(nn.Module):
         B = x.shape[0]
         device = x.device
 
-        # Flatten x if spatial
         x_flat = x.reshape(B, -1) if x.dim() > 2 else x
 
         # Project and flatten tower outputs
         tower_forces = []
         for y in tower_outputs:
             y_proj = self.tower_proj(y.reshape(B, -1) if y.dim() > 2 else y)
-            # Log map: tangent force pointing from x toward y
             xi = ManifoldOps.log_map(x_flat, y_proj)
             tower_forces.append(xi)
 
@@ -327,8 +328,6 @@ class TowerForceGenerator(nn.Module):
 
         # Compute signed differential pairs
         force_components = {}
-
-        # Paired towers (pos - neg)
         pair_names = ['cantor', 'simplex', 'shape', 'wide'][:self.num_tower_pairs]
         total_force = torch.zeros_like(x_flat)
 
@@ -355,17 +354,16 @@ class TowerForceGenerator(nn.Module):
         force_components['u_theta'] = u_theta
         total_force = total_force + u_theta
 
-        # Reshape back to original shape
         total_force = total_force.reshape(x.shape)
 
         return total_force, force_components
 
 
 # =============================================================================
-# THE BEATRIX OSCILLATOR
+# BEATRIX OSCILLATOR (TorchComponent)
 # =============================================================================
 
-class BeatrixOscillator(nn.Module):
+class BeatrixOscillator(TorchComponent):
     """
     Covariant Differential Dynamics Engine.
 
@@ -392,10 +390,12 @@ class BeatrixOscillator(nn.Module):
 
     def __init__(
         self,
-        manifold_dim: int,
-        tower_dim: int = None,
+        name: str = 'beatrix_oscillator',
+        manifold_dim: int = 131072,
+        tower_dim: int = 256,
         num_tower_pairs: int = 4,
         num_theta_probes: int = 4,
+        fingerprint_dim: int = 64,
         # Schedule parameters
         beta_start: float = 0.1,
         beta_end: float = 2.0,
@@ -413,18 +413,19 @@ class BeatrixOscillator(nn.Module):
         # Manifold curvature (0 = flat/Euclidean)
         curvature: float = 0.0,
     ):
-        super().__init__()
+        super().__init__(name)
 
         self.manifold_dim = manifold_dim
         self.curvature = curvature
 
-        # Tower force generator
-        tower_dim = tower_dim or manifold_dim
+        # Tower force generator (TorchComponent)
         self.force_generator = TowerForceGenerator(
+            name=f'{name}_force_gen',
             tower_dim=tower_dim,
             manifold_dim=manifold_dim,
             num_tower_pairs=num_tower_pairs,
             num_theta_probes=num_theta_probes,
+            fingerprint_dim=fingerprint_dim,
         )
 
         # Create schedules
@@ -442,14 +443,7 @@ class BeatrixOscillator(nn.Module):
         v_init: Optional[Tensor] = None,
         t_init: float = 0.0,
     ) -> OscillatorState:
-        """
-        Initialize oscillator state.
-
-        Args:
-            x_init: Initial position (can be noise for generation)
-            v_init: Initial velocity (default: small random)
-            t_init: Initial time
-        """
+        """Initialize oscillator state."""
         B = x_init.shape[0]
         device = x_init.device
 
@@ -463,9 +457,9 @@ class BeatrixOscillator(nn.Module):
     def compute_acceleration(
         self,
         state: OscillatorState,
-        x_ref: Tensor,                    # Conditioning anchor
-        tower_outputs: List[Tensor],      # Tower opinions
-        guidance: Optional[Tensor] = None, # External guidance (DINO)
+        x_ref: Tensor,
+        tower_outputs: List[Tensor],
+        guidance: Optional[Tensor] = None,
         state_fingerprint: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
@@ -475,8 +469,6 @@ class BeatrixOscillator(nn.Module):
         """
         x, v, t = state.x, state.v, state.t
 
-        # Get schedule values at current time
-        # Normalize t to [0, 1] if needed
         t_norm = t if t.max() <= 1.0 else t / t.max()
 
         beta = self.beta_schedule(t_norm)
@@ -484,7 +476,6 @@ class BeatrixOscillator(nn.Module):
         kappa = self.kappa_schedule(t_norm)
         gamma = self.gamma_schedule(t_norm)
 
-        # Expand schedule values for broadcasting
         while beta.dim() < x.dim():
             beta = beta.unsqueeze(-1)
             omega = omega.unsqueeze(-1)
@@ -516,7 +507,6 @@ class BeatrixOscillator(nn.Module):
 
         # External guidance: γ·ξ_guide
         if guidance is not None:
-            # Reshape guidance to match x if needed
             if guidance.shape != x.shape:
                 guidance = guidance.reshape(x.shape)
             guidance_force = gamma * guidance
@@ -525,7 +515,6 @@ class BeatrixOscillator(nn.Module):
             guidance_force = torch.zeros_like(x)
             components['guidance'] = guidance_force
 
-        # Total acceleration
         acceleration = damping + spring + control + guidance_force
         components['total'] = acceleration
 
@@ -550,24 +539,15 @@ class BeatrixOscillator(nn.Module):
         """
         x, v, t = state.x, state.v, state.t
 
-        # Compute acceleration
         a, force_components = self.compute_acceleration(
             state, x_ref, tower_outputs, guidance, state_fingerprint
         )
 
-        # Update velocity
         v_new = v + dt * a
-
-        # Move along geodesic
         x_new = ManifoldOps.exp_map(x, dt * v_new, self.curvature)
-
-        # Parallel transport velocity to new tangent space
         v_transported = ManifoldOps.parallel_transport(x, x_new, v_new, self.curvature)
-
-        # Update time
         t_new = t + dt
 
-        # Compute energy for diagnostics
         kinetic = 0.5 * (v_transported ** 2).sum(dim=tuple(range(1, v.dim())))
         potential = 0.5 * (ManifoldOps.log_map(x_new, x_ref, self.curvature) ** 2).sum(
             dim=tuple(range(1, x.dim()))
@@ -612,22 +592,15 @@ class BeatrixOscillator(nn.Module):
         """
         dt = dt or (1.0 / num_steps)
 
-        # Initialize state
         state = self.initialize_state(x_init, t_init=0.0)
 
         trajectory = [state.clone()] if return_trajectory else None
 
         for step_idx in range(num_steps):
-            # Get tower outputs for current state
             tower_outputs = tower_outputs_fn(state)
-
-            # Get guidance signal
             guidance = guidance_fn(state) if guidance_fn else None
-
-            # Get fingerprint for routing
             fingerprint = fingerprint_fn(state) if fingerprint_fn else None
 
-            # Take integration step
             state = self.step(
                 state, dt, x_ref, tower_outputs, guidance, fingerprint
             )
@@ -651,7 +624,6 @@ class BeatrixOscillator(nn.Module):
 
         Uses constant tower outputs (not state-dependent) for efficiency.
         """
-        # Create functions that return constant values
         def tower_fn(state):
             return tower_outputs
 
@@ -675,18 +647,47 @@ class BeatrixOscillator(nn.Module):
 
 
 # =============================================================================
-# BEATRIX CORE - FULL SYSTEM
+# PROJECTION COMPONENT
 # =============================================================================
 
-class BeatrixCore(nn.Module):
+class ProjectionBlock(TorchComponent):
+    """MLP projection as a proper TorchComponent."""
+
+    def __init__(
+        self,
+        name: str,
+        in_dim: int,
+        out_dim: int,
+        hidden_dim: Optional[int] = None,
+    ):
+        super().__init__(name)
+        hidden_dim = hidden_dim or in_dim * 2
+
+        self.norm = nn.LayerNorm(in_dim)
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, out_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x
+
+
+# =============================================================================
+# BEATRIX CORE (BaseRouter)
+# =============================================================================
+
+class BeatrixCore(BaseRouter):
     """
-    The complete Beatrix system.
+    The complete Beatrix oscillator system as a BaseRouter.
 
     Combines:
-        - Head router (Flux2 AE + DINO + text encoders)
-        - Tower collectives (force generators)
         - Oscillator (dynamics engine)
-        - Output projection (latent → image via VAE decode)
+        - Condition projection (embed_dim → manifold)
+        - Guidance projection (embed_dim → manifold)
 
     This is Tesla's vision realized in silicon:
         Resonant harmonics guiding energy through a manifold
@@ -695,31 +696,44 @@ class BeatrixCore(nn.Module):
 
     def __init__(
         self,
-        manifold_dim: int = 32 * 64 * 64,  # Flux2 latent flattened
+        name: str = 'beatrix_core',
+        manifold_dim: int = 32 * 64 * 64,
         tower_dim: int = 256,
         embed_dim: int = 256,
         num_tower_pairs: int = 4,
         num_theta_probes: int = 4,
         num_steps: int = 50,
+        fingerprint_dim: int = 64,
         # Oscillator config
         beta_range: Tuple[float, float] = (0.1, 2.0),
         omega_range: Tuple[float, float] = (1.0, 0.1),
         kappa_range: Tuple[float, float] = (1.0, 0.5),
         gamma_range: Tuple[float, float] = (1.0, 0.0),
+        kappa_schedule: ScheduleType = ScheduleType.TESLA_369,
     ):
-        super().__init__()
+        super().__init__(name, strict=False)
 
         self.manifold_dim = manifold_dim
         self.tower_dim = tower_dim
         self.embed_dim = embed_dim
         self.num_steps = num_steps
 
-        # Oscillator
-        self.oscillator = BeatrixOscillator(
+        # Store config
+        self.objects['config'] = {
+            'manifold_dim': manifold_dim,
+            'tower_dim': tower_dim,
+            'embed_dim': embed_dim,
+            'num_steps': num_steps,
+        }
+
+        # Oscillator (TorchComponent)
+        self.attach('oscillator', BeatrixOscillator(
+            name='oscillator',
             manifold_dim=manifold_dim,
             tower_dim=tower_dim,
             num_tower_pairs=num_tower_pairs,
             num_theta_probes=num_theta_probes,
+            fingerprint_dim=fingerprint_dim,
             beta_start=beta_range[0],
             beta_end=beta_range[1],
             omega_start=omega_range[0],
@@ -728,20 +742,29 @@ class BeatrixCore(nn.Module):
             kappa_end=kappa_range[1],
             gamma_start=gamma_range[0],
             gamma_end=gamma_range[1],
-        )
+            kappa_schedule=kappa_schedule,
+        ))
 
         # Projection from embed_dim to manifold for conditioning
-        self.condition_proj = nn.Linear(embed_dim, manifold_dim)
+        self.attach('condition_proj', ProjectionBlock(
+            'condition_proj',
+            in_dim=embed_dim,
+            out_dim=manifold_dim,
+        ))
 
         # Projection from guidance to manifold
-        self.guidance_proj = nn.Linear(embed_dim, manifold_dim)
+        self.attach('guidance_proj', ProjectionBlock(
+            'guidance_proj',
+            in_dim=embed_dim,
+            out_dim=manifold_dim,
+        ))
 
     def forward(
         self,
-        noise: Tensor,               # [B, manifold_dim] or [B, C, H, W]
-        condition: Tensor,           # [B, embed_dim] from text encoder
-        tower_outputs: List[Tensor], # From tower collectives
-        guidance: Optional[Tensor] = None,  # [B, embed_dim] from DINO
+        noise: Tensor,
+        condition: Tensor,
+        tower_outputs: List[Tensor],
+        guidance: Optional[Tensor] = None,
         fingerprint: Optional[Tensor] = None,
         num_steps: Optional[int] = None,
     ) -> Tensor:
@@ -758,20 +781,16 @@ class BeatrixCore(nn.Module):
         """
         num_steps = num_steps or self.num_steps
 
-        # Flatten noise if spatial
         B = noise.shape[0]
         x_init = noise.reshape(B, -1)
 
-        # Project condition to manifold anchor
-        x_ref = self.condition_proj(condition)
+        x_ref = self['condition_proj'](condition)
 
-        # Project guidance if provided
         guidance_manifold = None
         if guidance is not None:
-            guidance_manifold = self.guidance_proj(guidance)
+            guidance_manifold = self['guidance_proj'](guidance)
 
-        # Run oscillator
-        x_final = self.oscillator(
+        x_final = self['oscillator'](
             x_init=x_init,
             x_ref=x_ref,
             tower_outputs=tower_outputs,
@@ -784,7 +803,7 @@ class BeatrixCore(nn.Module):
 
 
 # =============================================================================
-# UTILITIES
+# FACTORY FUNCTION
 # =============================================================================
 
 def create_beatrix_oscillator(
@@ -802,12 +821,12 @@ def create_beatrix_oscillator(
         num_tower_pairs: Number of signed differential pairs
         schedule_type: "linear", "cosine", "tesla_369"
     """
-    import math
     manifold_dim = math.prod(manifold_shape)
 
     schedule = ScheduleType(schedule_type) if isinstance(schedule_type, str) else schedule_type
 
     return BeatrixOscillator(
+        name='beatrix_oscillator',
         manifold_dim=manifold_dim,
         tower_dim=tower_dim,
         num_tower_pairs=num_tower_pairs,
@@ -826,11 +845,11 @@ if __name__ == '__main__':
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # Create oscillator for Flux2 manifold
-    manifold_shape = (32, 64, 64)  # Flux2 latent
+    manifold_shape = (32, 64, 64)
     manifold_dim = 32 * 64 * 64
 
     oscillator = BeatrixOscillator(
+        name='test_oscillator',
         manifold_dim=manifold_dim,
         tower_dim=256,
         num_tower_pairs=4,
@@ -841,16 +860,12 @@ if __name__ == '__main__':
     print(f"\nOscillator created for manifold dim {manifold_dim}")
     print(f"  Parameters: {sum(p.numel() for p in oscillator.parameters()):,}")
 
-    # Test integration
     B = 2
     x_init = torch.randn(B, manifold_dim, device=device) * 0.1
     x_ref = torch.randn(B, manifold_dim, device=device)
 
-    # Fake tower outputs (would come from actual towers)
-    num_towers = 4 * 2 + 4  # pairs + theta probes
+    num_towers = 4 * 2 + 4
     tower_outputs = [torch.randn(B, 256, device=device) for _ in range(num_towers)]
-
-    # Fake guidance
     guidance = torch.randn(B, manifold_dim, device=device) * 0.1
 
     print("\nRunning integration...")
@@ -868,9 +883,8 @@ if __name__ == '__main__':
     print(f"  x_ref norm: {x_ref.norm():.4f}")
     print(f"  x_final norm: {x_final.norm():.4f}")
 
-    # Check trajectory
     print(f"\nTrajectory ({len(trajectory)} states):")
-    for i, state in enumerate(trajectory[::5]):  # Every 5th state
+    for i, state in enumerate(trajectory[::5]):
         dist_to_ref = (state.x - x_ref).norm()
         energy_str = f"{state.energy[0]:.4f}" if state.energy is not None else "N/A"
         print(f"  t={state.t[0]:.2f}: energy={energy_str}, dist_to_ref={dist_to_ref:.4f}")

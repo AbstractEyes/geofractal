@@ -306,12 +306,22 @@ def build_address(name: str, address_type: AddressType, fingerprint_dim: int, **
         )
 
     elif address_type == AddressType.FRACTAL:
+        # FractalAddressComponent fingerprint is built from orbit[:, :2].flatten()
+        # => output dim = 2 * orbit_length.
+        # Therefore, to get fingerprint_dim output, orbit_length must be fingerprint_dim // 2.
+        if fingerprint_dim % 2 != 0:
+            raise ValueError(
+                f"Fractal address requires even fingerprint_dim (got {fingerprint_dim}) "
+                f"because it flattens (re, im) pairs."
+            )
+
         return FractalAddressComponent(
             f'{name}_addr',
             region=kwargs.get('region', 'seahorse'),
-            orbit_length=fingerprint_dim,
+            orbit_length=fingerprint_dim // 2,
             learnable=kwargs.get('learnable', True),
         )
+
 
     elif address_type == AddressType.SINUSOIDAL:
         # Sinusoidal uses standard learned address
