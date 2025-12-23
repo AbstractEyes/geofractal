@@ -515,14 +515,15 @@ class ConfigurableTower(SafeAttachMixin, BaseTower):
         opinion = self['opinion_proj'](pooled)
 
         # Cache features for retrieval after wide_forward
-        self.objects['_cached_features'] = features
+        # Uses ephemeral cache that can be bulk-cleared
+        self.cache_set('features', features)
 
         return opinion, features
 
     @property
     def cached_features(self) -> Optional[Tensor]:
         """Features from last forward pass (for WideRouter integration)."""
-        return self.objects.get('_cached_features')
+        return self.cache_get('features')
 
 
 # =============================================================================
@@ -665,6 +666,10 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
 
         if debug:
             debug_info['fused_norm'] = fused.norm(dim=-1).mean().item()
+
+        # Clear tower caches to prevent memory leaks
+        for tower_name in self.tower_names:
+            self[tower_name].cache_clear()
 
         return CollectiveOpinion(
             fused=fused,
