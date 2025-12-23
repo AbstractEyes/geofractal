@@ -18,6 +18,47 @@ Design Principles:
     - No enforced data flow (subclass decides topology)
     - Override what you need, ignore the rest
 
+Storage Types:
+    Routers have three storage mechanisms for different use cases:
+
+    1. components (ModuleDict): nn.Module submodules with parameter tracking
+       - Use for learnable layers, nested routers
+       - Automatically included in state_dict, .to(), optimizer
+
+    2. objects (dict): Persistent non-module data
+       - Use for configs, metadata, constants
+       - NOT moved by .to() or network_to()
+       - NOT included in state_dict (serialize manually if needed)
+
+    3. _cache (dict): Ephemeral tensor storage
+       - Use for intermediate tensors during forward pass
+       - Cleared automatically via reset() or cache_clear()
+       - NOT moved by .to() - use cache_to() for explicit movement
+       - NOT included in state_dict (intentionally transient)
+
+Cache System:
+    The cache provides managed lifecycle for intermediate tensors to
+    prevent memory leaks from stale references. Unlike objects[], cache
+    entries are expected to be cleared after each forward pass.
+
+    # Store intermediate tensor
+    self.cache_set('features', features)
+
+    # Retrieve (returns None if not found)
+    features = self.cache_get('features')
+
+    # Clear after forward pass
+    self.cache_clear()
+
+    # Clear entire router tree
+    self.cache_clear_recursive()
+
+    # Debug: inspect cache across all nested routers
+    debug_info = router.cache_debug()
+
+    # Move cache tensors to device (explicit, not automatic)
+    router.cache_to(device='cuda:0')
+
 Hardware Control:
     Routers provide optional strict controls for device and dtype
     management across complex multi-model systems.
@@ -26,6 +67,18 @@ Hardware Control:
     - strict_dtype: Locks router to specific dtype, validates on attach
     - strict_device: Locks router to specific device, validates on attach
     - network_to: Moves entire router subnetwork with configurable behavior
+
+Accelerate Compatibility:
+    The cache is intentionally NOT managed by PyTorch's parameter/buffer
+    system. This means:
+
+    - accelerate's device_map won't move cache tensors
+    - .to() and network_to() won't move cache tensors
+    - For multi-GPU: clear cache before device changes, or use cache_to()
+
+    Recommended pattern with accelerate:
+        model.reset()  # Clears cache
+        model = accelerate.prepare(model)
 
 Implications:
     - Routers can hold any object as a component
@@ -46,7 +99,14 @@ Usage:
 
         def forward(self, x: Tensor) -> Tensor:
             x = self['encoder'](x)
+
+            # Cache intermediate for later retrieval
+            self.cache_set('encoded', x)
+
             x = self['decoder'](x)
+
+            # Clear cache at end of forward
+            self.cache_clear()
             return x
 
     # Pythonic access
@@ -60,6 +120,12 @@ Usage:
     # Hardware-controlled router
     router = MyRouter('gpu_router', strict_device=torch.device('cuda:0'))
     router.network_to(device='cuda:0', dtype=torch.float16)
+
+    # Cache management
+    router.cache_set('temp', tensor)
+    router.cache_get('temp')
+    router.cache_clear()
+    router.cache_to(device='cuda:0')  # Explicit cache movement
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -122,6 +188,10 @@ class BaseRouter(nn.Module, ABC):
         self.uuid = uuid or str(uuid_lib.uuid4())
         self.components = nn.ModuleDict()
         self.objects: dict = {}
+
+        # Ephemeral cache - for intermediate tensors during forward pass
+        # Use cache_set/cache_get/cache_clear for managed lifecycle
+        self._cache: dict = {}
 
         # Hardware control
         self.strict = strict
@@ -221,6 +291,138 @@ class BaseRouter(nn.Module, ABC):
         """
         return name in self.components or name in self.objects
 
+    # =========================================================================
+    # CACHE MANAGEMENT
+    # =========================================================================
+
+    def cache_set(self, key: str, value: Any) -> None:
+        """
+        Store a value in ephemeral cache.
+
+        Use for intermediate tensors that should be cleared after forward pass.
+        Unlike objects[], cache is explicitly managed and can be bulk-cleared.
+
+        Args:
+            key: Cache key.
+            value: Value to cache (typically a Tensor).
+        """
+        self._cache[key] = value
+
+    def cache_get(self, key: str, default: Any = None) -> Any:
+        """
+        Retrieve a value from ephemeral cache.
+
+        Args:
+            key: Cache key.
+            default: Value to return if key not found.
+
+        Returns:
+            Cached value or default.
+        """
+        return self._cache.get(key, default)
+
+    def cache_clear(self) -> None:
+        """
+        Clear all ephemeral cache entries.
+
+        Call this at the end of forward() to prevent memory leaks.
+        """
+        self._cache.clear()
+
+    def cache_clear_recursive(self) -> None:
+        """
+        Clear cache on this router and all nested routers.
+
+        Traverses component tree to clear all _cache dicts.
+        """
+        self._cache.clear()
+        for component in self.components.values():
+            if isinstance(component, BaseRouter):
+                component.cache_clear_recursive()
+            elif hasattr(component, '_cache'):
+                component._cache.clear()
+
+    def cache_keys(self) -> list:
+        """Return list of current cache keys."""
+        return list(self._cache.keys())
+
+    def cache_size_bytes(self) -> int:
+        """
+        Estimate total bytes held in cache.
+
+        Returns:
+            Total bytes for tensor values, 0 for non-tensors.
+        """
+        total = 0
+        for v in self._cache.values():
+            if isinstance(v, Tensor):
+                total += v.numel() * v.element_size()
+        return total
+
+    def cache_to(
+        self,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+        non_blocking: bool = False,
+    ) -> 'BaseRouter':
+        """
+        Move all cached tensors to device/dtype.
+
+        This is EXPLICIT - not called by .to() or network_to().
+        Use when you need to preserve cache across device changes.
+
+        For most use cases, prefer cache_clear() before device changes
+        to avoid stale tensor references.
+
+        Args:
+            device: Target device.
+            dtype: Target dtype.
+            non_blocking: If True, use async transfer.
+
+        Returns:
+            Self for chaining.
+        """
+        device = torch.device(device) if device else None
+
+        for key in list(self._cache.keys()):
+            val = self._cache[key]
+            if isinstance(val, Tensor):
+                if device is not None and dtype is not None:
+                    self._cache[key] = val.to(device=device, dtype=dtype, non_blocking=non_blocking)
+                elif device is not None:
+                    self._cache[key] = val.to(device=device, non_blocking=non_blocking)
+                elif dtype is not None:
+                    self._cache[key] = val.to(dtype=dtype, non_blocking=non_blocking)
+
+        return self
+
+    def cache_to_recursive(
+        self,
+        device: Optional[Union[str, torch.device]] = None,
+        dtype: Optional[torch.dtype] = None,
+        non_blocking: bool = False,
+    ) -> 'BaseRouter':
+        """
+        Move cache tensors on this router and all nested routers.
+
+        Args:
+            device: Target device.
+            dtype: Target dtype.
+            non_blocking: If True, use async transfer.
+
+        Returns:
+            Self for chaining.
+        """
+        self.cache_to(device=device, dtype=dtype, non_blocking=non_blocking)
+
+        for component in self.components.values():
+            if isinstance(component, BaseRouter):
+                component.cache_to_recursive(device=device, dtype=dtype, non_blocking=non_blocking)
+            elif hasattr(component, 'cache_to'):
+                component.cache_to(device=device, dtype=dtype, non_blocking=non_blocking)
+
+        return self
+
     def detach(self, name: str) -> Optional[Any]:
         """
         Remove and return a component.
@@ -241,10 +443,14 @@ class BaseRouter(nn.Module, ABC):
         """
         Clear transient state.
 
-        Override to clear any state that shouldn't persist between
-        forward passes (caches, buffers, message queues, etc).
+        Clears ephemeral cache and calls reset() on nested routers.
+        Override to clear additional state that shouldn't persist between
+        forward passes (buffers, message queues, etc).
         """
-        pass
+        self._cache.clear()
+        for component in self.components.values():
+            if isinstance(component, BaseRouter):
+                component.reset()
 
     def to(self, *args, **kwargs) -> 'BaseRouter':
         """
@@ -275,6 +481,7 @@ class BaseRouter(nn.Module, ABC):
         dtype: Optional[torch.dtype] = None,
         strict: bool = False,
         silent: bool = True,
+        clear_cache: bool = True,
     ) -> 'BaseRouter':
         """
         Move router and all nested routers to device/dtype.
@@ -283,11 +490,18 @@ class BaseRouter(nn.Module, ABC):
         incompatible components based on strict and silent flags.
         Non-module objects are unaffected.
 
+        Cache tensors are NOT automatically moved (they're not registered
+        with PyTorch). By default, cache is cleared to prevent device
+        mismatch errors. Set clear_cache=False and use cache_to_recursive()
+        if you need to preserve cache contents.
+
         Args:
             device: Target device.
             dtype: Target dtype.
             strict: If True, raise on incompatible components.
             silent: If True and not strict, skip incompatible quietly.
+            clear_cache: If True (default), clear cache before moving.
+                        Set False if using cache_to_recursive() manually.
 
         Returns:
             Self for chaining.
@@ -295,6 +509,10 @@ class BaseRouter(nn.Module, ABC):
         Raises:
             RuntimeError: If strict=True and component is incompatible.
         """
+        # Clear cache first to prevent stale device references
+        if clear_cache:
+            self.cache_clear_recursive()
+
         device = torch.device(device) if device else None
 
         self._network_to_recursive(self, device, dtype, strict, silent)
@@ -376,6 +594,56 @@ class BaseRouter(nn.Module, ABC):
         if name in self.objects:
             return self.objects[name]
         raise KeyError(f"Component '{name}' not found")
+
+    def cache_debug(self, prefix: str = '') -> dict:
+        """
+        Debug cache across entire router tree.
+
+        Returns dict with cache info for this router and all nested routers.
+        Useful for finding memory leaks from uncached tensors.
+
+        Args:
+            prefix: Path prefix for nested routers.
+
+        Returns:
+            Dict mapping router paths to cache info.
+        """
+        path = f"{prefix}/{self.name}" if prefix else self.name
+        result = {}
+
+        # This router's cache
+        if self._cache:
+            cache_info = {}
+            for k, v in self._cache.items():
+                if isinstance(v, Tensor):
+                    cache_info[k] = {
+                        'shape': list(v.shape),
+                        'dtype': str(v.dtype),
+                        'device': str(v.device),
+                        'bytes': v.numel() * v.element_size(),
+                    }
+                else:
+                    cache_info[k] = {'type': type(v).__name__}
+            result[path] = cache_info
+
+        # Recurse into components
+        for comp_name, comp in self.components.items():
+            if isinstance(comp, BaseRouter):
+                result.update(comp.cache_debug(prefix=path))
+            elif hasattr(comp, '_cache') and comp._cache:
+                comp_path = f"{path}/{comp_name}"
+                cache_info = {}
+                for k, v in comp._cache.items():
+                    if isinstance(v, Tensor):
+                        cache_info[k] = {
+                            'shape': list(v.shape),
+                            'bytes': v.numel() * v.element_size(),
+                        }
+                    else:
+                        cache_info[k] = {'type': type(v).__name__}
+                result[comp_path] = cache_info
+
+        return result
 
     def __repr__(self) -> str:
         module_keys = list(self.components.keys())
