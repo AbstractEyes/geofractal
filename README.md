@@ -15,9 +15,26 @@ GeoFractal Router is a coordination architecture for building **collectives of a
 **The key insight:** Individual units don't need to be accurate. They need to *see differently*. The collective triangulates truth from divergent viewpoints.
 
 ```
-Traditional Ensemble:    Smart Model + Smart Model + Smart Model → Average
-GeoFractal Collective:   Different View + Different View + Different View → Triangulate
+Traditional Ensemble:    
+    Smart Model + 
+    Smart Model + 
+    Smart Model → Average
+GeoFractal Collective:   
+    [ 
+        Smart Model + Different View +
+        Tasked Model + Different View +
+    ] → A
+    [
+        Fused Opinions
+        New Model + Different View
+    ]  → B
+    [
+        Diverse Opinions
+        Incepted Model + Different View
+    ] → Triangulate Fused Opinions
 ```
+
+**There are many ways to build collectives and ensembles, these are just some examples.**
 
 **Diagnostics & Proofs:**
 
