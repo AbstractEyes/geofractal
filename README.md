@@ -4,37 +4,20 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)]()
 
 ---
 
 ## What Is This?
 
-GeoFractal Router is a coordination architecture for building **collectives of autonomous AI units**. Instead of one monolithic model, you build multiple *towers* that produce independent or incepted opinions through fusion, coordinate through *geometric routing*, and fuse their perspectives into emergent collective intelligence.
+GeoFractal Router is a coordination architecture for building **collectives of autonomous AI units**. Instead of one monolithic model, you build multiple *towers* that produce opinions, coordinate through *geometric routing*, and fuse their perspectives into emergent collective intelligence.
 
 **The key insight:** Individual units don't need to be accurate. They need to *see differently*. The collective triangulates truth from divergent viewpoints.
 
 ```
-Traditional Ensemble:    
-    Smart Model + 
-    Smart Model + 
-    Smart Model → Average
-GeoFractal Collective:   
-    [ 
-        Smart Model + Different View +
-        Tasked Model + Different View +
-    ] → A
-    [
-        Fused Opinions
-        New Model + Different View
-    ]  → B
-    [
-        Diverse Opinions
-        Incepted Model + Different View
-    ] → Triangulate Fused Opinions
+Traditional Ensemble:    Smart Model + Smart Model + Smart Model → Average
+GeoFractal Collective:   Different View + Different View + Different View → Triangulate
 ```
-
-**There are many ways to build collectives and ensembles, these are just some examples.**
 
 **Diagnostics & Proofs:**
 
@@ -58,7 +41,7 @@ See the diagnostic implementations and transfer learning experiments:
 | **Component** | Attachable unit with identity and lifecycle | Building block for routers and towers |
 | **Address** | Geometric identity on a manifold | Fingerprints enable similarity/distance routing |
 | **Fusion** | Opinion aggregation | Where emergence happens |
-| **Cache** | Ephemeral tensor storage | Managed lifecycle prevents memory leaks |
+| **Cache** | Ephemeral tensor storage | Optional - only for towers exposing intermediates |
 
 More routers, towers, components, and collective patterns are planned for immediate and future releases.
 
@@ -74,7 +57,7 @@ Every router has three distinct storage mechanisms:
 |---------|------|----------------|---------------|---------|
 | `components` | `nn.ModuleDict` | ✅ Yes | ✅ Yes | nn.Module children |
 | `objects` | `dict` | ❌ No | ❌ No | Config, metadata |
-| `_cache` | `dict` | ❌ No | ❌ No | Ephemeral tensors |
+| `_cache` | `dict` | ❌ No | ❌ No | Ephemeral tensors (optional) |
 
 ```python
 # components[] - Learnable modules (moved by .to(), saved in state_dict)
@@ -83,11 +66,11 @@ self.attach('encoder', nn.Linear(256, 512))
 # objects[] - Config and metadata (persistent, NOT tensors)
 self.attach('config', {'dropout': 0.1, 'scale': 1.0})
 
-# _cache - Ephemeral tensors (managed lifecycle, cleared after use)
+# _cache - Ephemeral tensors for external retrieval (use only if needed)
 self.cache_set('features', intermediate_tensor)
 ```
 
-**⚠️ CRITICAL:** Never store tensors in `objects[]` - this causes memory leaks. Use `cache_set()` for intermediate tensors.
+**⚠️ CRITICAL:** Never store tensors in `objects[]` - this causes memory leaks. If external code needs tensors after `forward()`, use `cache_set()`. For data used only within `forward()`, use local variables.
 
 ### The Component Hierarchy
 
@@ -178,9 +161,8 @@ class MyCollective(WideRouter):
     def forward(self, x: Tensor) -> Tensor:
         opinions = self.wide_forward(x)  # Batched tower execution
         
-        # Clear tower caches to prevent memory accumulation
-        for name in self.tower_names:
-            self[name].cache_clear()
+        # If towers cache intermediates for retrieval, clear after use:
+        # self.clear_tower_caches()
             
         return self['fusion'](*opinions.values())
 
@@ -196,7 +178,7 @@ output = compiled(x)  # 1.4x faster than eager
 - **Structure analysis**: Identifies aligned operations for fusion
 - **Compile-safe**: Separates Python bookkeeping from tensor hot path
 - **Near-linear scaling**: Per-tower cost *decreases* with more towers
-- **Cache management**: `reset()` and `clear_tower_caches()` for memory safety
+- **Cache management**: `reset()` and `clear_tower_caches()` available if towers use cache
 
 ### The Collective Pattern
 
@@ -207,20 +189,22 @@ output = compiled(x)  # 1.4x faster than eager
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
 │  │   Tower A   │  │   Tower B   │  │   Tower C   │             │
 │  │ + Address   │  │ + Address   │  │ + Address   │             │
-│  │ + _cache    │  │ + _cache    │  │ + _cache    │             │
+│  │ (+ _cache)  │  │ (+ _cache)  │  │ (+ _cache)  │             │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
 │         │                │                │                     │
 │         └────────────────┼────────────────┘                     │
 │                          ↓                                      │
 │              wide_forward() / NotifierRouter                    │
 │                          ↓                                      │
-│              cache_clear() on each tower                        │
+│              (cache_clear() if towers use cache)                │
 │                          ↓                                      │
 │              FusionComponent (aggregate opinions)               │
 │                          ↓                                      │
 │                    Collective Output                            │
 └─────────────────────────────────────────────────────────────────┘
 ```
+
+*Note: `_cache` is optional - only towers exposing intermediates use it.*
 
 ---
 
@@ -273,10 +257,7 @@ class WideCollective(WideRouter):
 
     def forward(self, x: Tensor) -> Tensor:
         opinions = self.wide_forward(x)
-        
-        # Clear tower caches after collecting opinions
-        self.clear_tower_caches()
-        
+        # SimpleTower doesn't use cache, so no clearing needed
         return self['fusion'](*opinions.values())
 
 
@@ -317,18 +298,29 @@ port.unload()
 
 ## Cache System
 
-### Why Cache Matters
+### When Cache Is Used
 
-The cache system prevents VRAM memory leaks that occurred in earlier versions:
+**Most towers don't need cache.** Cache is only for towers that expose intermediates to external code:
+
+| Tower Type | Uses Cache? | Why |
+|------------|-------------|-----|
+| Simple feedforward | ❌ No | No external access needed |
+| Residual tower | ❌ No | Residual is local variable |
+| `ConfigurableTower` | ✅ Yes | Exposes features to collective |
+| `ConfigurableConvTower` | ✅ Yes | Exposes features to collective |
+| Custom tower exposing intermediates | ✅ Yes | External code retrieves features |
+
+### Why Cache Exists
+
+The cache system prevents VRAM memory leaks in towers that *do* expose intermediates:
 
 ```python
 # ❌ OLD (LEAKED ~33MB per tower per forward)
 self.objects['_cached_features'] = features  # Never cleared!
 
 # ✅ NEW (Managed lifecycle)
-self.cache_set('features', features)  # Cleared by collective
+self.cache_set('features', features)  # Collective clears after retrieval
 ```
-
 
 ### Cache API
 
@@ -346,27 +338,37 @@ self.cache_set('features', features)  # Cleared by collective
 
 ### When to Use Cache vs Local Variables
 
-| Situation | Use |
-|-----------|-----|
-| Residual within same `forward()` | Local variable |
-| Gate computed and used in same `forward()` | Local variable |
-| Features needed by Collective after `forward()` returns | Cache |
-| Intermediates for WideRouter integration | Cache |
-| Data shared between separate method calls | Cache |
+| Situation | Use | Example |
+|-----------|-----|---------|
+| Residual within same `forward()` | Local variable | `residual = x` |
+| Gate computed and used in same `forward()` | Local variable | `gate = self['gate'](x)` |
+| Features needed by Collective after `forward()` | Cache | `self.cache_set('features', x)` |
+| Intermediates retrieved by WideRouter | Cache | ConfigurableTower pattern |
+
+**Rule of thumb:** If the data never leaves `forward()`, use a local variable. If external code needs it after `forward()` returns, use cache.
 
 ```python
-class MyTower(BaseTower):
+# Simple tower - NO cache needed
+class ResidualTower(BaseTower):
     def forward(self, x: Tensor) -> Tensor:
-        # ✅ Local variable - only used within this forward()
-        residual = x
-        
+        residual = x  # Local variable - used only here
+        for stage in self.stages:
+            x = stage(x)
+        return x + residual  # No cache involved
+
+# Tower exposing features - uses cache
+class FeatureExposingTower(BaseTower):
+    def forward(self, x: Tensor) -> Tensor:
         for stage in self.stages:
             x = stage(x)
         
-        # ✅ Cache - needed by Collective after forward() returns
+        # Cache because collective retrieves this after forward()
         self.cache_set('features', x)
-        
-        return x + residual
+        return self['output_proj'](x)
+    
+    @property
+    def cached_features(self):
+        return self.cache_get('features')
 ```
 
 ### Debugging Memory Issues
@@ -377,10 +379,11 @@ debug_info = model.cache_debug()
 for path, cache in debug_info.items():
     print(f"{path}: {list(cache.keys())}")
 
-# Should be empty between batches
-assert model.cache_debug() == {}
+# If towers use cache, it should be empty between batches
+# (after collective clears it)
+# If towers don't use cache, this is already empty
 
-# Force clear everything
+# Force clear everything (safe, no-op if already empty)
 model.reset()
 ```
 
@@ -446,18 +449,19 @@ model.network_to('cpu')  # Cache stays on GPU!
 
 ---
 
-## Critical Dos and Don'ts For Caching and Device Movement
+## Critical Dos and Don'ts
 
 ### ✅ DO
 
 ```python
-# Use cache for tensors needed after forward()
-self.cache_set('features', features)
+# Use cache ONLY for tensors needed by external code after forward()
+self.cache_set('features', features)  # Collective will retrieve this
 
-# Clear cache in collective forward()
-self.clear_tower_caches()  # or loop with cache_clear()
+# Clear cache in collective IF towers use cache
+if towers_use_cache:
+    self.clear_tower_caches()
 
-# Call reset() before device changes
+# Call reset() before device changes (safe even if cache is empty)
 model.reset()
 model.network_to(device='cuda:1')
 
@@ -483,34 +487,37 @@ compiled = collective.prepare_and_compile()
 # Store tensors in objects[] - MEMORY LEAK!
 self.objects['features'] = features
 
-# Forget to clear cache - VRAM accumulates!
+# Use cache for data only needed within forward()
 def forward(self, x):
-    self.cache_set('temp', tensor)
-    return output  # Cache never cleared!
+    self.cache_set('residual', x)  # Wrong! Use local variable
+    ...
+    return x + self.cache_get('residual')
+
+# Forget to clear cache IF you use it
+def forward(self, x):
+    self.cache_set('features', tensor)  # For external access
+    return output  # Collective must clear this!
 
 # Assume .to() moves cache
 model.to('cuda:1')  # Cache stays on old device!
 
 # Use raw torch.compile() on WideRouter
 compiled = torch.compile(collective)  # May fail
-
-# Access cache after clear
-self.cache_clear()
-features = self.cache_get('features')  # Returns None!
 ```
 
 ---
 
 ## Key Principles
 
-1. **Three Storage Types** - `components` (modules), `objects` (config), `_cache` (tensors)
-2. **Never Tensor in objects[]** - Use `cache_set()` instead
-3. **Stages Are Components** - Not raw primitives
-4. **Towers Produce Opinions** - Local conclusions, not final answers
-5. **Clear Cache in Collectives** - Prevents VRAM leaks
-6. **Use network_to()** - Safe device movement with cache clearing
-7. **Divergence Over Accuracy** - See differently, triangulate truth
-8. **Compile First for Wide Models** - Let `torch.compile` handle fusion
+1. **Three Storage Types** - `components` (modules), `objects` (config), `_cache` (ephemeral tensors)
+2. **Never Tensor in objects[]** - Use `cache_set()` if external access needed, local variable otherwise
+3. **Cache Is Optional** - Only towers exposing intermediates need it
+4. **Local Variables First** - Use cache only when data must persist after `forward()`
+5. **Stages Are Components** - Not raw primitives
+6. **Towers Produce Opinions** - Local conclusions, not final answers
+7. **Use network_to()** - Safe device movement with cache clearing
+8. **Divergence Over Accuracy** - See differently, triangulate truth
+9. **Compile First for Wide Models** - Let `torch.compile` handle fusion
 
 ---
 
@@ -519,6 +526,7 @@ features = self.cache_get('features')  # Returns None!
 | Document | Description |
 |----------|-------------|
 | [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Complete tutorial with cache system |
+
 ---
 
 ## Changelog
@@ -551,7 +559,6 @@ features = self.cache_get('features')  # Returns None!
 **Documentation** - Comprehensive updates
 
 - New GETTING_STARTED.md sections: Storage Types, Cache Control, Device Movement, Dos/Don'ts
-- ARCHITECTURE_CHANGES_v2.md: Full migration guide
 
 ### v1.0.0-beta (2025-12-23)
 
