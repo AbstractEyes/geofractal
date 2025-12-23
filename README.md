@@ -501,8 +501,6 @@ features = self.cache_get('features')  # Returns None!
 | Document | Description |
 |----------|-------------|
 | [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Complete tutorial with cache system |
-| [ARCHITECTURE_CHANGES_v2.md](src/geofractal/router/ARCHITECTURE_CHANGES_v2.md) | Detailed changelog |
-
 ---
 
 ## Changelog
