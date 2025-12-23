@@ -428,7 +428,7 @@ model.network_to('cpu')  # Cache stays on GPU!
 
 ---
 
-## Critical Dos and Don'ts
+## Critical Dos and Don'ts For Caching and Device Movement
 
 ### ✅ DO
 
