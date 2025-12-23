@@ -523,15 +523,15 @@ compiled = torch.compile(collective)  # May fail
 
 ## Documentation
 
-| Document | Description |
-|----------|-------------|
-| [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Complete tutorial with cache system |
-
+| Document | Description                                                          |
+|----------|----------------------------------------------------------------------|
+| [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Basic tutorial with the system, includes new cache system changes.   |
+| [QUICK_BUILD.md](src/geofractal/router/QUICK_BUILD.md) | Quick reference for building collectives, not a comprehensive guide. |
 ---
 
 ## Changelog
 
-### v2.0.0 (2025-12-23)
+### v1.0.1 (2025-12-23) Beta2
 
 **Cache System** - Managed ephemeral tensor storage
 
