@@ -2,9 +2,9 @@
 
 **Collective Intelligence through Geometric Routing**
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-MIT%20%2F%20Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-1.0.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.0--beta-green.svg)]()
 
 ---
 
@@ -328,7 +328,7 @@ output = compiled(x)  # ~1.5x faster than eager
 
 ## Changelog
 
-### v1.0.0 (2025-12-23) Beta Release
+### v1.0.0-beta (2025-12-23)
 
 **Port System** - Standardized encoder integration
 
@@ -357,9 +357,6 @@ output = compiled(x)  # ~1.5x faster than eager
 - WideRouter compile optimizations
 - BaseTower stage management
 - TorchComponent device affinity
-- Large system implementations
-- Bug fixes and refactors
-- Documentation updates pre-release
 
 ### v0.1.0
 
@@ -372,7 +369,7 @@ output = compiled(x)  # ~1.5x faster than eager
 
 ## License
 
-Apache License 2.0 with Attribution
+Mixed licensing: MIT and Apache 2.0. See individual file headers for specific license.
 
 ---
 
