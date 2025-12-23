@@ -329,6 +329,7 @@ self.objects['_cached_features'] = features  # Never cleared!
 self.cache_set('features', features)  # Cleared by collective
 ```
 
+
 ### Cache API
 
 | Method | Description |
