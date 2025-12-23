@@ -2,9 +2,9 @@
 
 **Collective Intelligence through Geometric Routing**
 
-[![License](https://img.shields.io/badge/License-MIT%20%2F%20Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-1.0.0--beta-green.svg)]()
+[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)]()
 
 ---
 
@@ -32,7 +32,6 @@ See the diagnostic implementations and transfer learning experiments:
 
 | Concept | What It Is | Key Insight |
 |---------|------------|-------------|
-| **Compiles** | Device affinity management capable of torch compilation | Multi-GPU deployment made easy |
 | **Router** | Coordination architecture | Collective intelligence through geometric routing |
 | **Tower** | Self-encapsulated processing unit | Produces an *opinion*, not just an output |
 | **Port** | Encoder wrapper with lifecycle | Standardized interface for any encoder |
@@ -42,6 +41,7 @@ See the diagnostic implementations and transfer learning experiments:
 | **Component** | Attachable unit with identity and lifecycle | Building block for routers and towers |
 | **Address** | Geometric identity on a manifold | Fingerprints enable similarity/distance routing |
 | **Fusion** | Opinion aggregation | Where emergence happens |
+| **Cache** | Ephemeral tensor storage | Managed lifecycle prevents memory leaks |
 
 More routers, towers, components, and collective patterns are planned for immediate and future releases.
 
@@ -49,11 +49,55 @@ More routers, towers, components, and collective patterns are planned for immedi
 
 ## Architecture
 
+### Storage Model
+
+Every router has three distinct storage mechanisms:
+
+| Storage | Type | Device-Managed | In state_dict | Use For |
+|---------|------|----------------|---------------|---------|
+| `components` | `nn.ModuleDict` | ✅ Yes | ✅ Yes | nn.Module children |
+| `objects` | `dict` | ❌ No | ❌ No | Config, metadata |
+| `_cache` | `dict` | ❌ No | ❌ No | Ephemeral tensors |
+
+```python
+# components[] - Learnable modules (moved by .to(), saved in state_dict)
+self.attach('encoder', nn.Linear(256, 512))
+
+# objects[] - Config and metadata (persistent, NOT tensors)
+self.attach('config', {'dropout': 0.1, 'scale': 1.0})
+
+# _cache - Ephemeral tensors (managed lifecycle, cleared after use)
+self.cache_set('features', intermediate_tensor)
+```
+
+**⚠️ CRITICAL:** Never store tensors in `objects[]` - this causes memory leaks. Use `cache_set()` for intermediate tensors.
+
 ### The Component Hierarchy
 
 GeoFractal has five base types: **BaseComponent**, **BaseRouter**, **BaseTower**, **WideRouter**, and **BasePort**:
 
 ```
+BaseRouter (ABC - nn.Module)
+│   - name, uuid
+│   - components: nn.ModuleDict (learnable children)
+│   - objects: dict (config, metadata)
+│   - _cache: dict (ephemeral tensors)
+│   - Lifecycle: attach(), detach(), reset()
+│
+├── BaseTower (BaseRouter + stages)
+│       - stages: nn.ModuleList (ordered pipeline)
+│       - Dual indexing: tower[0] (stage), tower['name'] (component)
+│       - Produces opinions
+│
+├── WideRouter (BaseRouter + wide execution)
+│       - Tower registration and discovery
+│       - wide_forward() for batched execution
+│       - torch.compile integration
+│
+└── NotifierRouter (BaseRouter + messaging)
+        - Geometric message routing
+        - Channel-based communication
+
 BaseComponent (ABC - pure Python)
 │   - name, uuid, parent
 │   - Lifecycle: on_attach(), on_detach()
@@ -89,61 +133,16 @@ BasePort (ABC - pure protocol, no torch)
         └── VAEPort       # Latent encoders
 ```
 
-**Port Data Flow:**
-
-```
-INPUT (unknown device)
-    │
-    ▼
-preprocess() ──────── CPU (tokenization, normalization)
-    │
-    ▼
-[cache check] ─────── External (PyArrow, datasets)
-    │
-    ▼
-encode() ──────────── GPU (encoder's device)
-    │
-    ▼
-postprocess() ─────── GPU (pooling, projection)
-    │
-    ▼
-[cache store] ─────── External (PyArrow, datasets)
-    │
-    ▼
-OUTPUT (target device)
-```
-
-### Router Hierarchy
-
-```
-BaseRouter (ABC - nn.Module)
-│   - Component container with strict hardware control
-│   - network_to() for recursive device movement
-│
-├── BaseTower (BaseRouter)
-│       - Ordered stages (nn.ModuleList)
-│       - Produces opinions
-│
-├── NotifierRouter (BaseRouter)
-│       - Geometric message routing
-│       - Channel-based communication
-│
-└── WideRouter (BaseRouter)
-        - Compile-optimized for wide models
-        - Auto-discovers aligned towers
-        - Near-linear scaling with torch.compile
-```
-
 ### WideRouter: Compile-Optimized Wide Models
 
 **WideRouter** is designed for collectives with many towers processing the same input. It leverages `torch.compile` for kernel fusion, achieving near-linear scaling:
 
 | Towers | Time | Per-Tower |
 |--------|------|-----------|
-| 4 | 1.03ms | 258µs |
-| 8 | 1.90ms | 238µs |
-| 16 | 3.63ms | 227µs |
-| 32 | 7.21ms | 225µs |
+| 4 | 1.06ms | 265µs |
+| 8 | 1.89ms | 237µs |
+| 16 | 3.96ms | 248µs |
+| 32 | 7.27ms | 227µs |
 
 ```python
 from geofractal.router.wide_router import WideRouter
@@ -161,6 +160,11 @@ class MyCollective(WideRouter):
 
     def forward(self, x: Tensor) -> Tensor:
         opinions = self.wide_forward(x)  # Batched tower execution
+        
+        # Clear tower caches to prevent memory accumulation
+        for name in self.tower_names:
+            self[name].cache_clear()
+            
         return self['fusion'](*opinions.values())
 
 
@@ -175,6 +179,7 @@ output = compiled(x)  # 1.4x faster than eager
 - **Structure analysis**: Identifies aligned operations for fusion
 - **Compile-safe**: Separates Python bookkeeping from tensor hot path
 - **Near-linear scaling**: Per-tower cost *decreases* with more towers
+- **Cache management**: `reset()` and `clear_tower_caches()` for memory safety
 
 ### The Collective Pattern
 
@@ -185,12 +190,14 @@ output = compiled(x)  # 1.4x faster than eager
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐             │
 │  │   Tower A   │  │   Tower B   │  │   Tower C   │             │
 │  │ + Address   │  │ + Address   │  │ + Address   │             │
-│  │ (Spherical) │  │ (Spherical) │  │ (Hyperbolic)│             │
+│  │ + _cache    │  │ + _cache    │  │ + _cache    │             │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘             │
 │         │                │                │                     │
 │         └────────────────┼────────────────┘                     │
 │                          ↓                                      │
-│              NotifierRouter (geometric routing)                 │
+│              wide_forward() / NotifierRouter                    │
+│                          ↓                                      │
+│              cache_clear() on each tower                        │
 │                          ↓                                      │
 │              FusionComponent (aggregate opinions)               │
 │                          ↓                                      │
@@ -208,6 +215,62 @@ output = compiled(x)  # 1.4x faster than eager
 git clone https://github.com/AbstractPhil/geofractal.git
 cd geofractal
 pip install -e .
+```
+
+### Build a Wide Collective
+
+```python
+import torch
+import torch.nn as nn
+from torch import Tensor
+
+from geofractal.router.wide_router import WideRouter
+from geofractal.router.base_tower import BaseTower
+from geofractal.router.components.fusion_component import AdaptiveFusion
+
+
+class SimpleTower(BaseTower):
+    def __init__(self, name: str, dim: int):
+        super().__init__(name, strict=False)
+        for i in range(2):
+            self.append(nn.Sequential(
+                nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
+            ))
+        self.attach('norm', nn.LayerNorm(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        for stage in self.stages:
+            x = x + stage(x)
+        return self['norm'](x)
+
+
+class WideCollective(WideRouter):
+    def __init__(self, name: str, dim: int, num_towers: int = 8):
+        super().__init__(name, auto_discover=True)
+
+        for i in range(num_towers):
+            self.attach(f'tower_{i}', SimpleTower(f'tower_{i}', dim))
+
+        self.discover_towers()
+        self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        opinions = self.wide_forward(x)
+        
+        # Clear tower caches after collecting opinions
+        self.clear_tower_caches()
+        
+        return self['fusion'](*opinions.values())
+
+
+# Create, move to GPU, compile
+torch.set_float32_matmul_precision('high')
+collective = WideCollective('wide', dim=256, num_towers=16)
+collective.network_to(device='cuda')
+compiled = collective.prepare_and_compile()
+
+x = torch.randn(32, 64, 256, device='cuda')
+output = compiled(x)  # ~1.4x faster than eager
 ```
 
 ### Using Encoder Ports
@@ -233,51 +296,110 @@ port.half()
 port.unload()
 ```
 
-### Build a Wide Collective (Recommended)
+---
+
+## Cache System
+
+### Why Cache Matters
+
+The cache system prevents VRAM memory leaks that occurred in earlier versions:
 
 ```python
-from geofractal.router.wide_router import WideRouter
-from geofractal.router.base_tower import BaseTower
-from geofractal.router.components.fusion_component import AdaptiveFusion
+# ❌ OLD (LEAKED ~33MB per tower per forward)
+self.objects['_cached_features'] = features  # Never cleared!
 
+# ✅ NEW (Managed lifecycle)
+self.cache_set('features', features)  # Cleared by collective
+```
 
-class SimpleTower(BaseTower):
-    def __init__(self, name: str, dim: int):
-        super().__init__(name, strict=False)
-        for i in range(2):
-            self.append(nn.Sequential(
-                nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
-            ))
-        self.attach('norm', nn.LayerNorm(dim))
+### Cache API
 
-    def forward(self, x):
+| Method | Description |
+|--------|-------------|
+| `cache_set(key, value)` | Store tensor in ephemeral cache |
+| `cache_get(key, default=None)` | Retrieve from cache |
+| `cache_clear()` | Clear this router's cache only |
+| `cache_clear_recursive()` | Clear entire router tree |
+| `cache_keys()` | List current cache keys |
+| `cache_size_bytes()` | Estimate VRAM held in cache |
+| `cache_to(device, dtype)` | Explicitly move cache tensors |
+| `cache_debug(prefix='')` | Debug cache state across tree |
+| `reset()` | Clear cache recursively (call before device moves) |
+
+### When to Use Cache vs Local Variables
+
+| Situation | Use |
+|-----------|-----|
+| Residual within same `forward()` | Local variable |
+| Gate computed and used in same `forward()` | Local variable |
+| Features needed by Collective after `forward()` returns | Cache |
+| Intermediates for WideRouter integration | Cache |
+| Data shared between separate method calls | Cache |
+
+```python
+class MyTower(BaseTower):
+    def forward(self, x: Tensor) -> Tensor:
+        # ✅ Local variable - only used within this forward()
+        residual = x
+        
         for stage in self.stages:
-            x = x + stage(x)
-        return self['norm'](x)
+            x = stage(x)
+        
+        # ✅ Cache - needed by Collective after forward() returns
+        self.cache_set('features', x)
+        
+        return x + residual
+```
 
+### Debugging Memory Issues
 
-class WideCollective(WideRouter):
-    def __init__(self, name: str, dim: int, num_towers: int = 8):
-        super().__init__(name, auto_discover=True)
+```python
+# Check cache state across entire model
+debug_info = model.cache_debug()
+for path, cache in debug_info.items():
+    print(f"{path}: {list(cache.keys())}")
 
-        for i in range(num_towers):
-            self.attach(f'tower_{i}', SimpleTower(f'tower_{i}', dim))
+# Should be empty between batches
+assert model.cache_debug() == {}
 
-        self.discover_towers()
-        self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
+# Force clear everything
+model.reset()
+```
 
-    def forward(self, x):
-        opinions = self.wide_forward(x)
-        return self['fusion'](*opinions.values())
+---
 
+## Device Movement
 
-# Create, move to GPU, compile
-collective = WideCollective('wide', dim=256, num_towers=16)
-collective.network_to(device='cuda')
-compiled = collective.prepare_and_compile()
+### network_to() vs .to()
 
-x = torch.randn(32, 64, 256, device='cuda')
-output = compiled(x)  # ~1.5x faster than eager
+| Method | Cache Behavior | Use When |
+|--------|----------------|----------|
+| `.to(device)` | ❌ Not moved | Quick testing |
+| `network_to(device)` | 🗑️ Cleared by default | Production |
+
+```python
+# Standard PyTorch - cache NOT moved (unsafe)
+model.to('cuda:1')
+
+# Router-aware - cache cleared by default (safe)
+model.network_to(device='cuda:1')
+
+# Explicit cache control
+model.network_to(device='cuda:1', clear_cache=False)
+model.cache_to_recursive(device='cuda:1')  # Manual move
+```
+
+### Accelerate Compatibility
+
+```python
+# ✅ Recommended pattern
+model.reset()  # Clear all caches first
+model = accelerate.prepare(model)
+
+# ❌ Risky - cache on wrong device
+model = accelerate.prepare(model)
+model(x)  # Cache created
+model.network_to('cpu')  # Cache stays on GPU!
 ```
 
 ---
@@ -306,15 +428,71 @@ output = compiled(x)  # ~1.5x faster than eager
 
 ---
 
+## Critical Dos and Don'ts
+
+### ✅ DO
+
+```python
+# Use cache for tensors needed after forward()
+self.cache_set('features', features)
+
+# Clear cache in collective forward()
+self.clear_tower_caches()  # or loop with cache_clear()
+
+# Call reset() before device changes
+model.reset()
+model.network_to(device='cuda:1')
+
+# Use network_to() for production
+model.network_to(device='cuda', dtype=torch.float16)
+
+# Use local variables for forward()-scoped data
+residual = x  # Only used within this forward()
+
+# Put config in objects[]
+self.attach('config', {'scale': 1.0})
+
+# Call discover_towers() after attaching towers
+self.discover_towers()
+
+# Use prepare_and_compile() for WideRouter
+compiled = collective.prepare_and_compile()
+```
+
+### ❌ DON'T
+
+```python
+# Store tensors in objects[] - MEMORY LEAK!
+self.objects['features'] = features
+
+# Forget to clear cache - VRAM accumulates!
+def forward(self, x):
+    self.cache_set('temp', tensor)
+    return output  # Cache never cleared!
+
+# Assume .to() moves cache
+model.to('cuda:1')  # Cache stays on old device!
+
+# Use raw torch.compile() on WideRouter
+compiled = torch.compile(collective)  # May fail
+
+# Access cache after clear
+self.cache_clear()
+features = self.cache_get('features')  # Returns None!
+```
+
+---
+
 ## Key Principles
 
-1. **Five Base Types** - BaseComponent, BaseRouter, BaseTower, WideRouter, BasePort
-2. **Stages Are Components** - Not raw primitives
-3. **Towers Produce Opinions** - Local conclusions, not final answers
-4. **Ports Wrap Encoders** - Standardized lifecycle for any encoder
-5. **Geometric Routing** - Manifold-based coordination
-6. **Divergence Over Accuracy** - See differently, triangulate truth
-7. **Compile First for Wide Models** - Let `torch.compile` handle fusion
+1. **Three Storage Types** - `components` (modules), `objects` (config), `_cache` (tensors)
+2. **Never Tensor in objects[]** - Use `cache_set()` instead
+3. **Stages Are Components** - Not raw primitives
+4. **Towers Produce Opinions** - Local conclusions, not final answers
+5. **Clear Cache in Collectives** - Prevents VRAM leaks
+6. **Use network_to()** - Safe device movement with cache clearing
+7. **Divergence Over Accuracy** - See differently, triangulate truth
+8. **Compile First for Wide Models** - Let `torch.compile` handle fusion
 
 ---
 
@@ -322,35 +500,56 @@ output = compiled(x)  # ~1.5x faster than eager
 
 | Document | Description |
 |----------|-------------|
-| [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Complete tutorial |
+| [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Complete tutorial with cache system |
+| [ARCHITECTURE_CHANGES_v2.md](src/geofractal/router/ARCHITECTURE_CHANGES_v2.md) | Detailed changelog |
 
 ---
 
 ## Changelog
+
+### v2.0.0 (2025-12-23)
+
+**Cache System** - Managed ephemeral tensor storage
+
+- **New `_cache` dict** on all routers for intermediate tensors
+- **Cache API**: `cache_set()`, `cache_get()`, `cache_clear()`, `cache_clear_recursive()`
+- **Debug tools**: `cache_debug()`, `cache_size_bytes()`, `cache_keys()`
+- **Device safety**: `cache_to()`, `cache_to_recursive()`
+- **Updated `reset()`**: Now clears cache recursively
+- **Updated `network_to()`**: New `clear_cache=True` parameter (default)
+
+**Memory Leak Fix** - Eliminated ~268MB/forward VRAM leak
+
+- Fixed `objects['_cached_features']` → `cache_set('features', ...)`
+- Auto-clearing in `ConfigurableCollective.forward()` and `ConvTowerCollective.forward()`
+- New `WideRouter.clear_tower_caches()` method
+
+**Multi-Channel VAE Support** - Direct latent processing
+
+- **FlexibleInputComponent**: Handles `[B,C,H,W]` (spatial) or `[B,L,D]` (sequence) inputs
+- **MultiScaleConvBlock**: Local/regional/global feature extraction with SE attention
+- **ChannelMixerBlock**: Cross-channel attention for multi-channel latents
+- **New presets**: `preset_flux_vae_towers()` (16-ch), `preset_sd_vae_towers()` (4-ch)
+- **ConvTowerConfig options**: `in_channels`, `input_mode`, `pool_mode`, `use_channel_mixer`
+
+**Documentation** - Comprehensive updates
+
+- New GETTING_STARTED.md sections: Storage Types, Cache Control, Device Movement, Dos/Don'ts
+- ARCHITECTURE_CHANGES_v2.md: Full migration guide
 
 ### v1.0.0-beta (2025-12-23)
 
 **Port System** - Standardized encoder integration
 
 - **BasePort**: Pure protocol for data-in → data-out with lifecycle
-  - `preprocess(raw) → prepared` (CPU, no device movement)
-  - `encode(prepared) → encoded` (GPU, returns context for postprocess)
-  - `postprocess(encoded) → output` (proper pooling with attention mask)
-  - `load()` / `unload()` lifecycle management
-
 - **TorchPort**: Torch-specific base with device/dtype management
-  - `to(device, dtype)` - move encoder
-  - `cuda()`, `cpu()`, `half()`, `float()`, `bfloat16()` - convenience methods
-  - `freeze()` / `unfreeze()` - gradient control
-  - Automatic VRAM cleanup on unload
+- **QwenPort**: Full Qwen family support with proper pooling
 
-- **QwenPort**: Full Qwen family support
-  - Qwen2, Qwen2.5, Instruct variants
-  - Proper pooling with attention mask (last, first, mean, max)
-  - Chat template support for Instruct models
-  - Single input → `[D]`, batch input → `[B, D]`
+**WideRouter** - Compile-optimized wide models
 
-**Architecture designed for external caching** - Ports handle encode pipeline, caching handled by composition (CachedPort, DatasetPort, PyArrow/datasets integration).
+- Auto-discovery of aligned towers
+- `prepare_and_compile()` for safe compilation
+- Near-linear scaling benchmarks
 
 ### v0.2.1
 
@@ -369,7 +568,7 @@ output = compiled(x)  # ~1.5x faster than eager
 
 ## License
 
-Mixed licensing: MIT and Apache 2.0. See individual file headers for specific license.
+Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 ---
 
