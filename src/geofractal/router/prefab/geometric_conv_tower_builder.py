@@ -7,12 +7,39 @@ Convolutional tower variants with BATCHED collective processing.
 Each tower is a TorchComponent-based stage system.
 ConvTowerCollective groups towers by type for batched forward.
 
+Multi-Channel Latent Support:
+    Designed for VAE latent processing (Flux, SD, etc.):
+
+    - FlexibleInputComponent: Handles [B, C, H, W] spatial OR [B, L, D] sequence
+    - ChannelMixerBlock: Cross-channel attention for multi-channel latents
+    - MultiScaleConvBlock: Local/regional/global feature extraction
+    - SpatialToOpinionComponent: Configurable pooling (adaptive/attention/multiscale)
+
+    Example for Flux VAE (16 channels):
+        configs = preset_flux_vae_towers()
+        collective = build_conv_collective(configs, dim=256, spatial_size=32)
+
+        # Direct spatial input
+        latents = vae.encode(images)  # [B, 16, 32, 32]
+        fused, opinions = collective(latents)
+
 Tower types:
-- DepthTower: Multi-scale dilated convolutions
-- FrequencyTower: FFT-based frequency domain processing
-- ColorPatternTower: Interpolated IN/BN normalization
-- CoarseFineTower: Parallel resolution streams
-- WideResNetTower: Wide residual blocks
+    - DepthTower: Multi-scale dilated convolutions
+    - FrequencyTower: FFT-based frequency domain processing
+    - ColorPatternTower: Interpolated IN/BN normalization
+    - CoarseFineTower: Parallel resolution streams
+    - WideResNetTower: Wide residual blocks
+    - BottleneckTower: ResNet-style bottleneck blocks
+    - SqueezeExciteTower: SE blocks with channel attention
+    - InvertedBottleneckTower: MobileNetV2-style
+    - SpatialAttentionTower: Spatial self-attention
+
+Config Options:
+    - in_channels: Input channels for spatial mode (e.g., 16 for Flux, 4 for SD)
+    - input_mode: 'spatial', 'sequence', 'sequence_pooled', or 'auto'
+    - pool_mode: 'adaptive', 'attention', or 'multiscale'
+    - use_channel_mixer: Enable cross-channel attention
+    - use_multiscale: Enable MultiScaleConvBlock between stages
 """
 
 from __future__ import annotations
@@ -70,6 +97,13 @@ class ConvTowerConfig:
 
     inverted: bool = False
     tower_params: Dict[str, Any] = field(default_factory=dict)
+
+    # Multi-channel latent support (e.g., Flux VAE)
+    in_channels: Optional[int] = None      # Input channels (e.g., 16 for Flux)
+    input_mode: str = 'auto'               # 'spatial', 'sequence', 'sequence_pooled', 'auto'
+    pool_mode: str = 'adaptive'            # 'adaptive', 'attention', 'multiscale'
+    use_channel_mixer: bool = False        # Cross-channel attention
+    use_multiscale: bool = True            # MultiScaleConvBlock vs standard
 
     def __post_init__(self):
         if isinstance(self.tower_type, str):
@@ -356,35 +390,328 @@ class SpatialAttentionComponent(TorchComponent):
 # PROJECTION COMPONENTS
 # =============================================================================
 
-class SeqToSpatialComponent(TorchComponent):
-    """Project sequence to spatial: [B, L, D] -> [B, C, H, W]"""
+class FlexibleInputComponent(TorchComponent):
+    """
+    Flexible input projection supporting multiple formats.
 
-    def __init__(self, name: str, seq_dim: int, channels: int, spatial_size: int, **kwargs):
+    Supported input modes:
+    - 'spatial': [B, C, H, W] - direct spatial input (e.g., VAE latents)
+    - 'sequence': [B, L, D] where L = H*W - reshape to spatial
+    - 'sequence_pooled': [B, L, D] - mean pool then expand (legacy, lossy)
+
+    For multi-channel inputs like Flux VAE (16 channels):
+    - Set in_channels=16, spatial_size=32
+    - Input [B, 16, 32, 32] is projected to [B, out_channels, H, W]
+    """
+
+    def __init__(
+        self,
+        name: str,
+        in_features: int,          # D for sequence, C for spatial
+        out_channels: int,         # Output channels for conv stages
+        spatial_size: int,         # Target H=W
+        mode: str = 'auto',        # 'spatial', 'sequence', 'sequence_pooled', 'auto'
+        in_channels: int = None,   # For spatial mode (e.g., 16 for Flux)
+        **kwargs
+    ):
         super().__init__(name, **kwargs)
         self.spatial_size = spatial_size
-        self.channels = channels
-        self.proj = nn.Linear(seq_dim, channels * spatial_size * spatial_size)
-        self.norm = nn.BatchNorm2d(channels)
+        self.out_channels = out_channels
+        self.mode = mode
+        self.in_features = in_features
+        self.in_channels = in_channels or in_features
+
+        # Spatial input: [B, C_in, H, W] -> [B, C_out, H, W]
+        self.spatial_proj = nn.Conv2d(self.in_channels, out_channels, 1)
+
+        # Sequence input: [B, L, D] -> [B, C_out, H, W]
+        # Project each token, reshape to spatial
+        self.seq_proj = nn.Linear(in_features, out_channels)
+
+        # Sequence pooled (legacy): [B, D] -> [B, C_out, H, W]
+        self.pooled_proj = nn.Linear(in_features, out_channels * spatial_size * spatial_size)
+
+        self.norm = nn.GroupNorm(min(32, out_channels), out_channels)
 
     def forward(self, x: Tensor) -> Tensor:
-        B, L, D = x.shape
-        h = self.proj(x.mean(dim=1))
-        h = h.view(B, self.channels, self.spatial_size, self.spatial_size)
-        return self.norm(h)
+        mode = self.mode
+
+        # Auto-detect mode based on input shape
+        if mode == 'auto':
+            if x.dim() == 4:
+                mode = 'spatial'
+            elif x.dim() == 3:
+                B, L, D = x.shape
+                if L == self.spatial_size * self.spatial_size:
+                    mode = 'sequence'
+                else:
+                    mode = 'sequence_pooled'
+            else:
+                raise ValueError(f"Unexpected input shape: {x.shape}")
+
+        if mode == 'spatial':
+            # [B, C, H, W] -> [B, C_out, H, W]
+            h = self.spatial_proj(x)
+            # Handle size mismatch
+            if h.shape[-1] != self.spatial_size:
+                h = F.interpolate(h, size=self.spatial_size, mode='bilinear', align_corners=False)
+
+        elif mode == 'sequence':
+            # [B, L, D] -> [B, H*W, C_out] -> [B, C_out, H, W]
+            B, L, D = x.shape
+            h = self.seq_proj(x)  # [B, L, C_out]
+            h = h.permute(0, 2, 1)  # [B, C_out, L]
+            h = h.view(B, self.out_channels, self.spatial_size, self.spatial_size)
+
+        elif mode == 'sequence_pooled':
+            # [B, L, D] -> [B, D] -> [B, C_out*H*W] -> [B, C_out, H, W]
+            B = x.shape[0]
+            pooled = x.mean(dim=1)
+            h = self.pooled_proj(pooled)
+            h = h.view(B, self.out_channels, self.spatial_size, self.spatial_size)
+
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        return F.gelu(self.norm(h))
+
+
+class MultiScaleConvBlock(TorchComponent):
+    """
+    Multi-scale convolution block for processing multi-channel latents.
+
+    Processes at multiple scales simultaneously:
+    - Local: 3×3 conv for fine details
+    - Regional: 5×5 or dilated 3×3 for medium context
+    - Global: pooled features for full-image context
+
+    Channel-wise attention gates which scale contributes where.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        channels: int,
+        expansion: int = 2,
+        use_se: bool = True,  # Squeeze-excite attention
+        **kwargs
+    ):
+        super().__init__(name, **kwargs)
+        self.channels = channels
+        mid_channels = channels * expansion
+
+        # Local path (fine details)
+        self.local_conv = nn.Sequential(
+            nn.Conv2d(channels, mid_channels, 3, padding=1),
+            nn.GroupNorm(min(32, mid_channels), mid_channels),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, channels, 3, padding=1),
+        )
+
+        # Regional path (medium context)
+        self.regional_conv = nn.Sequential(
+            nn.Conv2d(channels, mid_channels, 3, padding=2, dilation=2),
+            nn.GroupNorm(min(32, mid_channels), mid_channels),
+            nn.GELU(),
+            nn.Conv2d(mid_channels, channels, 3, padding=2, dilation=2),
+        )
+
+        # Global path (full context)
+        self.global_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_fc = nn.Sequential(
+            nn.Linear(channels, mid_channels),
+            nn.GELU(),
+            nn.Linear(mid_channels, channels),
+        )
+
+        # Scale mixing
+        self.scale_gate = nn.Sequential(
+            nn.Conv2d(channels * 3, channels, 1),
+            nn.Sigmoid(),
+        )
+
+        # Optional squeeze-excite
+        self.use_se = use_se
+        if use_se:
+            self.se = nn.Sequential(
+                nn.AdaptiveAvgPool2d(1),
+                nn.Flatten(),
+                nn.Linear(channels, channels // 4),
+                nn.GELU(),
+                nn.Linear(channels // 4, channels),
+                nn.Sigmoid(),
+            )
+
+        self.norm = nn.GroupNorm(min(32, channels), channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+
+        # Multi-scale features
+        local_feat = self.local_conv(x)
+        regional_feat = self.regional_conv(x)
+
+        global_feat = self.global_pool(x).flatten(1)  # [B, C]
+        global_feat = self.global_fc(global_feat)  # [B, C]
+        global_feat = global_feat.view(B, C, 1, 1).expand(-1, -1, H, W)  # [B, C, H, W]
+
+        # Concatenate and gate
+        concat = torch.cat([local_feat, regional_feat, global_feat], dim=1)  # [B, 3C, H, W]
+        gate = self.scale_gate(concat)  # [B, C, H, W]
+
+        # Weighted combination
+        out = gate * local_feat + (1 - gate) * 0.5 * (regional_feat + global_feat)
+
+        # Squeeze-excite channel attention
+        if self.use_se:
+            se_weight = self.se(out).view(B, C, 1, 1)
+            out = out * se_weight
+
+        return self.norm(out + x)
+
+
+class ChannelMixerBlock(TorchComponent):
+    """
+    Channel mixing block for multi-channel latents (e.g., Flux's 16 channels).
+
+    Cross-channel attention allows channels to share information,
+    important for VAE latents where channels encode different aspects.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        channels: int,
+        spatial_size: int,
+        num_heads: int = 4,
+        **kwargs
+    ):
+        super().__init__(name, **kwargs)
+        self.channels = channels
+        self.spatial_size = spatial_size
+        self.num_heads = num_heads
+
+        # Spatial pooling to reduce computation
+        self.spatial_pool = nn.AdaptiveAvgPool2d(8)  # Always 8×8 for attention
+
+        # Channel attention via linear layers (treat channels as sequence)
+        self.channel_norm = nn.LayerNorm(64)  # 8*8 = 64
+        self.channel_q = nn.Linear(64, 64)
+        self.channel_k = nn.Linear(64, 64)
+        self.channel_v = nn.Linear(64, 64)
+        self.channel_proj = nn.Linear(64, 64)
+
+        # Upsample back
+        self.upsample = nn.Upsample(size=spatial_size, mode='bilinear', align_corners=False)
+
+        # Residual mixing
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+
+        # Pool to fixed size for attention
+        h = self.spatial_pool(x)  # [B, C, 8, 8]
+        h = h.view(B, C, -1)  # [B, C, 64]
+
+        # Channel attention (treat C as sequence length)
+        h_norm = self.channel_norm(h)
+        q = self.channel_q(h_norm)  # [B, C, 64]
+        k = self.channel_k(h_norm)  # [B, C, 64]
+        v = self.channel_v(h_norm)  # [B, C, 64]
+
+        # Attention: [B, C, 64] × [B, 64, C] -> [B, C, C]
+        attn = torch.bmm(q, k.transpose(-1, -2)) / math.sqrt(64)
+        attn = F.softmax(attn, dim=-1)
+
+        # Apply: [B, C, C] × [B, C, 64] -> [B, C, 64]
+        out = torch.bmm(attn, v)
+        out = self.channel_proj(out)
+
+        # Reshape and upsample
+        out = out.view(B, C, 8, 8)
+        out = self.upsample(out)  # [B, C, H, W]
+
+        # Gated residual
+        return x + torch.sigmoid(self.gate) * out
 
 
 class SpatialToOpinionComponent(TorchComponent):
-    """Project spatial to opinion: [B, C, H, W] -> [B, D]"""
+    """
+    Project spatial to opinion: [B, C, H, W] -> [B, D]
 
-    def __init__(self, name: str, channels: int, out_dim: int, **kwargs):
+    Supports multiple pooling strategies:
+    - 'adaptive': AdaptiveAvgPool2d (default)
+    - 'attention': Learned spatial attention weights
+    - 'multiscale': Pool at multiple scales, concatenate
+    """
+
+    def __init__(
+        self,
+        name: str,
+        channels: int,
+        out_dim: int,
+        pool_mode: str = 'adaptive',
+        **kwargs
+    ):
         super().__init__(name, **kwargs)
-        self.pool = nn.AdaptiveAvgPool2d(1)
-        self.proj = nn.Linear(channels, out_dim)
+        self.pool_mode = pool_mode
+        self.channels = channels
+        self.out_dim = out_dim
+
+        if pool_mode == 'adaptive':
+            self.pool = nn.AdaptiveAvgPool2d(1)
+            self.proj = nn.Linear(channels, out_dim)
+
+        elif pool_mode == 'attention':
+            self.attn_conv = nn.Conv2d(channels, 1, 1)
+            self.proj = nn.Linear(channels, out_dim)
+
+        elif pool_mode == 'multiscale':
+            # Pool at 1×1, 2×2, 4×4 and concatenate
+            self.pool1 = nn.AdaptiveAvgPool2d(1)
+            self.pool2 = nn.AdaptiveAvgPool2d(2)
+            self.pool4 = nn.AdaptiveAvgPool2d(4)
+            # 1 + 4 + 16 = 21 spatial positions
+            self.proj = nn.Linear(channels * 21, out_dim)
+
         self.norm = nn.LayerNorm(out_dim)
 
     def forward(self, x: Tensor) -> Tensor:
-        h = self.pool(x).flatten(1)
+        B, C, H, W = x.shape
+
+        if self.pool_mode == 'adaptive':
+            h = self.pool(x).flatten(1)  # [B, C]
+
+        elif self.pool_mode == 'attention':
+            # Learn spatial attention weights
+            attn = self.attn_conv(x)  # [B, 1, H, W]
+            attn = F.softmax(attn.view(B, 1, -1), dim=-1)  # [B, 1, H*W]
+            h = x.view(B, C, -1)  # [B, C, H*W]
+            h = torch.bmm(h, attn.transpose(-1, -2)).squeeze(-1)  # [B, C]
+
+        elif self.pool_mode == 'multiscale':
+            p1 = self.pool1(x).flatten(1)  # [B, C]
+            p2 = self.pool2(x).flatten(1)  # [B, C*4]
+            p4 = self.pool4(x).flatten(1)  # [B, C*16]
+            h = torch.cat([p1, p2, p4], dim=1)  # [B, C*21]
+
         return self.norm(self.proj(h))
+
+
+# Legacy alias for backward compatibility
+class SeqToSpatialComponent(FlexibleInputComponent):
+    """Legacy wrapper - prefer FlexibleInputComponent directly."""
+
+    def __init__(self, name: str, seq_dim: int, channels: int, spatial_size: int, **kwargs):
+        super().__init__(
+            name=name,
+            in_features=seq_dim,
+            out_channels=channels,
+            spatial_size=spatial_size,
+            mode='sequence_pooled',  # Legacy behavior
+            **kwargs
+        )
 
 
 # =============================================================================
@@ -392,7 +719,15 @@ class SpatialToOpinionComponent(TorchComponent):
 # =============================================================================
 
 class ConfigurableConvTower(BaseTower):
-    """Conv tower built from ConvTowerConfig."""
+    """
+    Conv tower built from ConvTowerConfig.
+
+    Supports multi-channel latent inputs (e.g., Flux VAE with 16 channels):
+    - FlexibleInputComponent handles [B, C, H, W] or [B, L, D] inputs
+    - Optional ChannelMixerBlock for cross-channel attention
+    - MultiScaleConvBlock for multi-scale processing
+    - Configurable output pooling (adaptive, attention, multiscale)
+    """
 
     def __init__(
         self,
@@ -422,19 +757,41 @@ class ConfigurableConvTower(BaseTower):
             'dim': dim,
             'depth': depth,
             'spatial_size': spatial_size,
+            'in_channels': config.in_channels,
+            'input_mode': config.input_mode,
         }
         self.objects['spatial_size'] = spatial_size
 
         base_channels = params.get('base_channels', 64)
 
-        self.attach('input_proj', SeqToSpatialComponent(
-            f'{config.name}_input', dim, base_channels, spatial_size
+        # Input projection - now supports multi-channel inputs
+        self.attach('input_proj', FlexibleInputComponent(
+            f'{config.name}_input',
+            in_features=dim,
+            out_channels=base_channels,
+            spatial_size=spatial_size,
+            mode=config.input_mode,
+            in_channels=config.in_channels,
         ))
 
-        self._build_stages(config.tower_type, config.name, base_channels, depth, spatial_size, params)
+        # Optional channel mixer at start (for multi-channel latents)
+        if config.use_channel_mixer and config.in_channels and config.in_channels > 1:
+            self.attach('channel_mixer', ChannelMixerBlock(
+                f'{config.name}_channel_mix',
+                channels=base_channels,
+                spatial_size=spatial_size,
+            ))
 
+        # Main processing stages
+        self._build_stages(
+            config.tower_type, config.name, base_channels, depth,
+            spatial_size, params, config.use_multiscale
+        )
+
+        # Output projection with configurable pooling
         self.attach('output_proj', SpatialToOpinionComponent(
-            f'{config.name}_output', base_channels, dim
+            f'{config.name}_output', base_channels, dim,
+            pool_mode=config.pool_mode,
         ))
 
         self.attach('address', AddressComponent(
@@ -443,36 +800,61 @@ class ConfigurableConvTower(BaseTower):
 
         self.attach('opinion_proj', nn.Linear(dim, dim))
 
-    def _build_stages(self, tower_type, tower_name, channels, depth, spatial_size, params):
+    def _build_stages(self, tower_type, tower_name, channels, depth, spatial_size, params, use_multiscale):
+        # Optionally inject MultiScaleConvBlock between regular stages
+        if use_multiscale and depth >= 2:
+            multiscale_interval = max(1, depth // 2)
+        else:
+            multiscale_interval = depth + 1  # Never insert
+
+        stage_idx = 0
+
         if tower_type == ConvTowerType.DEPTH:
             dilations = [1, 2, 4, 8]
             for i in range(depth):
                 dilation = dilations[i % len(dilations)]
                 self.append(DilatedConvComponent(f'{tower_name}_dilated_{i}', channels, dilation))
+                stage_idx += 1
+                if stage_idx % multiscale_interval == 0 and stage_idx < depth:
+                    self.append(MultiScaleConvBlock(f'{tower_name}_ms_{stage_idx}', channels))
 
         elif tower_type == ConvTowerType.DILATED:
-            # Explicit dilated conv (same as DEPTH, clearer name)
             dilations = params.get('dilations', [1, 2, 4, 8])
             for i in range(depth):
                 dilation = dilations[i % len(dilations)]
                 self.append(DilatedConvComponent(f'{tower_name}_dil_{i}', channels, dilation))
+                stage_idx += 1
+                if stage_idx % multiscale_interval == 0 and stage_idx < depth:
+                    self.append(MultiScaleConvBlock(f'{tower_name}_ms_{stage_idx}', channels))
 
         elif tower_type == ConvTowerType.FREQUENCY:
             for i in range(depth):
                 self.append(FrequencyComponent(f'{tower_name}_freq_{i}', channels, spatial_size))
+                stage_idx += 1
+                if stage_idx % multiscale_interval == 0 and stage_idx < depth:
+                    self.append(MultiScaleConvBlock(f'{tower_name}_ms_{stage_idx}', channels))
 
         elif tower_type == ConvTowerType.COLOR_PATTERN:
             for i in range(depth):
                 self.append(InterpolatedNormComponent(f'{tower_name}_pattern_{i}', channels))
+                stage_idx += 1
+                if stage_idx % multiscale_interval == 0 and stage_idx < depth:
+                    self.append(MultiScaleConvBlock(f'{tower_name}_ms_{stage_idx}', channels))
 
         elif tower_type == ConvTowerType.COARSE_FINE:
             for i in range(depth):
                 self.append(CoarseFineComponent(f'{tower_name}_cf_{i}', channels))
+                stage_idx += 1
+                if stage_idx % multiscale_interval == 0 and stage_idx < depth:
+                    self.append(MultiScaleConvBlock(f'{tower_name}_ms_{stage_idx}', channels))
 
         elif tower_type == ConvTowerType.WIDE_RESNET:
             dropout = params.get('dropout', 0.1)
             for i in range(depth):
                 self.append(WideResComponent(f'{tower_name}_wrn_{i}', channels, dropout))
+                stage_idx += 1
+                if stage_idx % multiscale_interval == 0 and stage_idx < depth:
+                    self.append(MultiScaleConvBlock(f'{tower_name}_ms_{stage_idx}', channels))
 
         elif tower_type == ConvTowerType.BOTTLENECK:
             reduction = params.get('reduction', 4)
@@ -506,28 +888,56 @@ class ConfigurableConvTower(BaseTower):
         return self._inverted
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
-        """Process through conv tower."""
-        B, L, D = x.shape
+        """
+        Process through conv tower.
 
+        Supports multiple input formats:
+        - [B, L, D]: Sequence input (L = H*W tokens or arbitrary)
+        - [B, C, H, W]: Spatial input (e.g., VAE latents)
+
+        Returns:
+            opinion: [B, dim] tower opinion
+            features: [B, L, dim] or [B, H*W, dim] expanded features
+        """
+        # Determine input format and get sequence length for feature expansion
+        if x.dim() == 4:
+            # Spatial input [B, C, H, W]
+            B, C, H, W = x.shape
+            seq_len = H * W
+        elif x.dim() == 3:
+            # Sequence input [B, L, D]
+            B, seq_len, D = x.shape
+        else:
+            raise ValueError(f"Unexpected input shape: {x.shape}")
+
+        # Input projection (handles both formats)
         h = self['input_proj'](x)
 
+        # Optional channel mixer (early cross-channel attention)
+        if 'channel_mixer' in self.components:
+            h = self['channel_mixer'](h)
+
+        # Main conv stages
         for stage in self.stages:
             h = stage(h)
 
+        # Output projection
         pooled = self['output_proj'](h)
         opinion = self['opinion_proj'](pooled)
 
-        features = pooled.unsqueeze(1).expand(-1, L, -1)
+        # Expand features to match input sequence length
+        features = pooled.unsqueeze(1).expand(-1, seq_len, -1)
 
         # Cache features for WideRouter retrieval
-        self.objects['_cached_features'] = features
+        # Uses ephemeral cache that can be bulk-cleared
+        self.cache_set('features', features)
 
         return opinion, features
 
     @property
     def cached_features(self) -> Optional[Tensor]:
         """Features from last forward pass (for WideRouter integration)."""
-        return self.objects.get('_cached_features')
+        return self.cache_get('features')
 
 
 # =============================================================================
@@ -614,6 +1024,10 @@ class ConvTowerCollective(WideRouter):
         fp_cat = torch.cat(all_fingerprints, dim=-1)
         collective_fp = F.normalize(self['fp_proj'](fp_cat), dim=-1)
 
+        # Clear tower caches to prevent memory leaks
+        for name in self.tower_names:
+            self[name].cache_clear()
+
         return fused, opinions_dict
 
 
@@ -695,6 +1109,112 @@ def preset_conv_full_stack() -> List[ConvTowerConfig]:
         'dilated', 'coarse_fine', 'inverted_bottleneck', 'spatial_attention',
         'depth', 'color_pattern'
     ])
+
+
+def preset_flux_vae_towers(
+    tower_types: List[str] = ['wide_resnet', 'frequency', 'squeeze_excite', 'spatial_attention']
+) -> List[ConvTowerConfig]:
+    """
+    Conv tower configs optimized for Flux VAE latents.
+
+    Flux VAE produces 16-channel latents at 8x spatial compression:
+    - 256×256 image → 32×32×16 latent
+    - 512×512 image → 64×64×16 latent
+
+    These configs enable:
+    - Direct spatial input (no sequence conversion)
+    - Cross-channel attention
+    - Multi-scale processing
+    - Attention pooling for output
+    """
+    configs = []
+    for tower_type in tower_types:
+        configs.append(ConvTowerConfig(
+            f'{tower_type}_pos',
+            tower_type=tower_type,
+            inverted=False,
+            in_channels=16,           # Flux VAE channels
+            input_mode='spatial',     # Direct [B, C, H, W] input
+            pool_mode='attention',    # Learned spatial attention for output
+            use_channel_mixer=True,   # Cross-channel attention
+            use_multiscale=True,      # Multi-scale conv blocks
+        ))
+        configs.append(ConvTowerConfig(
+            f'{tower_type}_neg',
+            tower_type=tower_type,
+            inverted=True,
+            in_channels=16,
+            input_mode='spatial',
+            pool_mode='attention',
+            use_channel_mixer=True,
+            use_multiscale=True,
+        ))
+    return configs
+
+
+def preset_sd_vae_towers(
+    tower_types: List[str] = ['wide_resnet', 'frequency', 'squeeze_excite']
+) -> List[ConvTowerConfig]:
+    """
+    Conv tower configs for Stable Diffusion VAE latents.
+
+    SD VAE produces 4-channel latents at 8x spatial compression:
+    - 512×512 image → 64×64×4 latent
+    """
+    configs = []
+    for tower_type in tower_types:
+        configs.append(ConvTowerConfig(
+            f'{tower_type}_pos',
+            tower_type=tower_type,
+            inverted=False,
+            in_channels=4,            # SD VAE channels
+            input_mode='spatial',
+            pool_mode='adaptive',
+            use_channel_mixer=False,  # Only 4 channels, less benefit
+            use_multiscale=True,
+        ))
+        configs.append(ConvTowerConfig(
+            f'{tower_type}_neg',
+            tower_type=tower_type,
+            inverted=True,
+            in_channels=4,
+            input_mode='spatial',
+            pool_mode='adaptive',
+            use_channel_mixer=False,
+            use_multiscale=True,
+        ))
+    return configs
+
+
+def preset_sequence_towers(
+    tower_types: List[str] = ['wide_resnet', 'frequency']
+) -> List[ConvTowerConfig]:
+    """
+    Conv tower configs for sequence inputs (e.g., from transformers).
+
+    Expects [B, L, D] input where L = H*W spatial tokens.
+    Reshapes to spatial for conv processing.
+    """
+    configs = []
+    for tower_type in tower_types:
+        configs.append(ConvTowerConfig(
+            f'{tower_type}_pos',
+            tower_type=tower_type,
+            inverted=False,
+            input_mode='sequence',    # [B, L, D] with L = H*W
+            pool_mode='adaptive',
+            use_channel_mixer=False,
+            use_multiscale=True,
+        ))
+        configs.append(ConvTowerConfig(
+            f'{tower_type}_neg',
+            tower_type=tower_type,
+            inverted=True,
+            input_mode='sequence',
+            pool_mode='adaptive',
+            use_channel_mixer=False,
+            use_multiscale=True,
+        ))
     return configs
 
 

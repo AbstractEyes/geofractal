@@ -2,31 +2,34 @@
 geofractal.router.wide_router
 ====================================
 
-WideRouter - Autonomous caching and batched execution for wide models.
+WideRouter - Execution coordinator for wide models with multiple towers.
 
-When multiple towers process the same input, structurally similar operations
-can be batched together. WideRouter discovers alignment automatically and
-executes pooled operations in batched mode.
+When multiple towers process the same input, WideRouter provides:
+- Automatic tower discovery and registration
+- Structure analysis for alignment detection
+- Grouped execution (torch.compile handles kernel fusion)
+- Cache management across tower tree
 
-Design Philosophy:
-    - Convenience first: Most behavior is automatic
-    - Autonomous alignment: Discovers structure without manual annotation
-    - Under-the-hood batching: No changes to tower code required
-    - Opt-in fine control: @cache_similar for explicit grouping
+Current Execution Path (actively used):
+    1. wide_forward() calls _execute_aligned()
+    2. Towers grouped by structural signature
+    3. Sequential execution per group (torch.compile fuses)
+    4. Results collected and returned
 
-How It Works:
-    1. StackTracker monitors call depth during forward passes
-    2. StructureAnalyzer discovers aligned operations across towers
-    3. TensorPool accumulates inputs for aligned operations
-    4. Batched execution replaces sequential tower calls
-    5. Results are scattered back to original call sites
+Reserved Infrastructure (built, not yet active):
+    - StackTracker: Call depth monitoring (for future profiling)
+    - TensorPool: Batched accumulation (for manual batching)
+    - CacheRegistry: Alignment heuristics (for adaptive batching)
+    - WideForwardHook: Forward interception (for transparent batching)
+    - BatchedLinearGroup: Operation-level batching (experimental)
 
 Architecture:
     WideRouter (BaseRouter)
-    ├── StackTracker        - Call depth monitoring
-    ├── TensorPool          - Batched tensor accumulation
-    ├── CacheRegistry       - Alignment tracking and heuristics
-    └── towers              - The wide model's tower collection
+    ├── tracker: StackTracker       [reserved]
+    ├── pool: TensorPool            [reserved, cleared on reset()]
+    ├── registry: CacheRegistry     [reserved]
+    ├── analyzer: StructureAnalyzer [used for alignment]
+    └── towers                      [the actual tower modules]
 
 Usage:
     class MyCollective(WideRouter):
@@ -43,6 +46,10 @@ Usage:
         def forward(self, x: Tensor) -> Tensor:
             # Automatic batched execution across registered towers
             opinions = self.wide_forward(x)
+
+            # Clear tower caches if they store intermediates
+            self.clear_tower_caches()
+
             return self['fusion'](*opinions.values())
 
     # Or even simpler - auto-detect towers:
@@ -50,6 +57,13 @@ Usage:
         def forward(self, x: Tensor) -> Tensor:
             opinions = self.wide_forward(x)  # Auto-finds all towers
             return self['fusion'](*opinions.values())
+
+Cache Management:
+    WideRouter inherits BaseRouter's cache system:
+    - self._cache: Ephemeral dict for intermediates
+    - cache_set/cache_get/cache_clear: Managed lifecycle
+    - reset(): Clears cache + pool + tower caches
+    - clear_tower_caches(): Just tower caches
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -1174,6 +1188,34 @@ class WideRouter(BaseRouter):
             "WideRouter subclass must implement forward(). "
             "Use self.wide_forward(x) to execute registered towers."
         )
+
+    # =========================================================================
+    # CLEANUP AND LIFECYCLE
+    # =========================================================================
+
+    def reset(self) -> None:
+        """
+        Clear transient state including tower caches.
+
+        Clears:
+        - Base router cache (via super)
+        - TensorPool pending/results
+        - Tower caches (for all registered towers)
+        """
+        super().reset()  # Clears self._cache and recurses to components
+        self.pool.clear()
+
+    def clear_tower_caches(self) -> None:
+        """
+        Clear ephemeral caches on all registered towers.
+
+        Call this after wide_forward if towers cache intermediate tensors.
+        Note: ConfigurableCollective and ConvTowerCollective do this automatically.
+        """
+        for name in self.tower_names:
+            tower = self.get(name)
+            if tower is not None and hasattr(tower, 'cache_clear'):
+                tower.cache_clear()
 
     # =========================================================================
     # DIAGNOSTICS
