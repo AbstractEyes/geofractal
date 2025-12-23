@@ -14,6 +14,29 @@ Structural Model:
     stages:     Ordered pipeline (nn.ModuleList) - int indexed
     components: Named auxiliaries (nn.ModuleDict) - str indexed
     objects:    Non-module storage (dict) - str indexed
+    _cache:     Ephemeral tensor cache (dict) - managed lifecycle
+
+Storage Guide:
+    Use stages for:     Ordered processing layers
+    Use components for: Named nn.Module auxiliaries (norms, projections)
+    Use objects for:    Config dicts, constants, metadata
+    Use _cache for:     Intermediate tensors during forward (auto-cleared)
+
+Cache System (inherited from BaseRouter):
+    Towers inherit the ephemeral cache for intermediate tensors:
+
+    def forward(self, x):
+        # Store intermediate for later retrieval
+        self.cache_set('hidden', hidden_state)
+
+        # ... processing ...
+
+        # Retrieve if needed
+        hidden = self.cache_get('hidden')
+
+        # Clear at end of forward (or let collective clear)
+        self.cache_clear()
+        return output
 
 Coordination Model:
     Towers communicate through pools, not direct connection.
@@ -58,7 +81,14 @@ class BaseTower(BaseRouter):
     """
     Self-encapsulated processing unit producing an opinion.
 
-    Extends BaseRouter with ordered stage processing.
+    Extends BaseRouter with ordered stage processing via nn.ModuleList.
+    Inherits cache system for intermediate tensor management.
+
+    Attributes:
+        stages: nn.ModuleList for ordered pipeline processing
+        components: nn.ModuleDict for named auxiliary modules (inherited)
+        objects: dict for non-module config/metadata (inherited)
+        _cache: dict for ephemeral tensors (inherited, use cache_set/get/clear)
     """
 
     def __init__(self, name: str, uuid: Optional[str] = None, **kwargs):
@@ -160,11 +190,15 @@ class BaseTower(BaseRouter):
 
 
 # =============================================================================
-# TEST TOWERS
+# EXAMPLE TOWERS
 # =============================================================================
 
 class SequentialTower(BaseTower):
-    """Simple sequential processing - stages in order."""
+    """
+    Simple sequential processing - stages in order.
+
+    No caching needed - pure feedforward.
+    """
 
     def forward(self, x: Tensor) -> Tensor:
         for stage in self.stages:
@@ -173,7 +207,12 @@ class SequentialTower(BaseTower):
 
 
 class ResidualTower(BaseTower):
-    """Sequential with residual connection around all stages."""
+    """
+    Sequential with residual connection around all stages.
+
+    Uses local variable for residual - no cache needed
+    since residual is only used within this forward pass.
+    """
 
     def forward(self, x: Tensor) -> Tensor:
         residual = x
@@ -183,7 +222,11 @@ class ResidualTower(BaseTower):
 
 
 class PreNormTower(BaseTower):
-    """Uses attached component for pre-normalization."""
+    """
+    Uses attached component for pre-normalization.
+
+    Demonstrates components[] for named modules.
+    """
 
     def __init__(self, name: str, dim: int, **kwargs):
         super().__init__(name, **kwargs)
@@ -197,7 +240,11 @@ class PreNormTower(BaseTower):
 
 
 class GatedTower(BaseTower):
-    """Gated output - stages produce value, gate controls flow."""
+    """
+    Gated output - stages produce value, gate controls flow.
+
+    Gate computed once, applied after stages.
+    """
 
     def __init__(self, name: str, dim: int, **kwargs):
         super().__init__(name, **kwargs)
@@ -249,31 +296,30 @@ class AttentionTower(BaseTower):
         self.attach('norm2', nn.LayerNorm(dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        # Self-attention block
+        # Self-attention block with residual
         residual = x
         x = self['norm1'](x)
         x, _ = self['attn'](x, x, x)
         x = x + residual
 
-        # FFN through stages
+        # FFN through stages with residual
         residual = x
         x = self['norm2'](x)
         for stage in self.stages:
             x = stage(x)
-        x = x + residual
-
-        return x
+        return x + residual
 
 
 class ConditionalTower(BaseTower):
     """
     Conditional processing based on config object.
 
-    Demonstrates using non-module objects to control behavior.
+    Demonstrates using objects[] for non-module config.
     """
 
     def __init__(self, name: str, **kwargs):
         super().__init__(name, **kwargs)
+        # Config goes in objects (persistent, non-tensor)
         self.attach('config', {
             'use_residual': True,
             'scale': 1.0,
@@ -292,6 +338,58 @@ class ConditionalTower(BaseTower):
             x = x + residual
 
         return x
+
+
+class CachingTower(BaseTower):
+    """
+    Tower that exposes intermediate features via cache.
+
+    Demonstrates the pattern used by ConfigurableTower and
+    ConfigurableConvTower for WideRouter integration:
+
+    - Cache features during forward for external retrieval
+    - Expose via properties
+    - Caller (collective) responsible for clearing
+
+    Use cache when:
+    - External code needs access to intermediates
+    - Data must persist after forward() returns
+    - Sharing between separate method calls
+
+    Use local variables when:
+    - Data only used within forward()
+    - No external access needed
+    """
+
+    def __init__(self, name: str, dim: int, **kwargs):
+        super().__init__(name, **kwargs)
+        self.attach('output_proj', nn.Linear(dim, dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Process through stages
+        for stage in self.stages:
+            x = stage(x)
+
+        # Project to opinion
+        opinion = self['output_proj'](x)
+
+        # Cache features for external retrieval
+        # (e.g., WideRouter or Collective will use these)
+        self.cache_set('features', x)
+        self.cache_set('opinion', opinion)
+
+        # Note: NOT clearing here - caller (collective) clears
+        return opinion
+
+    @property
+    def cached_features(self) -> Tensor:
+        """Features from last forward pass."""
+        return self.cache_get('features')
+
+    @property
+    def cached_opinion(self) -> Tensor:
+        """Opinion from last forward pass."""
+        return self.cache_get('opinion')
 
 
 # =============================================================================
@@ -510,6 +608,59 @@ if __name__ == '__main__':
     print(f"\nWith residual: {y1[0, :3]}")
     print(f"Without residual: {y2[0, :3]}")
     print(f"Different outputs: {not torch.allclose(y1, y2)}")
+
+    # =========================================================================
+    section("CACHE SYSTEM - Ephemeral Tensor Storage")
+    # =========================================================================
+
+    print("Cache is for EXTERNAL access to intermediates.")
+    print("Local variables are fine for data used only within forward().\n")
+
+    caching = CachingTower('caching', dim=64)
+    caching.extend([
+        nn.Linear(64, 128),
+        nn.GELU(),
+        nn.Linear(128, 64),
+    ])
+
+    print(f"Tower:\n{caching}")
+    print(f"\nCache before forward: {caching.cache_keys()}")
+
+    x = torch.randn(4, 64)
+    y = caching(x)
+
+    print(f"Cache after forward: {caching.cache_keys()}")
+    print(f"Cache size: {caching.cache_size_bytes()} bytes")
+    print(f"Cached features shape: {caching.cached_features.shape}")
+    print(f"Cached opinion shape: {caching.cached_opinion.shape}")
+
+    # Clear cache (simulates what a Collective does)
+    caching.cache_clear()
+    print(f"\nCache after clear: {caching.cache_keys()}")
+    print(f"Cached features after clear: {caching.cached_features}")
+
+    # Demonstrate cache_debug on nested structure
+    print("\n--- Nested Cache Debug ---")
+    nested_cache = SequentialTower('outer_cache')
+    inner1 = CachingTower('inner1', dim=64)
+    inner1.extend([nn.Linear(64, 64)])
+    inner2 = CachingTower('inner2', dim=64)
+    inner2.extend([nn.Linear(64, 64)])
+    nested_cache.append(inner1)
+    nested_cache.append(inner2)
+
+    # Forward to populate caches
+    x = torch.randn(4, 64)
+    _ = nested_cache(x)
+
+    print(f"Cache state after forward:")
+    debug_info = nested_cache.cache_debug()
+    for path, cache in debug_info.items():
+        print(f"  {path}: {list(cache.keys())}")
+
+    # Clear recursively (what reset() does)
+    nested_cache.cache_clear_recursive()
+    print(f"\nAfter recursive clear: {nested_cache.cache_debug()}")
 
     # =========================================================================
     section("INSERT / POP - Dynamic Modification")
@@ -788,6 +939,7 @@ if __name__ == '__main__':
         ('DualPathTower', dual),
         ('AttentionTower', attn_tower),
         ('ConditionalTower', conditional),
+        ('CachingTower', caching),
         ('NestedTower (3 inner)', outer),
         ('TransformerBlock', transformer_block),
         ('FullTransformer (6 blocks)', full_transformer),
@@ -806,6 +958,7 @@ if __name__ == '__main__':
     print("  ✓ Ordered stage pipeline (nn.ModuleList)")
     print("  ✓ Named component storage (nn.ModuleDict)")
     print("  ✓ Non-module object storage (dict)")
+    print("  ✓ Ephemeral cache for tensors (_cache)")
     print("  ✓ Sequential-like interface (append/extend/insert/pop)")
     print("  ✓ Dual indexing (int for stages, str for components)")
     print("  ✓ Deterministic iteration over stages")
@@ -815,6 +968,20 @@ if __name__ == '__main__':
     print("  ✓ torch.compile compatibility")
     print("  ✓ UUID uniqueness for addressing")
 
+    print("\nCache system features:")
+    print("  ✓ cache_set(key, tensor) - store for external access")
+    print("  ✓ cache_get(key) - retrieve cached tensor")
+    print("  ✓ cache_clear() - clear this tower's cache")
+    print("  ✓ cache_clear_recursive() - clear entire tree")
+    print("  ✓ cache_debug() - inspect cache across tree")
+    print("  ✓ cache_size_bytes() - VRAM usage estimate")
+
+    print("\nWhen to use cache vs local variables:")
+    print("  Cache: External code needs intermediates after forward()")
+    print("  Cache: Sharing between separate methods")
+    print("  Local: Data only used within forward() scope")
+    print("  Local: Residuals, gates, paths in simple towers")
+
     print("\nTower patterns demonstrated:")
     print("  ✓ Sequential processing")
     print("  ✓ Residual connections")
@@ -823,6 +990,7 @@ if __name__ == '__main__':
     print("  ✓ Multi-path topologies")
     print("  ✓ Mixed stage/component architectures")
     print("  ✓ Config-driven behavior")
+    print("  ✓ Feature caching for WideRouter/Collectives")
     print("  ✓ Hierarchical nesting")
     print("  ✓ Full transformer blocks")
 
