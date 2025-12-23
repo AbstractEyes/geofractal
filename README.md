@@ -10,7 +10,7 @@
 
 ## What Is This?
 
-GeoFractal Router is a coordination architecture for building **collectives of autonomous AI units**. Instead of one monolithic model, you build multiple *towers* that produce opinions, coordinate through *geometric routing*, and fuse their perspectives into emergent collective intelligence.
+GeoFractal Router is a coordination architecture for building **collectives of autonomous AI units**. Instead of one monolithic model, you build multiple *towers* that produce independent or incepted opinions through fusion, coordinate through *geometric routing*, and fuse their perspectives into emergent collective intelligence.
 
 **The key insight:** Individual units don't need to be accurate. They need to *see differently*. The collective triangulates truth from divergent viewpoints.
 
