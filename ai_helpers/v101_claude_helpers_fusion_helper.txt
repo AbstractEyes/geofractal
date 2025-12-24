@@ -1,6 +1,6 @@
 # 101_claude.txt
 # GeoFractal Router - Claude Reference Guide
-# Last Updated: 2025-12-24 (v1.0.3)
+# Last Updated: 2025-12-24 (v1.0.4)
 
 # Official router repo:
 # https://github.com/AbstractEyes/geofractal
@@ -43,7 +43,7 @@
 REPO DIRECTORY STRUCTURE
 ================================================================================
 ai_helpers/
-└──101_claude.txt             # THIS FILE, version 1.0.3
+└──101_claude.txt             # THIS FILE, version 1.0.4
 
 src/geofractal/router/
 ├── __init__.py
@@ -61,6 +61,7 @@ src/geofractal/router/
 │   ├── __init__.py
 │   ├── torch_component.py                    # BaseComponent + nn.Module
 │   ├── address_component.py                  # Geometric identity (Spherical, etc.)
+│   ├── aggregation_component.py              # EXPERIMENTAL: FieldWalkerFusion
 │   ├── cantor_address_component.py           # Cantor-based addressing
 │   ├── cantor_euclidean_attention_component.py
 │   ├── data_component.py                     # Data flow components
@@ -666,8 +667,113 @@ cifar100_core_test.py         - CIFAR-100 experiments
 BEATRIX_CORE.md               - Beatrix documentation
 
 ================================================================================
+EXPERIMENTAL - PENDING ABLATION TESTS
+================================================================================
+
+The following components are functional but pending comprehensive ablation tests.
+Use with appropriate caution in production systems.
+
+AGGREGATION COMPONENT (router/components/aggregation_component.py):
+-------------------------------------------------------------------
+Status: EXPERIMENTAL - Core tests passing, awaiting ablation studies
+Origin: Derived from Alucard/Integra encoder walking system
+
+Multi-step interpolative fusion with universal masking support.
+Masking is first-class: mask=0 preserves original (fingerprint), mask=1 applies processing.
+
+Architecture:
+  FieldWalkerFusion = BlendMode × Schedule × Aggregation
+
+  BlendMode:   How to combine (a, b) at single alpha
+  Schedule:    How alpha evolves across steps
+  Aggregation: How to pool stepped results
+
+BLEND MODES (11):
+  lerp        - Linear interpolation
+  slerp       - Spherical interpolation (preserves magnitude)
+  slip        - Entropic phase gating: sigmoid((delta·b).sum())
+  zeus        - Sharp sigmoid threshold at alpha=0.5
+  helios      - Sine-weighted blend
+  surge       - Exponential: 1-exp(-k*alpha)
+  ripple      - Sinusoidal oscillation
+  gilgamesh   - Multi-axis projection
+  shiva       - Gradient decay
+  ifrit       - Squared sine spikes
+  min_p       - Adaptive gating: only blend where |delta| >= min_p * max(|delta|)
+
+SCHEDULES (7):
+  linear, cosine, sigmoid, tau, wave, learnable, adaptive
+
+AGGREGATIONS (19):
+  Basic:      mean, sum, max, min, first, last
+  Top/Bottom: top_k, bottom_k
+  Softmax:    softmax, softmin
+  Adaptive:   min_p (keeps steps where score >= min_p * max_score)
+  Weighted:   weighted, triangular
+  Similarity: similarity, cross_similarity, similarity_tree
+  Spherical:  slerp
+  Learned:    attention, learnable
+
+PRESETS:
+  'alucard'     - lerp + tau + mean (original Alucard behavior)
+  'slerp'       - slerp + linear + weighted
+  'slip'        - slip + cosine + similarity
+  'zeus'        - zeus + sigmoid + last
+  'gilgamesh'   - gilgamesh + linear + triangular
+  'shiva'       - shiva + cosine + similarity_tree
+  'ifrit'       - ifrit + wave + softmax
+  'learnable'   - lerp + learnable schedule + learnable aggregation
+  'fingerprint' - lerp + cosine + similarity (fingerprint preservation)
+  'min_p'       - min_p blend + linear + min_p aggregation
+
+MASKING:
+  All components support alpha (continuous) and binary (hard) masking.
+  - Alpha mask [0,1]: gradual blend with original
+  - Binary mask {0,1}: hard preservation/processing
+  - Fingerprint zones (mask=0) pass through unchanged
+  - binarize_mask(alpha_mask, threshold=0.5) converts alpha to binary
+
+USAGE:
+  from geofractal.router.components.aggregation_component import (
+      FieldWalkerFusion, from_preset, get_blend_mode, get_aggregation
+  )
+
+  # From preset
+  walker = from_preset('my_walker', 'slerp', in_features=256, num_steps=8)
+
+  # With masking (fingerprint first 8 tokens)
+  mask = torch.zeros(B, T)
+  mask[:, 8:] = 1.0
+  output = walker(source, target, mask=mask)
+
+  # Custom configuration
+  walker = FieldWalkerFusion(
+      'custom', in_features=256, num_steps=8,
+      blend_mode='slip', schedule='cosine', aggregation='min_p',
+      learnable_steps=True
+  )
+
+PENDING ABLATION TESTS:
+  - BlendMode comparison across modalities (vision, text, audio)
+  - Optimal num_steps for different tasks
+  - min_p threshold sensitivity analysis
+  - Learnable schedule convergence behavior
+  - Fingerprint preservation accuracy metrics
+  - Aggregation strategy impact on gradient flow
+
+================================================================================
 VERSION HISTORY
 ================================================================================
+
+v1.0.4 (2025-12-24):
+- EXPERIMENTAL: aggregation_component.py (pending ablation)
+  - FieldWalkerFusion: Multi-step interpolative fusion
+  - 11 BlendModes (lerp, slerp, slip, zeus, min_p, etc.)
+  - 7 Schedules (linear, cosine, learnable, adaptive, etc.)
+  - 19 Aggregations (mean, top_k, min_p, similarity_tree, etc.)
+  - Universal masking: alpha (continuous) + binary (hard)
+  - Fingerprint preservation for protected zones
+  - 10 presets including 'min_p' and 'fingerprint'
 
 v1.0.3 (2025-12-24):
 - Lyra-derived binding components:
@@ -814,6 +920,11 @@ QUICK LOOKUPS
 "Where is InceptiveFusion (auxiliary feature injection)?"
 -> src/geofractal/router/components/fusion_component.py
 -> InceptiveFusion class
+
+"Where is FieldWalkerFusion / multi-step interpolation?" [EXPERIMENTAL]
+-> src/geofractal/router/components/aggregation_component.py
+-> FieldWalkerFusion, BlendModes (lerp/slerp/slip/min_p), Aggregations (19 types)
+-> Presets: 'alucard', 'slerp', 'slip', 'min_p', 'fingerprint', etc.
 
 "Where is geometric routing?"
 -> src/geofractal/router/prefab/notifier_router.py

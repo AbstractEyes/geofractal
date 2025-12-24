@@ -547,7 +547,7 @@ class TauSchedule(Schedule):
         t = torch.linspace(0, 1, num_steps)
         tau_scale = 1 - torch.exp(-self.tau * t)
         sigma = torch.sin(math.pi * t)
-        return tau_scale * sigma
+        return (tau_scale * sigma).clamp(0, 1)
 
 
 class WaveSchedule(Schedule):
@@ -559,7 +559,7 @@ class WaveSchedule(Schedule):
 
     def forward(self, num_steps: int, batch_size: int = 1) -> Tensor:
         t = torch.linspace(0, 1, num_steps)
-        return torch.sin(self.freq * math.pi * t)
+        return torch.sin(self.freq * math.pi * t).clamp(0, 1)
 
 
 class LearnableSchedule(Schedule):
