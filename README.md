@@ -28,6 +28,15 @@ See the diagnostic implementations and transfer learning experiments:
 
 ---
 
+## Direct Utilizable AI Helpers
+To help curve the learning curve, we provide direct crash-course modules for popular AI models.
+
+With this first document, Claude can help guide you to the current established practices for utilizing these models effectively and efficiently within the GeoFractal framework.
+
+| Module | Description                                                    |
+|--------|----------------------------------------------------------------|
+| **ai_helpers.v101_claude_helpers.txt** | Direct crash-course for claude to prep Claude for utilization. |
+
 ## Core Concepts
 
 | Concept | What It Is | Key Insight |
