@@ -1,0 +1,827 @@
+# 101_claude.txt
+# GeoFractal Router - Claude Reference Guide
+# Last Updated: 2025-12-24 (v1.0.2)
+
+# Official router repo:
+# https://github.com/AbstractEyes/geofractal
+
+# If you are another assistant than Claude, please attempt to follow the guidelines
+# and answer questions about the geofractal.router package to the best of your ability.
+
+# Package predominantly omits "src." and defaults to geofractal in PYTHONPATH:
+# from geofractal.router.base_router import BaseRouter
+
+# Package contains many elements that are not related to the router itself:
+# Pay predominant attention to src/geofractal/router/
+
+# New scripts created with the geofractal.router package should follow the apache 2.0 license,
+# unless the license of the new script explicitly states otherwise - while many components are listed MIT instead of apache 2.0,
+# the overall package is apache 2.0 and new code should follow that license for compatibility.
+
+# If prompted for request the environment setup for geofractal.router in Colab or Jupyter.
+# If the prompt is related to juyter notebooks, colab, or google colab, please don't include "argparse" or command line setup instructions.
+
+# ================================================================================
+# COLAB / NOTEBOOK SETUP
+# ================================================================================
+# Standard installation block for experiments:
+#
+# ```python
+# # Install/update geofractal
+# try:
+#     !pip uninstall -qy geofractal geometricvocab
+# except:
+#     pass
+# !pip install -q git+https://github.com/AbstractEyes/geofractal.git
+# ```
+#
+# Run this cell first in any new Colab notebook to ensure latest version.
+# The uninstall step prevents version conflicts from cached installs.
+# ================================================================================
+
+================================================================================
+REPO DIRECTORY STRUCTURE
+================================================================================
+ai_helpers/
+└──101_claude.txt             # THIS FILE, version 1.0.2
+
+src/geofractal/router/
+├── __init__.py
+├── base_component.py          # ABC - pure Python, no torch
+├── base_port.py               # ABC - port protocol (also in ports/)
+├── base_router.py             # ABC - nn.Module, components/objects/_cache
+├── base_tower.py              # BaseRouter + stages (nn.ModuleList)
+├── wide_router.py             # BaseRouter + wide execution + torch.compile
+├── benchmark_router.py        # Performance benchmarks
+├── GETTING_STARTED.md         # Full tutorial
+├── QUICK_BUILD.md             # Cheat sheet
+├── Router_Transfer_Learning-12_19_25.ipynb
+│
+├── components/
+│   ├── __init__.py
+│   ├── torch_component.py                    # BaseComponent + nn.Module
+│   ├── address_component.py                  # Geometric identity (Spherical, etc.)
+│   ├── cantor_address_component.py           # Cantor-based addressing
+│   ├── cantor_euclidean_attention_component.py
+│   ├── data_component.py                     # Data flow components
+│   ├── embedding_component.py                # Embedding variants
+│   ├── encoder_data_component.py             # Encoder data handling
+│   ├── fusion_component.py                   # FusionComponent + all strategies
+│   ├── projection_component.py               # Shape transformations
+│   ├── rope_component.py                     # Rotary position embeddings
+│   ├── rope_eval.py                          # RoPE evaluation
+│   ├── beatrix_rope_test.py                  # Beatrix RoPE tests
+│   ├── transformer_component.py              # Transformer blocks
+│   ├── wormhole_attention_component.py       # Wormhole attention mechanism
+│   │
+│   └── diagnostics/
+│       ├── __init__.py
+│       ├── fusion_diagnostic.py
+│       ├── fusion_diagnostics_frozen.py
+│       ├── fusion_diagnostics_multi_tower.py
+│       └── TowerDiagnosticStressTest.ipynb
+│
+├── ports/
+│   ├── __init__.py
+│   ├── torch_port.py          # TorchPort - device/dtype management
+│   └── qwen.py                # QwenPort - Qwen family encoders
+│
+└── prefab/
+    ├── __init__.py
+    ├── notifier_router.py                 # Geometric message routing
+    ├── geometric_tower_builder.py         # ConfigurableTower, ConfigurableCollective
+    ├── geometric_conv_tower_builder.py    # ConvTower, multi-channel VAE support
+    ├── geometric_towers.py                # Pre-built tower configurations
+    ├── fusion_builder.py                  # ConfigurableFusion, FusionCollective, FusionBuilder
+    ├── debug_geometric_towers.py          # Debug utilities
+    ├── train_test_towers.py               # Training/testing utilities
+    │
+    └── agatha/
+        ├── __init__.py
+        ├── beatrix.py                     # Beatrix core model
+        ├── beatrix_collective.py          # Beatrix collective implementation
+        ├── beatrix_trainer.py             # Training logic
+        ├── beatrix_oscillator.py          # Oscillator component
+        ├── beatrix_tension_oscillator.py  # Tension-based oscillator
+        ├── beatrix_oscillator_test.py     # Oscillator tests
+        ├── beatrix_integration_test.py    # Integration tests
+        ├── head_router.py                 # Head routing logic
+        ├── head_router_tester.py          # Head router tests
+        ├── cifar100_core_test.py          # CIFAR-100 experiments
+        └── BEATRIX_CORE.md                # Beatrix documentation
+
+================================================================================
+CLASS HIERARCHY
+================================================================================
+
+COMPONENTS (building blocks):
+-----------------------------
+BaseComponent (ABC, pure Python)  [base_component.py]
+    - name: str
+    - uuid: str
+    - parent: Optional[BaseRouter]
+    - on_attach(), on_detach()
+    │
+    └── TorchComponent (BaseComponent + nn.Module)  [components/torch_component.py]
+            - home_device, allowed_devices
+            - forward()
+            │
+            ├── AddressComponent                    [components/address_component.py]
+            │   └── SphericalAddressComponent
+            │   └── HyperbolicAddressComponent
+            │
+            ├── CantorAddressComponent              [components/cantor_address_component.py]
+            │
+            ├── FusionComponent                     [components/fusion_component.py]
+            │   │
+            │   │   # Basic strategies
+            │   ├── AdaptiveFusion         # Content-dependent weights (Lyra pattern)
+            │   ├── GatedFusion            # Learned sigmoid gates
+            │   ├── AttentionFusion        # Cross-attention between inputs
+            │   ├── ConcatFusion           # Concatenate then project
+            │   ├── SumFusion              # Weighted sum
+            │   ├── BilinearFusion         # Bilinear interaction (2 inputs)
+            │   ├── ResidualFusion         # Fuse with residual connection
+            │   ├── SlotFusion             # Fuse across slot dimension
+            │   │
+            │   │   # Geometric strategies (from David)
+            │   ├── GeometricAttentionGate # Cayley-Menger + Angular + MHA combined
+            │   ├── CantorScaleFusion      # Fractal geometry routing (70/30 blend)
+            │   └── HierarchicalTreeGating # Binary tree decisions
+            │
+            ├── EmbeddingComponent                  [components/embedding_component.py]
+            │
+            ├── ProjectionComponent                 [components/projection_component.py]
+            │
+            ├── RoPEComponent                       [components/rope_component.py]
+            │
+            ├── TransformerComponent                [components/transformer_component.py]
+            │
+            ├── WormholeAttentionComponent          [components/wormhole_attention_component.py]
+            │
+            ├── CantorEuclideanAttentionComponent   [components/cantor_euclidean_attention_component.py]
+            │
+            │   # Fusion Controllers [prefab/fusion_builder.py]
+            ├── AlphaController            # Neighbor bleed-over strength [0, 0.5]
+            ├── BetaController             # Geometric vs learned balance [0, 1]
+            ├── GammaController            # Per-input importance weights (softmax)
+            └── FusionControllerBundle     # Bundle of α/β/γ controllers
+
+ROUTERS (coordination):
+-----------------------
+BaseRouter (ABC, nn.Module)  [base_router.py]
+    - name: str
+    - components: nn.ModuleDict    # Learnable modules
+    - objects: dict                # Config, metadata (NO TENSORS!)
+    - _cache: dict                 # Ephemeral tensors (optional)
+    │
+    ├── BaseTower (BaseRouter + stages)  [base_tower.py]
+    │       - stages: nn.ModuleList
+    │       - append(), extend()
+    │       - tower[0] = stage, tower['name'] = component
+    │       │
+    │       ├── ConfigurableTower       [prefab/geometric_tower_builder.py]
+    │       └── ConfigurableConvTower   [prefab/geometric_conv_tower_builder.py]
+    │
+    ├── WideRouter (BaseRouter + wide execution)  [wide_router.py]
+    │       - tower_names: List[str]
+    │       - discover_towers()
+    │       - wide_forward(x) -> Dict[name, output]
+    │       - prepare_and_compile()
+    │       - clear_tower_caches()
+    │       │
+    │       ├── ConfigurableCollective   [prefab/geometric_tower_builder.py]
+    │       ├── ConvTowerCollective      [prefab/geometric_conv_tower_builder.py]
+    │       └── FusionCollective         [prefab/fusion_builder.py]
+    │
+    ├── ConfigurableFusion (BaseRouter + fusion stages)  [prefab/fusion_builder.py]
+    │       - topology: PARALLEL | SEQUENTIAL | HIERARCHICAL | BLEND
+    │       - stages: fusion components
+    │       - controllers: α/β/γ bundle
+    │
+    ├── NotifierRouter (BaseRouter + messaging)  [prefab/notifier_router.py]
+    │       - register(address, channel)
+    │       - post(address, message, channel)
+    │       - route()
+    │
+    └── HeadRouter  [prefab/agatha/head_router.py]
+
+AGATHA/BEATRIX SYSTEM:  [prefab/agatha/]
+-----------------------
+beatrix.py                    # Core Beatrix model
+beatrix_collective.py         # Collective implementation
+beatrix_trainer.py            # Training logic
+beatrix_oscillator.py         # Oscillator dynamics
+beatrix_tension_oscillator.py # Tension-based oscillator
+head_router.py                # Head routing
+
+PORTS (encoder wrappers):
+-------------------------
+BasePort (ABC, pure Python)  [base_port.py]
+    - preprocess(raw) -> prepared
+    - encode(prepared) -> encoded
+    - postprocess(encoded) -> output
+    - load(), unload()
+    │
+    └── TorchPort (BasePort + device/dtype)  [ports/torch_port.py]
+            - to(), cuda(), cpu()
+            - half(), float(), bfloat16()
+            - freeze(), unfreeze()
+            │
+            └── QwenPort  [ports/qwen.py]
+
+================================================================================
+FUSION BUILDER SYSTEM
+================================================================================
+
+The FusionBuilder mirrors ConfigurableTower for fusion operations.
+
+TOPOLOGIES:
+-----------
+PARALLEL:     (x1,x2,x3,x4,x5) ──→ [Fusion] ──→ output
+
+SEQUENTIAL:   x1 ─┬→ [F1] ─┬→ [F2] ─┬→ [F3] ─┬→ [F4] → output
+              x2 ─┘        │        │        │
+              x3 ──────────┘        │        │
+              x4 ───────────────────┘        │
+              x5 ────────────────────────────┘
+
+HIERARCHICAL: x1 ─┬→ [F] ─┐
+              x2 ─┘       ├→ [F] ─┐
+              x3 ─┬→ [F] ─┘       ├→ [F] → output
+              x4 ─┘               │
+              x5 ─────────────────┘
+
+BLEND:        inputs ──→ [Adaptive] ──┐
+                    └──→ [Geometric] ─┼──→ β-blend → output
+
+STRATEGIES:
+-----------
+FusionStrategy.ADAPTIVE     -> AdaptiveFusion
+FusionStrategy.GATED        -> GatedFusion
+FusionStrategy.ATTENTION    -> AttentionFusion
+FusionStrategy.CONCAT       -> ConcatFusion
+FusionStrategy.SUM          -> SumFusion
+FusionStrategy.BILINEAR     -> BilinearFusion
+FusionStrategy.GEOMETRIC    -> GeometricAttentionGate
+FusionStrategy.CANTOR       -> CantorScaleFusion
+FusionStrategy.TREE         -> HierarchicalTreeGating
+
+CONTROLLERS:
+------------
+Alpha (α): Neighbor bleed-over, range [0, 0.5], default 0.1
+           α=0: Hard attention, α=0.5: 50% bleed to neighbors
+
+Beta (β):  Pathway balance, range [0, 1], default 0.5
+           β=0: Fully learned, β=1: Fully geometric
+
+Gamma (γ): Per-input importance weights, softmax normalized
+           Used for weighting expert opinions or scale outputs
+
+PRESETS:
+--------
+'simple'       -> Adaptive, parallel, no controllers
+'geometric'    -> GeometricAttentionGate, parallel, β controller
+'cantor'       -> CantorScaleFusion, parallel, α controller
+'hierarchical' -> HierarchicalTreeGating, parallel, γ controller
+'david'        -> Geometric, blend topology, α + β + γ controllers
+'liminal'      -> Adaptive, hierarchical, α + β + γ (per-stage)
+
+USAGE:
+------
+```python
+from geofractal.router.prefab.fusion_builder import (
+    FusionBuilder, ConfigurableFusion, FusionCollective,
+    FusionConfig, FusionTopology, FusionStrategy, ControllerConfig
+)
+
+# Quick build - single strategy
+fusion = FusionBuilder.simple('my_fusion', num_inputs=5, in_features=256)
+output = fusion(x1, x2, x3, x4, x5)
+
+# From preset
+fusion = FusionBuilder.preset('geo_fusion', 'geometric', num_inputs=8, in_features=512)
+
+# Full config
+config = FusionConfig(
+    num_inputs=5,
+    in_features=256,
+    topology=FusionTopology.BLEND,
+    stages=[
+        FusionStageSpec(strategy=FusionStrategy.ADAPTIVE),
+        FusionStageSpec(strategy=FusionStrategy.GEOMETRIC),
+    ],
+    controllers=ControllerConfig(
+        use_alpha=True, alpha_init=0.1,
+        use_beta=True, beta_init=0.7,
+        use_gamma=True
+    ),
+)
+fusion = ConfigurableFusion('my_fusion', config)
+
+# Fusion collective - multiple pipelines
+collective = FusionCollective('ensemble', num_inputs=5, in_features=256)
+collective.add_preset('learned', 'simple')
+collective.add_preset('geometric', 'geometric')
+collective.add_preset('fractal', 'cantor')
+collective.finalize()
+output = collective(x1, x2, x3, x4, x5)
+```
+
+================================================================================
+STORAGE MODEL
+================================================================================
+
+EVERY BaseRouter (and subclasses) has THREE storage mechanisms:
+
+┌─────────────┬──────────────────┬─────────────┬──────────────┬─────────────────┐
+│ Storage     │ Type             │ .to() moves │ state_dict   │ Use For         │
+├─────────────┼──────────────────┼─────────────┼──────────────┼─────────────────┤
+│ components  │ nn.ModuleDict    │ ✅ Yes      │ ✅ Yes       │ nn.Module       │
+│ objects     │ dict             │ ❌ No       │ ❌ No        │ Config, metadata│
+│ _cache      │ dict             │ ❌ No       │ ❌ No        │ Ephemeral tensor│
+└─────────────┴──────────────────┴─────────────┴──────────────┴─────────────────┘
+
+CRITICAL RULES:
+1. NEVER store tensors in objects[] - causes memory leaks
+2. Cache is OPTIONAL - most towers don't need it
+3. Use local variables for data used only within forward()
+4. Use cache ONLY when external code needs tensors after forward() returns
+
+================================================================================
+CACHE API
+================================================================================
+
+Methods on BaseRouter:
+- cache_set(key, value)           # Store tensor
+- cache_get(key, default=None)    # Retrieve tensor
+- cache_clear()                   # Clear this router only
+- cache_clear_recursive()         # Clear entire tree
+- cache_keys()                    # List keys
+- cache_size_bytes()              # Estimate VRAM
+- cache_to(device, dtype)         # Move cache explicitly
+- cache_to_recursive(...)         # Move entire tree
+- cache_debug(prefix='')          # Debug state across tree
+- reset()                         # Clears cache recursively
+
+WHEN TO USE CACHE:
+- Tower exposes features for collective to retrieve
+- ConfigurableTower pattern (cache_set in forward, collective clears)
+- Data must persist after forward() returns
+
+WHEN NOT TO USE CACHE:
+- Residual connection within forward() -> use local variable
+- Gate computation within forward() -> use local variable
+- Simple feedforward tower -> no cache needed
+
+================================================================================
+COMPONENT VS RAW NN.MODULE
+================================================================================
+
+STAGES (tower.append):
+- ✅ ALWAYS use TorchComponent subclasses
+- ❌ NEVER use raw nn.Linear, nn.Sequential, etc.
+
+NAMED COMPONENTS (self.attach('name', module)):
+- ✅ OK to use raw nn.Module (nn.LayerNorm, nn.Linear)
+- ✅ OK to use TorchComponent
+- These are auxiliaries, not pipeline stages
+
+WHY COMPONENTS FOR STAGES:
+- Identity (name, uuid) for addressing
+- Lifecycle hooks (on_attach, on_detach)
+- Device affinity controls
+- Parent awareness
+- Capturable opinions at each level
+- Block-level freezing/distillation/replacement
+
+================================================================================
+KEY PATTERNS
+================================================================================
+
+SIMPLE TOWER (no cache):
+```python
+class SimpleTower(BaseTower):
+    def __init__(self, name, dim):
+        super().__init__(name, strict=False)
+        for i in range(depth):
+            self.append(FFNBlock(f'{name}_ffn_{i}', dim))
+        self.attach('norm', nn.LayerNorm(dim))
+
+    def forward(self, x):
+        residual = x  # LOCAL VARIABLE
+        for stage in self.stages:
+            x = stage(x)
+        return self['norm'](x) + residual
+```
+
+FEATURE-EXPOSING TOWER (uses cache):
+```python
+class FeatureTower(BaseTower):
+    def forward(self, x):
+        for stage in self.stages:
+            x = stage(x)
+        self.cache_set('features', x)  # For collective
+        return self['proj'](x)
+```
+
+SIMPLE COLLECTIVE (no cache clearing):
+```python
+class SimpleCollective(WideRouter):
+    def forward(self, x):
+        opinions = self.wide_forward(x)
+        return self['fusion'](*opinions.values())
+```
+
+FEATURE COLLECTIVE (clears cache):
+```python
+class FeatureCollective(WideRouter):
+    def forward(self, x):
+        opinions = self.wide_forward(x)
+        features = [self[n].cache_get('features') for n in self.tower_names]
+        self.clear_tower_caches()  # AFTER retrieval
+        return self['fusion'](*opinions.values())
+```
+
+FUSION WITH CONTROLLERS:
+```python
+from geofractal.router.prefab.fusion_builder import FusionBuilder
+
+# Quick: single strategy
+fusion = FusionBuilder.simple('fuse', num_inputs=5, in_features=256)
+
+# Preset with geometric attention
+fusion = FusionBuilder.preset('fuse', 'david', num_inputs=5, in_features=256)
+
+# Access controller values
+if fusion.controllers:
+    alpha = fusion.controllers.get_alpha()
+    beta = fusion.controllers.get_beta()
+    gamma = fusion.controllers.get_gamma()
+    diagnostics = fusion.controllers.get_diagnostics()
+```
+
+================================================================================
+ANTI-PATTERNS
+================================================================================
+
+❌ self.objects['tensor'] = tensor        # MEMORY LEAK
+❌ self.cache_set('residual', x)          # Use local variable
+❌ tower.append(nn.Linear(d, d))          # Use TorchComponent
+❌ torch.compile(wide_router)              # Use prepare_and_compile()
+❌ model.to('cuda')                        # Use network_to()
+❌ Forget to clear cache in collective     # VRAM accumulates
+
+================================================================================
+DEVICE MOVEMENT
+================================================================================
+
+network_to() vs .to():
+- network_to(device, dtype, clear_cache=True) - SAFE, clears cache
+- .to(device) - UNSAFE, cache stays on old device
+
+PATTERN:
+```python
+model.reset()  # Clear any stale cache
+model.network_to(device='cuda')
+compiled = model.prepare_and_compile()
+```
+
+ACCELERATE:
+```python
+model.reset()  # BEFORE prepare
+model = accelerate.prepare(model)
+```
+
+================================================================================
+QUESTIONS TO ASK PER TASK
+================================================================================
+
+WHEN CREATING A COMPONENT:
+1. Does it need learnable parameters? -> TorchComponent
+2. Is it a stage in a tower? -> Must be TorchComponent
+3. Does it need device affinity? -> Use home_device, allowed_devices
+4. Does it need lifecycle hooks? -> Implement on_attach(), on_detach()
+
+WHEN CREATING A TOWER:
+1. Does it expose intermediates? -> Use cache_set()
+2. Is data used only in forward()? -> Use local variable
+3. Are stages components? -> Must be TorchComponent subclasses
+4. Does it need strict hardware control? -> Set strict=True
+
+WHEN CREATING A COLLECTIVE:
+1. How many towers? -> 4+ use WideRouter
+2. Same input to all towers? -> Use wide_forward()
+3. Do towers use cache? -> Call clear_tower_caches() after retrieval
+4. Need geometric routing? -> Add NotifierRouter
+
+WHEN CREATING A FUSION:
+1. How many inputs? -> num_inputs parameter
+2. Need dimension change? -> out_features parameter
+3. Need geometric attention? -> Use 'geometric' or 'cantor' preset
+4. Need blending control? -> Enable β controller
+5. Need neighbor bleed? -> Enable α controller
+6. Need input weighting? -> Enable γ controller
+7. Multiple fusion strategies? -> Use FusionCollective
+
+WHEN DEBUGGING MEMORY:
+1. Check cache: model.cache_debug()
+2. Check VRAM: model.cache_size_bytes()
+3. Force clear: model.reset()
+4. Look for objects[] tensor storage: grep "self.objects\["
+
+WHEN MODIFYING EXISTING CODE:
+1. Check storage type: components vs objects vs cache
+2. Check if tower uses cache
+3. Check if collective clears cache
+4. Check device movement uses network_to()
+
+================================================================================
+FILE RESPONSIBILITIES
+================================================================================
+
+CORE (router/):
+---------------
+base_component.py       - BaseComponent ABC, identity, lifecycle hooks
+base_router.py          - Cache system, component attachment, device movement
+base_tower.py           - Stage management, dual indexing, example towers
+wide_router.py          - Tower discovery, wide execution, compile integration
+base_port.py            - Port protocol ABC
+benchmark_router.py     - Performance benchmarks
+
+COMPONENTS (router/components/):
+--------------------------------
+torch_component.py                    - TorchComponent base, device affinity
+address_component.py                  - Spherical, Hyperbolic addressing
+cantor_address_component.py           - Cantor-based geometric addressing
+cantor_euclidean_attention_component.py - Cantor + Euclidean attention
+data_component.py                     - Data flow components
+embedding_component.py                - Embedding variants
+encoder_data_component.py             - Encoder data handling
+fusion_component.py                   - FusionComponent + all strategies
+projection_component.py               - Shape transformations (SlotProjection)
+rope_component.py                     - Rotary position embeddings
+transformer_component.py              - Transformer block components
+wormhole_attention_component.py       - Wormhole attention mechanism
+
+FUSION STRATEGIES (in fusion_component.py):
+-------------------------------------------
+Basic:
+  AdaptiveFusion       - Content-dependent weights (Lyra pattern)
+  GatedFusion          - Learned sigmoid gates per input
+  AttentionFusion      - Cross-attention between inputs
+  ConcatFusion         - Concatenate then project
+  SumFusion            - Weighted sum with learnable weights
+  BilinearFusion       - Bilinear interaction (exactly 2 inputs)
+  ResidualFusion       - Fuse with residual connection
+  SlotFusion           - Fuse across slot dimension
+
+Geometric (from David):
+  GeometricAttentionGate   - Cayley-Menger volume + Angular + MHA
+  CantorScaleFusion        - Fractal coordinate routing (70/30 blend)
+  HierarchicalTreeGating   - Binary tree probability routing
+
+DIAGNOSTICS (router/components/diagnostics/):
+---------------------------------------------
+fusion_diagnostic.py              - Fusion analysis
+fusion_diagnostics_frozen.py      - Frozen encoder tests
+fusion_diagnostics_multi_tower.py - Multi-tower stress tests
+
+PORTS (router/ports/):
+----------------------
+torch_port.py           - TorchPort base, device/dtype management
+qwen.py                 - QwenPort, Qwen family encoders
+
+PREFAB (router/prefab/):
+------------------------
+notifier_router.py              - Geometric message routing
+geometric_tower_builder.py      - ConfigurableTower, ConfigurableCollective
+geometric_conv_tower_builder.py - ConvTower, multi-channel VAE support
+geometric_towers.py             - Pre-built tower configurations
+fusion_builder.py               - FusionBuilder, ConfigurableFusion, FusionCollective
+debug_geometric_towers.py       - Debug utilities for towers
+train_test_towers.py            - Training/testing utilities
+
+FUSION BUILDER (in fusion_builder.py):
+--------------------------------------
+FusionTopology         - Enum: PARALLEL, SEQUENTIAL, HIERARCHICAL, BLEND
+FusionStrategy         - Enum: ADAPTIVE, GATED, ATTENTION, CONCAT, etc.
+ControllerConfig       - Dataclass: α/β/γ controller settings
+FusionStageSpec        - Dataclass: single stage specification
+FusionConfig           - Dataclass: complete fusion configuration
+
+AlphaController        - TorchComponent: neighbor bleed-over
+BetaController         - TorchComponent: pathway balance
+GammaController        - TorchComponent: input importance weights
+FusionControllerBundle - TorchComponent: bundle of controllers
+
+FusionBuilder          - Factory class with build_stage(), preset(), simple()
+ConfigurableFusion     - BaseRouter: multi-stage fusion with controllers
+FusionCollective       - WideRouter: multiple fusion pipelines
+
+AGATHA/BEATRIX (router/prefab/agatha/):
+---------------------------------------
+beatrix.py                    - Core Beatrix model
+beatrix_collective.py         - Beatrix collective implementation
+beatrix_trainer.py            - Training logic for Beatrix
+beatrix_oscillator.py         - Oscillator dynamics
+beatrix_tension_oscillator.py - Tension-based oscillator variant
+head_router.py                - Head routing logic
+cifar100_core_test.py         - CIFAR-100 experiments
+BEATRIX_CORE.md               - Beatrix documentation
+
+================================================================================
+VERSION HISTORY
+================================================================================
+
+v1.0.2 (2025-12-24):
+- FusionBuilder system (mirrors ConfigurableTower for fusion)
+- Geometric fusion strategies from David:
+  - GeometricAttentionGate (Cayley-Menger + Angular + MHA)
+  - CantorScaleFusion (fractal routing)
+  - HierarchicalTreeGating (binary tree)
+- Fusion controllers (α/β/γ)
+- FusionCollective for multi-pipeline fusion
+- All fusion strategies now accept out_features
+
+v1.0.1 (2025-12-23):
+- Cache system added to BaseRouter
+- Memory leak fix (objects[] -> cache_set())
+- network_to() clears cache by default
+- Multi-channel VAE support
+- Documentation overhaul
+
+v1.0.0-beta (2025-12-23):
+- Port system (BasePort, TorchPort, QwenPort)
+- WideRouter compile optimizations
+
+v0.2.1:
+- WideRouter, BaseTower, TorchComponent
+
+v0.1.0:
+- Initial release
+
+================================================================================
+COHESIVENESS RULES
+================================================================================
+
+1. STAGES ARE COMPONENTS
+   Every tower stage must be a TorchComponent subclass.
+   This enables uniform output capture, block-level operations.
+
+2. STORAGE SEPARATION
+   - Modules in components[]
+   - Config in objects[]
+   - Ephemeral tensors in _cache (if needed)
+   Never mix these.
+
+3. CACHE IS OPTIONAL
+   Most towers don't need cache. Only use when:
+   - External code retrieves tensors after forward()
+   - Collective needs intermediate features
+
+4. LOCAL VARIABLES FIRST
+   If data is only used within forward(), use a local variable.
+   Cache adds overhead and requires clearing.
+
+5. COLLECTIVE CLEARS CACHE
+   If towers use cache, the collective must clear it.
+   Tower sets -> Collective gets -> Collective clears.
+
+6. DEVICE MOVEMENT VIA network_to()
+   Always use network_to() in production.
+   Clears cache by default, updates device constraints.
+
+7. COMPILE VIA prepare_and_compile()
+   Never use raw torch.compile() on WideRouter.
+   prepare_and_compile() handles analysis first.
+
+8. COMPONENT IDENTITY
+   Every component has name + uuid.
+   Use meaningful names for debugging.
+
+9. OPINIONS NOT OUTPUTS
+   Towers produce opinions (local conclusions).
+   Collectives triangulate truth from divergent viewpoints.
+
+10. DIVERGENCE OVER ACCURACY
+    Individual towers don't need to be accurate.
+    They need to see differently.
+
+11. UNIFORM FUSION SIGNATURES
+    All FusionComponent subclasses accept out_features parameter.
+    Use out_proj when input/output dimensions differ.
+
+================================================================================
+QUICK LOOKUPS
+================================================================================
+
+"Baseline crash-course human tutorial?"
+-> src/geofractal/router/GETTING_STARTED.md
+
+"Cheat sheet?"
+-> src/geofractal/router/QUICK_BUILD.md
+-> Not particularly effective for Claude, good for humans.
+
+"Where is the cache system?"
+-> src/geofractal/router/base_router.py, _cache dict and cache_* methods
+
+"Where are tower stages managed?"
+-> src/geofractal/router/base_tower.py, stages: nn.ModuleList
+
+"Where is wide execution?"
+-> src/geofractal/router/wide_router.py, wide_forward()
+
+"Where is the memory leak fix?"
+-> src/geofractal/router/prefab/geometric_tower_builder.py
+-> src/geofractal/router/prefab/geometric_conv_tower_builder.py
+-> Changed objects['_cached_features'] to cache_set('features', ...)
+
+"Where are fusion strategies?"
+-> src/geofractal/router/components/fusion_component.py
+
+"Where is the fusion builder?"
+-> src/geofractal/router/prefab/fusion_builder.py
+-> FusionBuilder, ConfigurableFusion, FusionCollective
+
+"Where are fusion controllers?"
+-> src/geofractal/router/prefab/fusion_builder.py
+-> AlphaController, BetaController, GammaController, FusionControllerBundle
+
+"Where is geometric attention (Cayley-Menger)?"
+-> src/geofractal/router/components/fusion_component.py
+-> GeometricAttentionGate class
+
+"Where is Cantor fusion routing?"
+-> src/geofractal/router/components/fusion_component.py
+-> CantorScaleFusion class
+
+"Where is tree-based gating?"
+-> src/geofractal/router/components/fusion_component.py
+-> HierarchicalTreeGating class
+
+"Where is geometric routing?"
+-> src/geofractal/router/prefab/notifier_router.py
+-> src/geofractal/router/components/address_component.py
+
+"Where is Cantor addressing?"
+-> src/geofractal/router/components/cantor_address_component.py
+-> src/geofractal/router/components/cantor_euclidean_attention_component.py
+
+"Where is wormhole attention?"
+-> src/geofractal/router/components/wormhole_attention_component.py
+
+"Where are transformer blocks?"
+-> src/geofractal/router/components/transformer_component.py
+
+"Where is multi-channel VAE support?"
+-> src/geofractal/router/prefab/geometric_conv_tower_builder.py
+-> FlexibleInputComponent, preset_flux_vae_towers(), preset_sd_vae_towers()
+
+"Where are encoder ports?"
+-> src/geofractal/router/ports/torch_port.py (base)
+-> src/geofractal/router/ports/qwen.py (Qwen family)
+
+"Where is RoPE?"
+-> src/geofractal/router/components/rope_component.py
+-> src/geofractal/router/components/rope_eval.py
+
+"Where are embeddings?"
+-> src/geofractal/router/components/embedding_component.py
+
+"Where is projection/slot handling?"
+-> src/geofractal/router/components/projection_component.py
+
+"Where is Beatrix?"
+-> src/geofractal/router/prefab/agatha/beatrix.py (core)
+-> src/geofractal/router/prefab/agatha/beatrix_collective.py (collective)
+-> src/geofractal/router/prefab/agatha/beatrix_trainer.py (training)
+-> src/geofractal/router/prefab/agatha/BEATRIX_CORE.md (docs)
+
+"Where are oscillator dynamics?"
+-> src/geofractal/router/prefab/agatha/beatrix_oscillator.py
+-> src/geofractal/router/prefab/agatha/beatrix_tension_oscillator.py
+
+"Where is head routing?"
+-> src/geofractal/router/prefab/agatha/head_router.py
+
+"Where are diagnostics?"
+-> src/geofractal/router/components/diagnostics/fusion_diagnostic.py
+-> src/geofractal/router/components/diagnostics/fusion_diagnostics_frozen.py
+-> src/geofractal/router/components/diagnostics/fusion_diagnostics_multi_tower.py
+
+"Where are CIFAR-100 experiments?"
+-> src/geofractal/router/prefab/agatha/cifar100_core_test.py
+
+"Where are pre-built tower configs?"
+-> src/geofractal/router/prefab/geometric_towers.py
+
+"Where are debug utilities?"
+-> src/geofractal/router/prefab/debug_geometric_towers.py
+
+"Where is training/testing infrastructure?"
+-> src/geofractal/router/prefab/train_test_towers.py
+
+================================================================================
+END OF REFERENCE
+================================================================================

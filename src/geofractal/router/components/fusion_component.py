@@ -151,13 +151,20 @@ class SumFusion(FusionComponent):
             name: str,
             num_inputs: int,
             in_features: int,
+            out_features: Optional[int] = None,
             normalize: bool = True,
             **kwargs,
     ):
-        super().__init__(name, num_inputs, in_features, in_features, **kwargs)
+        super().__init__(name, num_inputs, in_features, out_features, **kwargs)
 
         self.normalize = normalize
         self.weights = nn.Parameter(torch.ones(num_inputs))
+
+        # Output projection if dimensions differ
+        if self.out_features != in_features:
+            self.out_proj = nn.Linear(in_features, self.out_features)
+        else:
+            self.out_proj = None
 
     def fuse(self, *inputs: Tensor) -> Tensor:
         weights = F.softmax(self.weights, dim=0) if self.normalize else self.weights
@@ -170,7 +177,12 @@ class SumFusion(FusionComponent):
         w_shape = [self.num_inputs] + [1] * (stacked.dim() - 1)
         weighted = stacked * weights.view(*w_shape)
 
-        return weighted.sum(dim=0)
+        fused = weighted.sum(dim=0)
+
+        if self.out_proj is not None:
+            fused = self.out_proj(fused)
+
+        return fused
 
 
 # =============================================================================
@@ -191,12 +203,19 @@ class GatedFusion(FusionComponent):
             name: str,
             num_inputs: int,
             in_features: int,
+            out_features: Optional[int] = None,
             **kwargs,
     ):
-        super().__init__(name, num_inputs, in_features, in_features, **kwargs)
+        super().__init__(name, num_inputs, in_features, out_features, **kwargs)
 
         # Gate projection for each input
         self.gate_proj = nn.Linear(in_features, num_inputs)
+
+        # Output projection if dimensions differ
+        if self.out_features != in_features:
+            self.out_proj = nn.Linear(in_features, self.out_features)
+        else:
+            self.out_proj = None
 
     def fuse(self, *inputs: Tensor) -> Tensor:
         # Stack to [B, N, D] - compile-friendly, no movedim
@@ -207,7 +226,12 @@ class GatedFusion(FusionComponent):
         gates = gates.unsqueeze(-1)  # [B, N, 1]
 
         gated = stacked * gates  # [B, N, D]
-        return gated.sum(dim=1)  # [B, D]
+        fused = gated.sum(dim=1)  # [B, D]
+
+        if self.out_proj is not None:
+            fused = self.out_proj(fused)
+
+        return fused
 
 
 # =============================================================================
@@ -226,11 +250,12 @@ class AttentionFusion(FusionComponent):
             name: str,
             num_inputs: int,
             in_features: int,
+            out_features: Optional[int] = None,
             num_heads: int = 8,
             dropout: float = 0.0,
             **kwargs,
     ):
-        super().__init__(name, num_inputs, in_features, in_features, **kwargs)
+        super().__init__(name, num_inputs, in_features, out_features, **kwargs)
 
         self.num_heads = num_heads
         self.head_dim = in_features // num_heads
@@ -238,7 +263,7 @@ class AttentionFusion(FusionComponent):
         self.q_proj = nn.Linear(in_features, in_features)
         self.k_proj = nn.Linear(in_features, in_features)
         self.v_proj = nn.Linear(in_features, in_features)
-        self.out_proj = nn.Linear(in_features, in_features)
+        self.out_proj = nn.Linear(in_features, self.out_features)
         self.dropout = nn.Dropout(dropout)
 
     def fuse(self, *inputs: Tensor) -> Tensor:
@@ -286,11 +311,12 @@ class AdaptiveFusion(FusionComponent):
             name: str,
             num_inputs: int,
             in_features: int,
+            out_features: Optional[int] = None,
             hidden_features: Optional[int] = None,
             temperature: float = 1.0,
             **kwargs,
     ):
-        super().__init__(name, num_inputs, in_features, in_features, **kwargs)
+        super().__init__(name, num_inputs, in_features, out_features, **kwargs)
 
         hidden = hidden_features or in_features // 4
         self.temperature = temperature
@@ -301,6 +327,12 @@ class AdaptiveFusion(FusionComponent):
             nn.GELU(),
             nn.Linear(hidden, 1),
         )
+
+        # Output projection if dimensions differ
+        if self.out_features != in_features:
+            self.out_proj = nn.Linear(in_features, self.out_features)
+        else:
+            self.out_proj = None
 
     def fuse(self, *inputs: Tensor) -> Tensor:
         # Stack inputs: [N, B, ..., D]
@@ -314,6 +346,10 @@ class AdaptiveFusion(FusionComponent):
 
         # Weighted sum
         fused = (stacked * weights).sum(dim=0)
+
+        # Project if needed
+        if self.out_proj is not None:
+            fused = self.out_proj(fused)
 
         return fused
 
@@ -505,6 +541,7 @@ class GeometricAttentionGate(FusionComponent):
             name: str,
             num_inputs: int,
             in_features: int,
+            out_features: Optional[int] = None,
             num_heads: int = 4,
             use_cayley_attention: bool = True,
             use_angular_attention: bool = True,
@@ -512,7 +549,7 @@ class GeometricAttentionGate(FusionComponent):
             dropout: float = 0.1,
             **kwargs,
     ):
-        super().__init__(name, num_inputs, in_features, in_features, **kwargs)
+        super().__init__(name, num_inputs, in_features, out_features, **kwargs)
 
         self.num_heads = num_heads
         self.head_dim = in_features // num_heads
@@ -541,10 +578,10 @@ class GeometricAttentionGate(FusionComponent):
                 role_weights = F.pad(role_weights, (0, num_inputs - 5), value=0.5)
             self.register_buffer("role_weights", role_weights)
 
-        # Output projection
+        # Output projection (supports out_features)
         self.out_proj = nn.Sequential(
-            nn.Linear(in_features, in_features),
-            nn.LayerNorm(in_features),
+            nn.Linear(in_features, self.out_features),
+            nn.LayerNorm(self.out_features),
             nn.GELU(),
             nn.Dropout(dropout)
         )
@@ -690,6 +727,9 @@ class GeometricAttentionGate(FusionComponent):
         stacked = torch.stack(input_list, dim=1)  # [B, N, D]
         fused = (stacked * combined_attention.unsqueeze(-1)).sum(dim=1)  # [B, D]
 
+        # Project to output dimension
+        fused = self.out_proj(fused)
+
         return fused
 
     def __repr__(self) -> str:
@@ -724,6 +764,7 @@ class CantorScaleFusion(FusionComponent):
             name: str,
             num_inputs: int,
             in_features: int,
+            out_features: Optional[int] = None,
             num_heads: int = 4,
             cantor_depth: int = 8,
             local_window: int = 3,
@@ -732,7 +773,7 @@ class CantorScaleFusion(FusionComponent):
             cantor_weight: float = 0.7,
             **kwargs,
     ):
-        super().__init__(name, num_inputs, in_features, in_features, **kwargs)
+        super().__init__(name, num_inputs, in_features, out_features, **kwargs)
 
         self.num_heads = num_heads
         self.head_dim = in_features // num_heads
@@ -763,8 +804,8 @@ class CantorScaleFusion(FusionComponent):
             self._build_routes()
         )
 
-        # Output projection
-        self.out_proj = nn.Linear(in_features, in_features)
+        # Output projection (supports out_features)
+        self.out_proj = nn.Linear(in_features, self.out_features)
         self.dropout = nn.Dropout(dropout)
 
         # Learned gate network
@@ -902,6 +943,9 @@ class CantorScaleFusion(FusionComponent):
         stacked = torch.stack(input_list, dim=1)  # [B, N, D]
         fused = (stacked * attention_weights.unsqueeze(-1)).sum(dim=1)  # [B, D]
 
+        # Project to output dimension
+        fused = self.out_proj(fused)
+
         return fused
 
     def __repr__(self) -> str:
@@ -935,12 +979,13 @@ class HierarchicalTreeGating(FusionComponent):
             name: str,
             num_inputs: int,
             in_features: int,
+            out_features: Optional[int] = None,
             depth: int = 3,
             node_hidden: int = 64,
             combine_weight: float = 0.7,
             **kwargs,
     ):
-        super().__init__(name, num_inputs, in_features, in_features, **kwargs)
+        super().__init__(name, num_inputs, in_features, out_features, **kwargs)
 
         self.depth = depth
         self.num_leaves = 2 ** depth
@@ -976,6 +1021,12 @@ class HierarchicalTreeGating(FusionComponent):
 
         # Learnable combination weight
         self.combine_weight = nn.Parameter(torch.tensor(combine_weight))
+
+        # Output projection if dimensions differ
+        if self.out_features != in_features:
+            self.out_proj = nn.Linear(in_features, self.out_features)
+        else:
+            self.out_proj = None
 
     def fuse(self, *inputs: Tensor) -> Tensor:
         """
@@ -1031,6 +1082,10 @@ class HierarchicalTreeGating(FusionComponent):
         # Apply gates to inputs
         stacked = torch.stack(input_list, dim=1)  # [B, N, D]
         fused = (stacked * gates.unsqueeze(-1)).sum(dim=1)  # [B, D]
+
+        # Project to output dimension if needed
+        if self.out_proj is not None:
+            fused = self.out_proj(fused)
 
         return fused
 
