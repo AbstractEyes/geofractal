@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-1.0.1-green.svg)]()
 
 ---
 
@@ -61,7 +61,8 @@ Every router has three distinct storage mechanisms:
 
 ```python
 # components[] - Learnable modules (moved by .to(), saved in state_dict)
-self.attach('encoder', nn.Linear(256, 512))
+# Named components can be raw nn.Module OR TorchComponent
+self.attach('encoder', nn.Linear(256, 512))  # OK as named component
 
 # objects[] - Config and metadata (persistent, NOT tensors)
 self.attach('config', {'dropout': 0.1, 'scale': 1.0})
@@ -227,16 +228,28 @@ from torch import Tensor
 
 from geofractal.router.wide_router import WideRouter
 from geofractal.router.base_tower import BaseTower
+from geofractal.router.components.torch_component import TorchComponent
 from geofractal.router.components.fusion_component import AdaptiveFusion
+
+
+class FFNBlock(TorchComponent):
+    """Feed-forward block as a component."""
+    
+    def __init__(self, name: str, dim: int, expansion: int = 2):
+        super().__init__(name)
+        self.fc1 = nn.Linear(dim, dim * expansion)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(dim * expansion, dim)
+    
+    def forward(self, x: Tensor) -> Tensor:
+        return self.fc2(self.act(self.fc1(x)))
 
 
 class SimpleTower(BaseTower):
     def __init__(self, name: str, dim: int):
         super().__init__(name, strict=False)
         for i in range(2):
-            self.append(nn.Sequential(
-                nn.Linear(dim, dim * 2), nn.GELU(), nn.Linear(dim * 2, dim)
-            ))
+            self.append(FFNBlock(f'{name}_ffn_{i}', dim))
         self.attach('norm', nn.LayerNorm(dim))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -523,15 +536,16 @@ compiled = torch.compile(collective)  # May fail
 
 ## Documentation
 
-| Document | Description                                                          |
-|----------|----------------------------------------------------------------------|
-| [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Basic tutorial with the system, includes new cache system changes.   |
-| [QUICK_BUILD.md](src/geofractal/router/QUICK_BUILD.md) | Quick reference for building collectives, not a comprehensive guide. |
+| Document | Description |
+|----------|-------------|
+| [QUICK_BUILD.md](src/geofractal/router/QUICK_BUILD.md) | Cheat sheet for rapid development |
+| [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Complete tutorial with cache system |
+
 ---
 
 ## Changelog
 
-### v1.0.1 (2025-12-23) Beta2
+### v1.0.1 (2025-12-23)
 
 **Cache System** - Managed ephemeral tensor storage
 
