@@ -18,6 +18,24 @@
 # unless the license of the new script explicitly states otherwise - while many components are listed MIT instead of apache 2.0,
 # the overall package is apache 2.0 and new code should follow that license for compatibility.
 
+# ================================================================================
+# COLAB / NOTEBOOK SETUP
+# ================================================================================
+# Standard installation block for experiments:
+#
+# ```python
+# # Install/update geofractal
+# try:
+#     !pip uninstall -qy geofractal geometricvocab
+# except:
+#     pass
+# !pip install -q git+https://github.com/AbstractEyes/geofractal.git
+# ```
+#
+# Run this cell first in any new Colab notebook to ensure latest version.
+# The uninstall step prevents version conflicts from cached installs.
+# ================================================================================
+
 ================================================================================
 REPO DIRECTORY STRUCTURE
 ================================================================================
