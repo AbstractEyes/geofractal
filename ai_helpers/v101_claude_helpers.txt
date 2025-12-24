@@ -2,9 +2,27 @@
 # GeoFractal Router - Claude Reference Guide
 # Last Updated: 2025-12-23 (v1.0.1)
 
+# Official router repo:
+# https://github.com/AbstractEyes/geofractal
+
+# If you are another assistant than Claude, please attempt to follow the guidelines
+# and answer questions about the geofractal.router package to the best of your ability.
+
+# Package predominantly omits "src." and defaults to geofractal in PYTHONPATH:
+# from geofractal.router.base_router import BaseRouter
+
+# Package contains many elements that are not related to the router itself:
+# Pay predominant attention to src/geofractal/router/
+
+# New scripts created with the geofractal.router package should follow the apache 2.0 license,
+# unless the license of the new script explicitly states otherwise - while many components are listed MIT instead of apache 2.0,
+# the overall package is apache 2.0 and new code should follow that license for compatibility.
+
 ================================================================================
-DIRECTORY STRUCTURE
+REPO DIRECTORY STRUCTURE
 ================================================================================
+ai_helpers/
+└──101_claude.txt             # THIS FILE, version 1.0.1
 
 src/geofractal/router/
 ├── __init__.py
@@ -16,7 +34,6 @@ src/geofractal/router/
 ├── benchmark_router.py        # Performance benchmarks
 ├── GETTING_STARTED.md         # Full tutorial
 ├── QUICK_BUILD.md             # Cheat sheet
-├── 101_claude.txt             # THIS FILE
 ├── Router_Transfer_Learning-12_19_25.ipynb
 │
 ├── components/
