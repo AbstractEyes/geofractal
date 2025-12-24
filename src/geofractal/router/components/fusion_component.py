@@ -39,7 +39,7 @@ Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
 
-from typing import Optional, List, Tuple, Union
+from typing import Optional, List, Tuple, Union, Dict, Any
 import math
 
 import torch
@@ -983,6 +983,7 @@ class HierarchicalTreeGating(FusionComponent):
             depth: int = 3,
             node_hidden: int = 64,
             combine_weight: float = 0.7,
+            dropout: float = 0.1,
             **kwargs,
     ):
         super().__init__(name, num_inputs, in_features, out_features, **kwargs)
@@ -999,7 +1000,7 @@ class HierarchicalTreeGating(FusionComponent):
                     nn.Linear(in_features, node_hidden),
                     nn.LayerNorm(node_hidden),
                     nn.GELU(),
-                    nn.Dropout(0.1),
+                    nn.Dropout(dropout),
                     nn.Linear(node_hidden, 2)  # Binary decision
                 ) for _ in range(num_nodes)
             ])
@@ -1094,6 +1095,467 @@ class HierarchicalTreeGating(FusionComponent):
             f"{self.__class__.__name__}(name='{self.name}', "
             f"inputs={self.num_inputs}, features={self.in_features}, "
             f"depth={self.depth}, leaves={self.num_leaves}, "
+            f"params={self.num_parameters():,})"
+        )
+
+
+# =============================================================================
+# BINDING MASK (from Lyra)
+# =============================================================================
+
+class BindingMask(TorchComponent):
+    """
+    Hard attention mask for isolated input groups.
+
+    Creates -inf mask for non-bound pairs, allowing strict isolation
+    between groups of inputs that should never attend to each other.
+
+    From Lyra: Used to isolate (clip_l ↔ t5_xl_l) from (clip_g ↔ t5_xl_g).
+
+    Args:
+        binding_config: Dict mapping input_idx -> list of allowed input_idxs
+                       Example: {0: [0, 2], 1: [1, 3], 2: [0, 2], 3: [1, 3]}
+                       means input 0 can only attend to 0 and 2, etc.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_inputs: int,
+        binding_config: Optional[Dict[int, List[int]]] = None,
+        **kwargs,
+    ):
+        super().__init__(name)
+
+        self.num_inputs = num_inputs
+        self.binding_config = binding_config
+
+        # Build mask
+        mask = self._build_mask(num_inputs, binding_config)
+        self.register_buffer('mask', mask)
+
+    def _build_mask(
+        self,
+        num_inputs: int,
+        binding_config: Optional[Dict[int, List[int]]]
+    ) -> Tensor:
+        """Build the binding mask."""
+        if binding_config is None:
+            # No config = all-to-all attention allowed
+            return torch.zeros(num_inputs, num_inputs)
+
+        # Start with all blocked
+        mask = torch.full((num_inputs, num_inputs), float('-inf'))
+
+        for i in range(num_inputs):
+            # Self-attention always allowed
+            mask[i, i] = 0.0
+
+            # Add allowed bindings
+            if i in binding_config:
+                for j in binding_config[i]:
+                    if 0 <= j < num_inputs:
+                        mask[i, j] = 0.0
+
+        return mask
+
+    def forward(self, attention_scores: Tensor) -> Tensor:
+        """
+        Apply binding mask to attention scores.
+
+        Args:
+            attention_scores: [..., N, N] where N is num_inputs
+
+        Returns:
+            Masked scores with -inf for blocked pairs
+        """
+        # Mask is [N, N], broadcasts to [..., N, N]
+        return attention_scores + self.mask.to(attention_scores.device)
+
+    def get_binding_groups(self) -> Dict[int, List[int]]:
+        """Get groups of inputs that can attend to each other (connected components)."""
+        if self.binding_config is None:
+            return {0: list(range(self.num_inputs))}
+
+        # Union-find
+        parent = list(range(self.num_inputs))
+
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+
+        def union(x, y):
+            px, py = find(x), find(y)
+            if px != py:
+                parent[px] = py
+
+        # Union bound pairs
+        for i, allowed in self.binding_config.items():
+            for j in allowed:
+                union(i, j)
+
+        # Build groups
+        groups = {}
+        for i in range(self.num_inputs):
+            root = find(i)
+            if root not in groups:
+                groups[root] = []
+            groups[root].append(i)
+
+        return groups
+
+
+# =============================================================================
+# INPUT VISIBILITY GATE (from Lyra's alpha)
+# =============================================================================
+
+class InputVisibilityGate(TorchComponent):
+    """
+    Per-input learned visibility control.
+
+    Different from AlphaController (neighbor bleed-over).
+    This gates each input's contribution via learned sigmoid.
+
+    From Lyra: Controls how much each modality contributes to fusion.
+    Higher visibility = stronger contribution, tied to KL divergence.
+
+    Pattern:
+        gate = sigmoid(gate_net(input))
+        alpha = sigmoid(learned_alpha)
+        output = input * (gate * alpha + (1 - alpha))
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_inputs: int,
+        in_features: int,
+        alpha_init: float = 1.0,
+        learnable: bool = True,
+        **kwargs,
+    ):
+        super().__init__(name)
+
+        self.num_inputs = num_inputs
+        self.in_features = in_features
+
+        # Per-input alpha (visibility strength)
+        alpha_tensor = torch.full((num_inputs,), alpha_init)
+        if learnable:
+            self.alpha = nn.Parameter(alpha_tensor)
+        else:
+            self.register_buffer('alpha', alpha_tensor)
+
+        # Per-input gating networks
+        self.gate_nets = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(in_features, in_features // 4),
+                nn.GELU(),
+                nn.Linear(in_features // 4, 1),
+                nn.Sigmoid()
+            )
+            for _ in range(num_inputs)
+        ])
+
+    def forward(self, *inputs: Tensor) -> List[Tensor]:
+        """
+        Apply visibility gating to inputs.
+
+        Args:
+            *inputs: Input tensors [B, ..., D]
+
+        Returns:
+            List of gated tensors
+        """
+        outputs = []
+
+        for i, inp in enumerate(inputs):
+            gate = self.gate_nets[i](inp)  # [B, ..., 1]
+            alpha_i = torch.sigmoid(self.alpha[i])
+
+            # gate * alpha + (1 - alpha) creates soft bypass
+            # When alpha=0: output = input (full bypass)
+            # When alpha=1: output = input * gate (full gating)
+            gated = inp * (gate * alpha_i + (1 - alpha_i))
+            outputs.append(gated)
+
+        return outputs
+
+    def get_alphas(self) -> Tensor:
+        """Get current alpha values (sigmoided)."""
+        return torch.sigmoid(self.alpha)
+
+
+# =============================================================================
+# BINDING STRENGTH CONTROLLER (from Lyra's beta)
+# =============================================================================
+
+class BindingStrengthController(TorchComponent):
+    """
+    Per-pair attention score boosting.
+
+    Different from BetaController (pathway balance).
+    This boosts attention scores between specific bound pairs.
+
+    From Lyra: Controls how strongly bound modalities attend to each other.
+
+    Args:
+        binding_pairs: List of (source_idx, target_idx) pairs to boost
+        beta_init: Initial boost strength
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_inputs: int,
+        binding_pairs: List[Tuple[int, int]],
+        beta_init: float = 0.3,
+        learnable: bool = True,
+        **kwargs,
+    ):
+        super().__init__(name)
+
+        self.num_inputs = num_inputs
+        self.binding_pairs = binding_pairs
+
+        # Per-pair beta (boost strength)
+        num_pairs = len(binding_pairs)
+        beta_tensor = torch.full((num_pairs,), beta_init)
+
+        if learnable:
+            self.beta = nn.Parameter(beta_tensor)
+        else:
+            self.register_buffer('beta', beta_tensor)
+
+        # Store pair indices for efficient lookup
+        self.register_buffer(
+            'pair_indices',
+            torch.tensor(binding_pairs, dtype=torch.long)
+        )
+
+    def forward(self, attention_scores: Tensor) -> Tensor:
+        """
+        Apply binding strength boost to attention scores.
+
+        Args:
+            attention_scores: [B, ..., num_inputs] where last dim is targets
+
+        Returns:
+            Boosted attention scores
+        """
+        scores = attention_scores.clone()
+
+        for pair_idx, (src, tgt) in enumerate(self.binding_pairs):
+            beta_val = torch.sigmoid(self.beta[pair_idx])
+            # Boost attention from source to target
+            scores[..., tgt] = scores[..., tgt] + beta_val
+
+        return scores
+
+    def get_betas(self) -> Dict[Tuple[int, int], float]:
+        """Get current beta values (sigmoided) per pair."""
+        return {
+            pair: torch.sigmoid(self.beta[i]).item()
+            for i, pair in enumerate(self.binding_pairs)
+        }
+
+
+# =============================================================================
+# ADAPTIVE BINDING FUSION (combines all Lyra patterns)
+# =============================================================================
+
+class AdaptiveBindingFusion(FusionComponent):
+    """
+    Full adaptive fusion with binding mask, visibility gating, and strength boosting.
+
+    Combines:
+    - BindingMask: Hard isolation between non-bound groups
+    - InputVisibilityGate: Per-input learned visibility (Lyra's alpha)
+    - BindingStrengthController: Per-pair attention boosting (Lyra's beta)
+    - CantorScaleFusion-style attention
+
+    This is the component equivalent of Lyra's AdaptiveCantorModalityFusion.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_inputs: int,
+        in_features: int,
+        out_features: Optional[int] = None,
+        num_heads: int = 4,
+        binding_config: Optional[Dict[int, List[int]]] = None,
+        binding_pairs: Optional[List[Tuple[int, int]]] = None,
+        alpha_init: float = 1.0,
+        beta_init: float = 0.3,
+        use_cantor: bool = True,
+        cantor_depth: int = 8,
+        dropout: float = 0.1,
+        **kwargs,
+    ):
+        super().__init__(name, num_inputs, in_features, out_features, **kwargs)
+
+        self.num_heads = num_heads
+        self.head_dim = in_features // num_heads
+        self.use_cantor = use_cantor
+
+        # Binding mask
+        self.binding_mask = BindingMask(
+            f"{name}_mask", num_inputs, binding_config
+        )
+
+        # Visibility gating (Lyra's alpha)
+        self.visibility = InputVisibilityGate(
+            f"{name}_visibility", num_inputs, in_features, alpha_init
+        )
+
+        # Binding strength (Lyra's beta)
+        if binding_pairs:
+            self.binding_strength = BindingStrengthController(
+                f"{name}_strength", num_inputs, binding_pairs, beta_init
+            )
+        else:
+            self.binding_strength = None
+
+        # Input embeddings
+        self.input_embeddings = nn.Parameter(
+            torch.randn(num_inputs, in_features) * 0.02
+        )
+
+        # QKV projections
+        self.q_proj = nn.Linear(in_features, in_features)
+        self.k_proj = nn.Linear(in_features, in_features)
+        self.v_proj = nn.Linear(in_features, in_features)
+
+        # Cantor routing (optional)
+        if use_cantor:
+            self.register_buffer(
+                'cantor_coords',
+                self._compute_cantor_coords(num_inputs, cantor_depth)
+            )
+
+        # Output projection
+        self.out_proj = nn.Linear(in_features, self.out_features)
+        self.dropout = nn.Dropout(dropout)
+        self.temperature = nn.Parameter(torch.tensor(0.07))
+
+    def _compute_cantor_coords(self, num_inputs: int, depth: int) -> Tensor:
+        """Compute Cantor set coordinates for inputs."""
+        coords = []
+        for i in range(num_inputs):
+            x = i / max(1, num_inputs - 1)
+            x = max(1e-6, min(x, 1.0 - 1e-6))
+
+            cantor_val = 0.0
+            factor = 0.5
+
+            for _ in range(depth):
+                x *= 3.0
+                digit = int(x)
+                x -= digit
+                if digit == 2:
+                    cantor_val += factor
+                factor *= 0.5
+
+            coords.append(cantor_val)
+
+        return torch.tensor(coords, dtype=torch.float32)
+
+    def fuse(self, *inputs: Tensor) -> Tensor:
+        """
+        Fuse inputs with binding constraints.
+
+        Args:
+            *inputs: Input tensors [B, D]
+
+        Returns:
+            Fused tensor [B, out_features]
+        """
+        B = inputs[0].shape[0]
+        device = inputs[0].device
+
+        # Apply visibility gating
+        gated_inputs = self.visibility(*inputs)
+
+        # Add input embeddings
+        embedded = [
+            g + self.input_embeddings[i]
+            for i, g in enumerate(gated_inputs)
+        ]
+
+        # Stack: [B, N, D]
+        stacked = torch.stack(embedded, dim=1)
+
+        # QKV
+        Q = self.q_proj(stacked)  # [B, N, D]
+        K = self.k_proj(stacked)
+        V = self.v_proj(stacked)
+
+        # Reshape for multi-head: [B, H, N, head_dim]
+        Q = Q.view(B, self.num_inputs, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        K = K.view(B, self.num_inputs, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        V = V.view(B, self.num_inputs, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        # Attention scores: [B, H, N, N]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = scores / self.temperature.abs()
+
+        # Apply binding mask (hard isolation)
+        # Mask is [N, N], expand to [1, 1, N, N]
+        scores = self.binding_mask(scores)
+
+        # Apply binding strength boost
+        if self.binding_strength is not None:
+            scores = self.binding_strength(scores)
+
+        # Softmax and dropout
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
+
+        # Apply attention: [B, H, N, head_dim]
+        out = torch.matmul(attn, V)
+
+        # Reshape: [B, N, D]
+        out = out.permute(0, 2, 1, 3).reshape(B, self.num_inputs, -1)
+
+        # Average across inputs (respecting binding groups)
+        groups = self.binding_mask.get_binding_groups()
+
+        if len(groups) == 1:
+            # Single group: simple mean
+            fused = out.mean(dim=1)
+        else:
+            # Multiple groups: weighted by group size
+            group_outputs = []
+            for group_indices in groups.values():
+                group_out = out[:, group_indices, :].mean(dim=1)
+                group_outputs.append(group_out)
+            fused = torch.stack(group_outputs, dim=0).mean(dim=0)
+
+        # Project to output
+        fused = self.out_proj(fused)
+        fused = self.dropout(fused)
+
+        return fused
+
+    def get_diagnostics(self) -> Dict[str, Any]:
+        """Get all controller values."""
+        diag = {
+            'visibility_alphas': self.visibility.get_alphas().detach().cpu().tolist(),
+            'binding_groups': self.binding_mask.get_binding_groups(),
+        }
+
+        if self.binding_strength is not None:
+            diag['binding_betas'] = self.binding_strength.get_betas()
+
+        return diag
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(name='{self.name}', "
+            f"inputs={self.num_inputs}, features={self.in_features}, "
+            f"heads={self.num_heads}, cantor={self.use_cantor}, "
             f"params={self.num_parameters():,})"
         )
 
@@ -1312,11 +1774,94 @@ if __name__ == '__main__':
     print(f"Compiled AdaptiveFusion: {y2.shape}")
 
     # -------------------------------------------------------------------------
+    test_section("BINDING MASK (from Lyra)")
+    # -------------------------------------------------------------------------
+
+    # Config: inputs 0,2 are bound, inputs 1,3 are bound (like clip_l/t5_l vs clip_g/t5_g)
+    binding_config = {
+        0: [0, 2],  # input 0 can attend to 0, 2
+        1: [1, 3],  # input 1 can attend to 1, 3
+        2: [0, 2],  # input 2 can attend to 0, 2
+        3: [1, 3],  # input 3 can attend to 1, 3
+    }
+
+    mask = BindingMask('test_mask', num_inputs=4, binding_config=binding_config)
+    print(f"Binding mask:\n{mask.mask}")
+    print(f"Binding groups: {mask.get_binding_groups()}")
+
+    # Test masking with proper attention score shape [B, query_inputs, key_inputs]
+    B, N = 2, 4
+    scores = torch.randn(B, N, N)  # [B, N, N] attention scores
+    masked = mask(scores)
+    print(f"Original scores shape: {scores.shape}")
+    print(f"Masked scores shape: {masked.shape}")
+    print(f"Sample row 0 (can attend to 0,2): {masked[0, 0, :].tolist()}")
+
+    # -------------------------------------------------------------------------
+    test_section("INPUT VISIBILITY GATE (Lyra's alpha)")
+    # -------------------------------------------------------------------------
+
+    visibility = InputVisibilityGate('test_vis', num_inputs=4, in_features=256)
+
+    inputs = [torch.randn(2, 256) for _ in range(4)]
+    gated = visibility(*inputs)
+
+    print(f"Input shape: {inputs[0].shape}")
+    print(f"Gated shape: {gated[0].shape}")
+    print(f"Visibility alphas: {visibility.get_alphas()}")
+
+    # -------------------------------------------------------------------------
+    test_section("BINDING STRENGTH CONTROLLER (Lyra's beta)")
+    # -------------------------------------------------------------------------
+
+    # Pairs to boost: (0->2) and (1->3)
+    binding_pairs = [(0, 2), (1, 3)]
+
+    strength = BindingStrengthController('test_strength', num_inputs=4, binding_pairs=binding_pairs)
+
+    scores = torch.zeros(2, 4)  # [B, num_inputs]
+    boosted = strength(scores)
+
+    print(f"Original scores: {scores[0]}")
+    print(f"Boosted scores: {boosted[0]}")
+    print(f"Binding betas: {strength.get_betas()}")
+
+    # -------------------------------------------------------------------------
+    test_section("ADAPTIVE BINDING FUSION (full Lyra pattern)")
+    # -------------------------------------------------------------------------
+
+    # Lyra-style: 4 inputs with 2 isolated groups
+    binding_config = {0: [0, 2], 1: [1, 3], 2: [0, 2], 3: [1, 3]}
+    binding_pairs = [(0, 2), (1, 3), (2, 0), (3, 1)]  # Bidirectional
+
+    fusion = AdaptiveBindingFusion(
+        'lyra_fusion',
+        num_inputs=4,
+        in_features=256,
+        binding_config=binding_config,
+        binding_pairs=binding_pairs,
+        alpha_init=1.0,
+        beta_init=0.3,
+    ).to(device)
+
+    inputs = [torch.randn(2, 256, device=device) for _ in range(4)]
+    output = fusion(*inputs)
+
+    print(f"Component: {fusion}")
+    print(f"Output shape: {output.shape}")
+    print(f"Diagnostics: {fusion.get_diagnostics()}")
+
+    # -------------------------------------------------------------------------
     test_section("ALL TESTS PASSED")
     # -------------------------------------------------------------------------
 
     print("\nFusionComponent is ready.")
-    print("\nNew geometric fusion strategies:")
+    print("\nGeometric fusion strategies:")
     print("  - GeometricAttentionGate: Cayley-Menger + Angular + MHA")
     print("  - CantorScaleFusion: Fractal geometry routing")
     print("  - HierarchicalTreeGating: Binary tree decisions")
+    print("\nLyra-derived components:")
+    print("  - BindingMask: Hard attention isolation")
+    print("  - InputVisibilityGate: Per-input visibility (alpha)")
+    print("  - BindingStrengthController: Per-pair boost (beta)")
+    print("  - AdaptiveBindingFusion: Full adaptive system")

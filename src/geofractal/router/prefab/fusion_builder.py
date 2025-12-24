@@ -54,6 +54,7 @@ from geofractal.router.components.fusion_component import (
     GeometricAttentionGate,
     CantorScaleFusion,
     HierarchicalTreeGating,
+    AdaptiveBindingFusion,
 )
 
 
@@ -80,6 +81,7 @@ class FusionStrategy(Enum):
     GEOMETRIC = "geometric"
     CANTOR = "cantor"
     TREE = "tree"
+    BINDING = "binding"  # Lyra's AdaptiveBindingFusion
 
 
 @dataclass
@@ -106,6 +108,14 @@ class ControllerConfig:
     use_gamma: bool = False
     gamma_learnable: bool = True
     gamma_temperature: float = 1.0
+
+    # Binding (for AdaptiveBindingFusion / Lyra pattern)
+    # binding_config: Dict mapping input_idx -> list of allowed input_idxs
+    # binding_pairs: List of (source_idx, target_idx) pairs to boost
+    binding_config: Optional[Dict[int, List[int]]] = None
+    binding_pairs: Optional[List[Tuple[int, int]]] = None
+    visibility_alpha_init: float = 1.0  # Lyra's alpha (per-input visibility)
+    binding_beta_init: float = 0.3  # Lyra's beta (per-pair boost)
 
 
 @dataclass
@@ -414,6 +424,7 @@ class FusionBuilder:
         FusionStrategy.GEOMETRIC: GeometricAttentionGate,
         FusionStrategy.CANTOR: CantorScaleFusion,
         FusionStrategy.TREE: HierarchicalTreeGating,
+        FusionStrategy.BINDING: AdaptiveBindingFusion,
     }
 
     # Presets for common patterns
@@ -455,6 +466,14 @@ class FusionBuilder:
                 use_gamma=True
             ),
         },
+        'lyra': {
+            'strategy': FusionStrategy.BINDING,
+            'topology': FusionTopology.PARALLEL,
+            'controllers': ControllerConfig(
+                visibility_alpha_init=1.0,
+                binding_beta_init=0.3,
+            ),
+        },
     }
 
     @classmethod
@@ -486,6 +505,20 @@ class FusionBuilder:
         # Bilinear is special - only takes 2 inputs, different signature
         if strategy == FusionStrategy.BILINEAR:
             return fusion_cls(name, in_features=d_in, out_features=d_out, **params)
+
+        # Binding (Lyra's AdaptiveBindingFusion) has special signature
+        if strategy == FusionStrategy.BINDING:
+            return fusion_cls(
+                name,
+                num_inputs=n_in,
+                in_features=d_in,
+                out_features=d_out,
+                binding_config=params.pop('binding_config', None),
+                binding_pairs=params.pop('binding_pairs', None),
+                alpha_init=params.pop('alpha_init', 1.0),
+                beta_init=params.pop('beta_init', 0.3),
+                **params
+            )
 
         # All other strategies have uniform signature
         return fusion_cls(name, num_inputs=n_in, in_features=d_in, out_features=d_out, **params)
