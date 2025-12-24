@@ -18,6 +18,9 @@
 # unless the license of the new script explicitly states otherwise - while many components are listed MIT instead of apache 2.0,
 # the overall package is apache 2.0 and new code should follow that license for compatibility.
 
+# If prompted for request the environment setup for geofractal.router in Colab or Jupyter.
+# If the prompt is related to juyter notebooks, colab, or google colab, please don't include "argparse" or command line setup instructions.
+
 # ================================================================================
 # COLAB / NOTEBOOK SETUP
 # ================================================================================
