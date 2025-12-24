@@ -59,7 +59,6 @@ src/geofractal/router/
     │
     └── agatha/
         ├── __init__.py
-        ├── data/                          # Data handling for Agatha
         ├── beatrix.py                     # Beatrix core model
         ├── beatrix_collective.py          # Beatrix collective implementation
         ├── beatrix_trainer.py             # Training logic
