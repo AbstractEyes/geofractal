@@ -129,7 +129,8 @@ Routers and towers have three distinct storage mechanisms. Understanding when to
 
 ```python
 # Stored in nn.ModuleDict - parameters tracked, device-managed
-self.attach('encoder', nn.Linear(256, 512))
+# Named components can be raw nn.Module OR TorchComponent
+self.attach('encoder', nn.Linear(256, 512))  # OK as named component
 self.attach('sub_tower', MyTower('sub', dim=256))
 
 # Access
@@ -574,6 +575,20 @@ With more towers, per-tower cost *decreases*:
 
 ```python
 from geofractal.router.wide_router import WideRouter
+from geofractal.router.components.torch_component import TorchComponent
+
+
+class FFNBlock(TorchComponent):
+    """Feed-forward block as a reusable component."""
+    
+    def __init__(self, name: str, dim: int, expansion: int = 2):
+        super().__init__(name)
+        self.fc1 = nn.Linear(dim, dim * expansion)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(dim * expansion, dim)
+    
+    def forward(self, x: Tensor) -> Tensor:
+        return self.fc2(self.act(self.fc1(x)))
 
 
 class SimpleTower(BaseTower):
@@ -583,11 +598,7 @@ class SimpleTower(BaseTower):
         super().__init__(name, strict=False)
 
         for i in range(depth):
-            self.append(nn.Sequential(
-                nn.Linear(dim, dim * 2),
-                nn.GELU(),
-                nn.Linear(dim * 2, dim),
-            ))
+            self.append(FFNBlock(f'{name}_ffn_{i}', dim))
         self.attach('norm', nn.LayerNorm(dim))
 
     def forward(self, x: Tensor) -> Tensor:
@@ -956,7 +967,7 @@ print(model.cache_debug())  # Should be empty between batches
 
 ---
 
-## Appendix: Architecture Changes (v2.0)
+## Appendix: Architecture Changes (v1.0.1)
 
 ### Cache System Addition
 
