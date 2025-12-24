@@ -482,84 +482,91 @@ COHESIVENESS RULES
 QUICK LOOKUPS
 ================================================================================
 
+"Baseline crash-course human tutorial?"
+-> src/geofractal/router/GETTING_STARTED.md
+
+"Cheat sheet?"
+-> src/geofractal/router/QUICK_BUILD.md
+-> Not particularly effective for Claude, good for humans.
+
 "Where is the cache system?"
--> base_router.py, _cache dict and cache_* methods
+-> src/geofractal/router/base_router.py, _cache dict and cache_* methods
 
 "Where are tower stages managed?"
--> base_tower.py, stages: nn.ModuleList
+-> src/geofractal/router/base_tower.py, stages: nn.ModuleList
 
 "Where is wide execution?"
--> wide_router.py, wide_forward()
+-> src/geofractal/router/wide_router.py, wide_forward()
 
 "Where is the memory leak fix?"
--> prefab/geometric_tower_builder.py
--> prefab/geometric_conv_tower_builder.py
+-> src/geofractal/router/prefab/geometric_tower_builder.py
+-> src/geofractal/router/prefab/geometric_conv_tower_builder.py
 -> Changed objects['_cached_features'] to cache_set('features', ...)
 
 "Where are fusion strategies?"
--> components/fusion_component.py
+-> src/geofractal/router/components/fusion_component.py
 
 "Where is geometric routing?"
--> prefab/notifier_router.py
--> components/address_component.py
+-> src/geofractal/router/prefab/notifier_router.py
+-> src/geofractal/router/components/address_component.py
 
 "Where is Cantor addressing?"
--> components/cantor_address_component.py
--> components/cantor_euclidean_attention_component.py
+-> src/geofractal/router/components/cantor_address_component.py
+-> src/geofractal/router/components/cantor_euclidean_attention_component.py
 
 "Where is wormhole attention?"
--> components/wormhole_attention_component.py
+-> src/geofractal/router/components/wormhole_attention_component.py
 
 "Where are transformer blocks?"
--> components/transformer_component.py
+-> src/geofractal/router/components/transformer_component.py
 
 "Where is multi-channel VAE support?"
--> prefab/geometric_conv_tower_builder.py
+-> src/geofractal/router/prefab/geometric_conv_tower_builder.py
 -> FlexibleInputComponent, preset_flux_vae_towers(), preset_sd_vae_towers()
 
 "Where are encoder ports?"
--> ports/torch_port.py (base)
--> ports/qwen.py (Qwen family)
+-> src/geofractal/router/ports/torch_port.py (base)
+-> src/geofractal/router/ports/qwen.py (Qwen family)
 
 "Where is RoPE?"
--> components/rope_component.py
--> components/rope_eval.py
+-> src/geofractal/router/components/rope_component.py
+-> src/geofractal/router/components/rope_eval.py
 
 "Where are embeddings?"
--> components/embedding_component.py
+-> src/geofractal/router/components/embedding_component.py
 
 "Where is projection/slot handling?"
--> components/projection_component.py
+-> src/geofractal/router/components/projection_component.py
 
 "Where is Beatrix?"
--> prefab/agatha/beatrix.py (core)
--> prefab/agatha/beatrix_collective.py (collective)
--> prefab/agatha/beatrix_trainer.py (training)
--> prefab/agatha/BEATRIX_CORE.md (docs)
+-> src/geofractal/router/prefab/agatha/beatrix.py (core)
+-> src/geofractal/router/prefab/agatha/beatrix_collective.py (collective)
+-> src/geofractal/router/prefab/agatha/beatrix_trainer.py (training)
+-> src/geofractal/router/prefab/agatha/BEATRIX_CORE.md (docs)
 
 "Where are oscillator dynamics?"
--> prefab/agatha/beatrix_oscillator.py
--> prefab/agatha/beatrix_tension_oscillator.py
+-> src/geofractal/router/prefab/agatha/beatrix_oscillator.py
+-> src/geofractal/router/prefab/agatha/beatrix_tension_oscillator.py
 
 "Where is head routing?"
--> prefab/agatha/head_router.py
+-> src/geofractal/router/prefab/agatha/head_router.py
 
 "Where are diagnostics?"
--> components/diagnostics/fusion_diagnostic.py
--> components/diagnostics/fusion_diagnostics_frozen.py
--> components/diagnostics/fusion_diagnostics_multi_tower.py
+-> src/geofractal/router/components/diagnostics/fusion_diagnostic.py
+-> src/geofractal/router/components/diagnostics/fusion_diagnostics_frozen.py
+-> src/geofractal/router/components/diagnostics/fusion_diagnostics_multi_tower.py
 
 "Where are CIFAR-100 experiments?"
--> prefab/agatha/cifar100_core_test.py
+-> src/geofractal/router/prefab/agatha/cifar100_core_test.py
 
 "Where are pre-built tower configs?"
--> prefab/geometric_towers.py
+-> src/geofractal/router/prefab/geometric_towers.py
 
 "Where are debug utilities?"
--> prefab/debug_geometric_towers.py
+-> src/geofractal/router/prefab/debug_geometric_towers.py
 
 "Where is training/testing infrastructure?"
--> prefab/train_test_towers.py
+-> src/geofractal/router/prefab/train_test_towers.py
 
 ================================================================================
 END OF REFERENCE
