@@ -33,9 +33,19 @@ To help curve the learning curve, we provide direct crash-course modules for pop
 
 With this first document, Claude can help guide you to the current established practices for utilizing these models effectively and efficiently within the GeoFractal framework.
 
-| Module | Description                                                    |
-|--------|----------------------------------------------------------------|
-| **ai_helpers.v101_claude_helpers.txt** | Direct crash-course for claude to prep Claude for utilization. |
+| Module                                       | Description                                                                            |
+|----------------------------------------------|----------------------------------------------------------------------------------------|
+| **ai_helpers.v101_claude_helpers.txt**       | Direct crash-course for claude to prep Claude for utilization.                         |
+| **src.geofractal.router.GETTING_STARTED.md** | More human direction, AI can benefit from it if the AI drifts.                         |
+| **src.geofractal.router.QUICK_BUILD.md**   | Quick reference for building with GeoFractal Router, AI can benefit from this as well. |
+
+To get started with AI development, you can drag and drop v101_claude_helpers.txt into Claude, GPT, DeepSeek, or any other AI platform that supports text file input. 
+This will help the AI understand how to effectively use the GeoFractal framework and its components.
+
+Drag and drop the other two documents into the AI platform as well, to provide more context and guidance for building with GeoFractal Router if needed.
+Drop the v101_claude_helpers.txt again if needed to reinforce the concepts. AI tends to drift and become forgetful.
+
+
 
 ## Core Concepts
 
