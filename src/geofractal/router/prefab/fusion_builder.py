@@ -55,6 +55,7 @@ from geofractal.router.components.fusion_component import (
     CantorScaleFusion,
     HierarchicalTreeGating,
     AdaptiveBindingFusion,
+    InceptiveFusion,
 )
 
 
@@ -82,6 +83,7 @@ class FusionStrategy(Enum):
     CANTOR = "cantor"
     TREE = "tree"
     BINDING = "binding"  # Lyra's AdaptiveBindingFusion
+    INCEPTIVE = "inceptive"  # Auxiliary feature injection
 
 
 @dataclass
@@ -116,6 +118,9 @@ class ControllerConfig:
     binding_pairs: Optional[List[Tuple[int, int]]] = None
     visibility_alpha_init: float = 1.0  # Lyra's alpha (per-input visibility)
     binding_beta_init: float = 0.3  # Lyra's beta (per-pair boost)
+
+    # Inceptive (for InceptiveFusion / auxiliary feature injection)
+    aux_features: int = 0  # Dimension of auxiliary features (0 = not used)
 
 
 @dataclass
@@ -425,6 +430,7 @@ class FusionBuilder:
         FusionStrategy.CANTOR: CantorScaleFusion,
         FusionStrategy.TREE: HierarchicalTreeGating,
         FusionStrategy.BINDING: AdaptiveBindingFusion,
+        FusionStrategy.INCEPTIVE: InceptiveFusion,
     }
 
     # Presets for common patterns
@@ -474,6 +480,13 @@ class FusionBuilder:
                 binding_beta_init=0.3,
             ),
         },
+        'inceptive': {
+            'strategy': FusionStrategy.INCEPTIVE,
+            'topology': FusionTopology.PARALLEL,
+            'controllers': ControllerConfig(
+                aux_features=40,  # Default: 20 levels * 2 features
+            ),
+        },
     }
 
     @classmethod
@@ -517,6 +530,18 @@ class FusionBuilder:
                 binding_pairs=params.pop('binding_pairs', None),
                 alpha_init=params.pop('alpha_init', 1.0),
                 beta_init=params.pop('beta_init', 0.3),
+                **params
+            )
+
+        # Inceptive (auxiliary feature injection) requires aux_features
+        if strategy == FusionStrategy.INCEPTIVE:
+            aux_features = params.pop('aux_features', 40)  # Default: 20 levels * 2
+            return fusion_cls(
+                name,
+                num_inputs=n_in,
+                in_features=d_in,
+                aux_features=aux_features,
+                out_features=d_out,
                 **params
             )
 

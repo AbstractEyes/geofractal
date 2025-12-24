@@ -983,7 +983,6 @@ class HierarchicalTreeGating(FusionComponent):
             depth: int = 3,
             node_hidden: int = 64,
             combine_weight: float = 0.7,
-            dropout: float = 0.1,
             **kwargs,
     ):
         super().__init__(name, num_inputs, in_features, out_features, **kwargs)
@@ -1000,7 +999,7 @@ class HierarchicalTreeGating(FusionComponent):
                     nn.Linear(in_features, node_hidden),
                     nn.LayerNorm(node_hidden),
                     nn.GELU(),
-                    nn.Dropout(dropout),
+                    nn.Dropout(0.1),
                     nn.Linear(node_hidden, 2)  # Binary decision
                 ) for _ in range(num_nodes)
             ])
@@ -1561,6 +1560,189 @@ class AdaptiveBindingFusion(FusionComponent):
 
 
 # =============================================================================
+# INCEPTIVE FUSION (consciousness-aware fusion from CantorMultiheadFusion)
+# =============================================================================
+
+class InceptiveFusion(FusionComponent):
+    """
+    Fusion with auxiliary feature injection for weight computation.
+
+    From CantorMultiheadFusion's "consciousness" mode - the weight MLP receives
+    not just anchor/gathered pairs, but also auxiliary geometric features
+    (e.g., Cantor staircase levels, positional encodings, etc.).
+
+    Pattern:
+        weights = MLP([anchor, gathered, auxiliary_features])
+        output = weighted_sum(gathered, softmax(weights))
+
+    This allows geometric/structural information to influence fusion weights
+    without being directly fused into the output representation.
+
+    Args:
+        name: Component name
+        num_inputs: Number of inputs to fuse
+        in_features: Input feature dimension
+        aux_features: Auxiliary feature dimension (geometric features)
+        out_features: Output dimension (default: in_features)
+        hidden_dim: Hidden dimension for weight MLP (default: in_features // 2)
+        num_heads: Number of attention heads (default: 8)
+        dropout: Dropout rate (default: 0.0)
+    """
+
+    def __init__(
+        self,
+        name: str,
+        num_inputs: int,
+        in_features: int,
+        aux_features: int,
+        out_features: Optional[int] = None,
+        hidden_dim: Optional[int] = None,
+        num_heads: int = 8,
+        dropout: float = 0.0,
+        uuid: Optional[str] = None,
+        **kwargs,
+    ):
+        super().__init__(name, num_inputs, in_features, out_features, uuid, **kwargs)
+
+        self.aux_features = aux_features
+        self.num_heads = num_heads
+        self.head_dim = in_features // num_heads
+        self.hidden_dim = hidden_dim or in_features // 2
+
+        assert in_features % num_heads == 0, "in_features must be divisible by num_heads"
+
+        # Input projection to head space
+        self.in_proj = nn.Linear(in_features, in_features)
+
+        # Weight computation MLP: [anchor, gathered, aux] -> weight
+        # Input: head_dim * 2 (anchor + gathered) + aux_features
+        weight_input_dim = self.head_dim * 2 + aux_features
+
+        self.weight_net = nn.Sequential(
+            nn.Linear(weight_input_dim, self.hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(self.hidden_dim, 1),
+        )
+
+        # Output projection
+        self.out_proj = nn.Linear(in_features, self.out_features)
+
+        self.dropout = nn.Dropout(dropout)
+        self._last_weights = None
+
+    def _validate_inputs(self, inputs: Tuple[Tensor, ...]) -> None:
+        """Validate input count and shapes."""
+        if len(inputs) != self.num_inputs:
+            raise ValueError(
+                f"Expected {self.num_inputs} inputs, got {len(inputs)}"
+            )
+
+    def fuse(
+        self,
+        *inputs: Tensor,
+        auxiliary_features: Optional[Tensor] = None,
+    ) -> Tensor:
+        """
+        Fuse inputs with auxiliary feature injection.
+
+        Args:
+            *inputs: N tensors of shape [B, D] or [B, S, D]
+            auxiliary_features: [B, aux_features] or [B, S, aux_features]
+                If None, uses zeros (degrades to learned pairwise fusion)
+
+        Returns:
+            Fused tensor [B, D] or [B, S, D]
+        """
+        self._validate_inputs(inputs)
+
+        N = len(inputs)
+        x0 = inputs[0]
+        has_seq = x0.dim() == 3
+
+        if has_seq:
+            B, S, D = x0.shape
+        else:
+            B, D = x0.shape
+            S = 1
+            inputs = tuple(x.unsqueeze(1) for x in inputs)
+
+        H = self.num_heads
+        head_dim = self.head_dim
+
+        # Stack inputs: [B, S, N, D]
+        stacked = torch.stack(inputs, dim=2)
+
+        # Project: [B, S, N, D]
+        projected = self.in_proj(stacked)
+
+        # Reshape to heads: [B, H, S, N, head_dim]
+        projected = projected.view(B, S, N, H, head_dim).permute(0, 3, 1, 2, 4)
+
+        # Handle auxiliary features
+        if auxiliary_features is None:
+            # Zero auxiliary features
+            aux = torch.zeros(B, S, self.aux_features, device=x0.device, dtype=x0.dtype)
+        else:
+            aux = auxiliary_features
+            if aux.dim() == 2:
+                aux = aux.unsqueeze(1).expand(-1, S, -1)
+
+        # Compute pairwise weights with auxiliary injection
+        # For each position, we compute weights for all N inputs
+
+        # Expand aux for all input pairs: [B, S, aux] -> [B, H, S, N, aux]
+        aux_exp = aux.unsqueeze(1).unsqueeze(3).expand(-1, H, -1, N, -1)
+
+        # Use mean as anchor (could also use first input or learned query)
+        anchor = projected.mean(dim=3, keepdim=True).expand(-1, -1, -1, N, -1)  # [B, H, S, N, head_dim]
+
+        # Concatenate: [anchor, input, aux] -> [B, H, S, N, head_dim*2 + aux]
+        combined = torch.cat([anchor, projected, aux_exp], dim=-1)
+
+        # Compute weights: [B, H, S, N, 1] -> [B, H, S, N]
+        weights = self.weight_net(combined).squeeze(-1)
+        weights = F.softmax(weights, dim=-1)
+        weights = self.dropout(weights)
+
+        self._last_weights = weights.detach()
+
+        # Weighted sum: [B, H, S, N, head_dim] x [B, H, S, N] -> [B, H, S, head_dim]
+        fused = torch.einsum('bhsnd,bhsn->bhsd', projected, weights)
+
+        # Reshape: [B, H, S, head_dim] -> [B, S, D]
+        fused = fused.permute(0, 2, 1, 3).reshape(B, S, D)
+
+        # Output projection
+        output = self.out_proj(fused)
+
+        if not has_seq:
+            output = output.squeeze(1)
+
+        return output
+
+    def forward(
+        self,
+        *inputs: Tensor,
+        auxiliary_features: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Forward with auxiliary features."""
+        return self.fuse(*inputs, auxiliary_features=auxiliary_features)
+
+    def get_last_weights(self) -> Optional[Tensor]:
+        """Get weights from last forward pass."""
+        return self._last_weights
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}(name='{self.name}', "
+            f"inputs={self.num_inputs}, features={self.in_features}, "
+            f"aux={self.aux_features}, heads={self.num_heads}, "
+            f"params={self.num_parameters():,})"
+        )
+
+
+# =============================================================================
 # MAIN TEST
 # =============================================================================
 
@@ -1852,6 +2034,39 @@ if __name__ == '__main__':
     print(f"Diagnostics: {fusion.get_diagnostics()}")
 
     # -------------------------------------------------------------------------
+    test_section("INCEPTIVE FUSION (consciousness-aware)")
+    # -------------------------------------------------------------------------
+
+    # Fusion with auxiliary geometric features
+    fusion = InceptiveFusion(
+        'inceptive',
+        num_inputs=4,
+        in_features=256,
+        aux_features=40,  # e.g., 20 levels * 2 features per level
+        num_heads=8,
+    ).to(device)
+
+    inputs = [torch.randn(2, 256, device=device) for _ in range(4)]
+    aux = torch.randn(2, 40, device=device)  # Cantor staircase features
+
+    output = fusion(*inputs, auxiliary_features=aux)
+
+    print(f"Component: {fusion}")
+    print(f"Output shape: {output.shape}")
+    print(f"Weights shape: {fusion.get_last_weights().shape}")
+
+    # Test without auxiliary (should still work)
+    output_no_aux = fusion(*inputs)
+    print(f"Without aux: {output_no_aux.shape}")
+
+    # Test with sequence dimension
+    inputs_seq = [torch.randn(2, 16, 256, device=device) for _ in range(4)]
+    aux_seq = torch.randn(2, 16, 40, device=device)
+
+    output_seq = fusion(*inputs_seq, auxiliary_features=aux_seq)
+    print(f"With sequence: {output_seq.shape}")
+
+    # -------------------------------------------------------------------------
     test_section("ALL TESTS PASSED")
     # -------------------------------------------------------------------------
 
@@ -1865,3 +2080,5 @@ if __name__ == '__main__':
     print("  - InputVisibilityGate: Per-input visibility (alpha)")
     print("  - BindingStrengthController: Per-pair boost (beta)")
     print("  - AdaptiveBindingFusion: Full adaptive system")
+    print("\nCantor-derived components:")
+    print("  - InceptiveFusion: Auxiliary feature injection for weights")

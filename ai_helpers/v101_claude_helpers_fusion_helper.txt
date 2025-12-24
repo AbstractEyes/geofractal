@@ -1,6 +1,6 @@
 # 101_claude.txt
 # GeoFractal Router - Claude Reference Guide
-# Last Updated: 2025-12-24 (v1.0.2)
+# Last Updated: 2025-12-24 (v1.0.3)
 
 # Official router repo:
 # https://github.com/AbstractEyes/geofractal
@@ -43,7 +43,7 @@
 REPO DIRECTORY STRUCTURE
 ================================================================================
 ai_helpers/
-└──101_claude.txt             # THIS FILE, version 1.0.2
+└──101_claude.txt             # THIS FILE, version 1.0.3
 
 src/geofractal/router/
 ├── __init__.py
@@ -135,7 +135,7 @@ BaseComponent (ABC, pure Python)  [base_component.py]
             ├── FusionComponent                     [components/fusion_component.py]
             │   │
             │   │   # Basic strategies
-            │   ├── AdaptiveFusion         # Content-dependent weights (Lyra pattern)
+            │   ├── AdaptiveFusion         # Content-dependent weights
             │   ├── GatedFusion            # Learned sigmoid gates
             │   ├── AttentionFusion        # Cross-attention between inputs
             │   ├── ConcatFusion           # Concatenate then project
@@ -145,9 +145,18 @@ BaseComponent (ABC, pure Python)  [base_component.py]
             │   ├── SlotFusion             # Fuse across slot dimension
             │   │
             │   │   # Geometric strategies (from David)
-            │   ├── GeometricAttentionGate # Cayley-Menger + Angular + MHA combined
-            │   ├── CantorScaleFusion      # Fractal geometry routing (70/30 blend)
-            │   └── HierarchicalTreeGating # Binary tree decisions
+            │   ├── GeometricAttentionGate # Cayley-Menger + Angular + MHA
+            │   ├── CantorScaleFusion      # Fractal geometry routing
+            │   ├── HierarchicalTreeGating # Binary tree decisions
+            │   │
+            │   │   # Binding strategies (from Lyra)
+            │   ├── BindingMask            # Hard -inf masking for isolated groups
+            │   ├── InputVisibilityGate    # Per-input visibility (Lyra's α)
+            │   ├── BindingStrengthController # Per-pair boost (Lyra's β)
+            │   ├── AdaptiveBindingFusion  # Full Lyra adaptive system
+            │   │
+            │   │   # Cantor-derived
+            │   └── InceptiveFusion        # Auxiliary feature injection for weights
             │
             ├── EmbeddingComponent                  [components/embedding_component.py]
             │
@@ -266,6 +275,8 @@ FusionStrategy.BILINEAR     -> BilinearFusion
 FusionStrategy.GEOMETRIC    -> GeometricAttentionGate
 FusionStrategy.CANTOR       -> CantorScaleFusion
 FusionStrategy.TREE         -> HierarchicalTreeGating
+FusionStrategy.BINDING      -> AdaptiveBindingFusion (Lyra)
+FusionStrategy.INCEPTIVE    -> InceptiveFusion (Cantor)
 
 CONTROLLERS:
 ------------
@@ -278,6 +289,19 @@ Beta (β):  Pathway balance, range [0, 1], default 0.5
 Gamma (γ): Per-input importance weights, softmax normalized
            Used for weighting expert opinions or scale outputs
 
+LYRA BINDING COMPONENTS (in fusion_component.py):
+-------------------------------------------------
+BindingMask:              Hard -inf mask for isolated input groups
+InputVisibilityGate:      Per-input visibility gating (different from α)
+BindingStrengthController: Per-pair attention boosting (different from β)
+AdaptiveBindingFusion:    Full system with mask + visibility + boost
+
+CANTOR-DERIVED COMPONENTS (in fusion_component.py):
+---------------------------------------------------
+InceptiveFusion:          Auxiliary features injected into weight MLP
+                          weights = MLP([anchor, gathered, aux_features])
+                          Use: geometric staircase, PE, Cantor levels
+
 PRESETS:
 --------
 'simple'       -> Adaptive, parallel, no controllers
@@ -286,6 +310,8 @@ PRESETS:
 'hierarchical' -> HierarchicalTreeGating, parallel, γ controller
 'david'        -> Geometric, blend topology, α + β + γ controllers
 'liminal'      -> Adaptive, hierarchical, α + β + γ (per-stage)
+'lyra'         -> AdaptiveBindingFusion, parallel, binding config
+'inceptive'    -> InceptiveFusion, parallel, aux_features=40
 
 USAGE:
 ------
@@ -581,6 +607,15 @@ Geometric (from David):
   CantorScaleFusion        - Fractal coordinate routing (70/30 blend)
   HierarchicalTreeGating   - Binary tree probability routing
 
+Binding (from Lyra):
+  BindingMask              - Hard -inf masking for isolated input groups
+  InputVisibilityGate      - Per-input learned visibility control
+  BindingStrengthController - Per-pair attention score boosting
+  AdaptiveBindingFusion    - Full system combining all three
+
+Cantor-derived:
+  InceptiveFusion          - Auxiliary features in weight computation
+
 DIAGNOSTICS (router/components/diagnostics/):
 ---------------------------------------------
 fusion_diagnostic.py              - Fusion analysis
@@ -633,6 +668,18 @@ BEATRIX_CORE.md               - Beatrix documentation
 ================================================================================
 VERSION HISTORY
 ================================================================================
+
+v1.0.3 (2025-12-24):
+- Lyra-derived binding components:
+  - BindingMask (hard -inf isolation)
+  - InputVisibilityGate (per-input visibility)
+  - BindingStrengthController (per-pair boost)
+  - AdaptiveBindingFusion (full Lyra pattern)
+- Cantor-derived components:
+  - InceptiveFusion (auxiliary feature injection)
+- FusionStrategy.BINDING + 'lyra' preset
+- FusionStrategy.INCEPTIVE + 'inceptive' preset
+- HierarchicalTreeGating dropout kwarg
 
 v1.0.2 (2025-12-24):
 - FusionBuilder system (mirrors ConfigurableTower for fusion)
@@ -759,6 +806,14 @@ QUICK LOOKUPS
 "Where is tree-based gating?"
 -> src/geofractal/router/components/fusion_component.py
 -> HierarchicalTreeGating class
+
+"Where are Lyra binding components?"
+-> src/geofractal/router/components/fusion_component.py
+-> BindingMask, InputVisibilityGate, BindingStrengthController, AdaptiveBindingFusion
+
+"Where is InceptiveFusion (auxiliary feature injection)?"
+-> src/geofractal/router/components/fusion_component.py
+-> InceptiveFusion class
 
 "Where is geometric routing?"
 -> src/geofractal/router/prefab/notifier_router.py
