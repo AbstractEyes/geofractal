@@ -25,7 +25,7 @@ See the diagnostic implementations and transfer learning experiments:
 
 - [`src/geofractal/router/components/diagnostics/`](src/geofractal/components/diagnostics/) - Fusion diagnostics, frozen encoder tests, multi-tower stress tests
 - [`studies/Router_Transfer_Learning-12_19_25.ipynb`](studies/Router_Transfer_Learning-12_19_25.ipynb) - Transfer learning experiments
-- [`studies/InceptionTowerResearch-12_23_25.ipynb`](studies/InceptionTowerResearch-12_23_25.ipynb) - Inception tower architecture research
+- [`studies/InceptionFusionTowerResearch-12_23_25.ipynb`](studies/InceptionFusionTowerResearch-12_23_25.ipynb) - Inception tower architecture research
 - [`studies/WalkerFusionConsistencyBaselineAblations-12_24_25.ipynb`](studies/WalkerFusionConsistencyBaselineAblations-12_24_25.ipynb) - Fusion consistency experiments
 ---
 
