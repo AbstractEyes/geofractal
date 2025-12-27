@@ -26,7 +26,6 @@ dependencies = [
   "datasets>=2.15",
   "torch>=2.1",
   "geometricvocab @ git+https://github.com/AbstractEyes/lattice_vocabulary.git"
-  "timm",
 ]
 
 [project.urls]
