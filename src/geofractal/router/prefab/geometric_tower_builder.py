@@ -209,12 +209,17 @@ def build_rope(name: str, rope_type: RoPEType, head_dim: int, **kwargs) -> nn.Mo
     """Build RoPE component by type."""
     if rope_type == RoPEType.CANTOR:
         return CantorRoPE(f'{name}_rope', head_dim=head_dim,
-                         theta_primary=kwargs.get('theta_primary', 10000.0),
-                         cantor_depth=kwargs.get('cantor_depth', 5))
+                         theta=kwargs.get('theta', 10000.0),
+                         levels=kwargs.get('levels', 5),
+                         tau=kwargs.get('tau', 0.25),
+                         mode=kwargs.get('mode', 'hybrid'),
+                         blend_alpha=kwargs.get('blend_alpha', 0.5))
     elif rope_type == RoPEType.BEATRIX:
         return BeatrixRoPE(f'{name}_rope', head_dim=head_dim,
-                          theta_base=kwargs.get('theta_base', 10000.0),
-                          staircase_resolution=kwargs.get('staircase_resolution', 64))
+                          theta=kwargs.get('theta', 10000.0),
+                          levels=kwargs.get('levels', 5),
+                          alpha=kwargs.get('alpha', 0.5),
+                          tau=kwargs.get('tau', 0.25))
     elif rope_type in (RoPEType.QUAD, RoPEType.SIMPLEX):
         return QuadRoPE(f'{name}_rope', head_dim=head_dim,
                         theta_w=kwargs.get('theta_w', 10000.0),
@@ -737,34 +742,245 @@ def build_tower_collective(
 # =============================================================================
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("Geometric Tower Builder - Quick Construction Test")
-    print("=" * 60)
+    import time
+
+    print("=" * 70)
+    print("Geometric Tower Builder - Comprehensive Forward Test")
+    print("=" * 70)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Device: {device}")
+
     B, L, D = 4, 16, 256
     x = torch.randn(B, L, D, device=device)
 
-    # Single tower
-    tower = quick_tower('cantor', dim=D, depth=2).to(device)
-    opinion, features = tower(x)
-    print(f"quick_tower: opinion {opinion.shape}, features {features.shape}")
+    # =========================================================================
+    # 1. Test all RoPE types
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("1. RoPE Types")
+    print("-" * 70)
 
-    # Pair (static)
-    pair = quick_pair('cantor', 'beatrix', dim=D, depth=1).to(device)
-    fused = pair(x)
-    print(f"quick_pair (static): {fused.shape}, fusion_params={pair.fusion_params}")
+    rope_types = list(RoPEType)
+    for rope_type in rope_types:
+        try:
+            config = TowerConfig(f'test_{rope_type.value}', rope=rope_type, address='standard')
+            tower = ConfigurableTower(config, default_dim=D, default_depth=1).to(device)
+            opinion, features = tower(x)
+            params = sum(p.numel() for p in tower.parameters())
+            print(f"  {rope_type.value:12s} ✓  opinion {opinion.shape}, params {params:,}")
+        except Exception as e:
+            print(f"  {rope_type.value:12s} ✗  {e}")
 
-    # Pair (inception)
-    pair_inc = quick_pair('cantor', 'beatrix', dim=D, depth=1, use_inception=True).to(device)
-    fused = pair_inc(x)
-    print(f"quick_pair (inception): {fused.shape}, fusion_params={pair_inc.fusion_params}")
+    # =========================================================================
+    # 2. Test all Address types
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("2. Address Types")
+    print("-" * 70)
 
-    # Collective
-    collective = quick_collective(['cantor', 'beatrix', 'helix', 'simplex'],
-                                   dim=D, depth=1, fusion_type='walker_shiva').to(device)
-    collective.discover_towers()
-    result = collective(x)
-    print(f"quick_collective: fused {result.fused.shape}")
+    address_types = list(AddressType)
+    for addr_type in address_types:
+        try:
+            config = TowerConfig(f'test_{addr_type.value}', rope='standard', address=addr_type)
+            tower = ConfigurableTower(config, default_dim=D, default_depth=1).to(device)
+            opinion, features = tower(x)
+            fp = tower.fingerprint
+            print(f"  {addr_type.value:12s} ✓  fingerprint {fp.shape}")
+        except Exception as e:
+            print(f"  {addr_type.value:12s} ✗  {e}")
 
-    print("\n✓ All quick construction tests passed")
+    # =========================================================================
+    # 3. Test all geometry presets
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("3. Geometry Presets (via quick_tower)")
+    print("-" * 70)
+
+    geometries = list(GEOMETRY_CONFIGS.keys())
+    for geom in geometries:
+        try:
+            tower = quick_tower(geom, dim=D, depth=1).to(device)
+            opinion, features = tower(x)
+            params = sum(p.numel() for p in tower.parameters())
+            print(f"  {geom:12s} ✓  params {params:,}")
+        except Exception as e:
+            print(f"  {geom:12s} ✗  {e}")
+
+    # =========================================================================
+    # 4. Test all fusion types
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("4. Fusion Types (via quick_collective)")
+    print("-" * 70)
+
+    fusion_types = list(FusionType)
+    for fusion_type in fusion_types:
+        try:
+            collective = quick_collective(
+                ['cantor', 'beatrix'], dim=D, depth=1, fusion_type=fusion_type.value
+            ).to(device)
+            collective.discover_towers()
+            result = collective(x)
+            fusion_params = sum(p.numel() for p in collective['fusion'].parameters())
+            print(f"  {fusion_type.value:18s} ✓  fusion_params {fusion_params:,}")
+        except Exception as e:
+            print(f"  {fusion_type.value:18s} ✗  {e}")
+
+    # =========================================================================
+    # 5. Test WalkerPair with all presets
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("5. WalkerPair Presets")
+    print("-" * 70)
+
+    walker_presets = ['shiva', 'slerp', 'lerp', 'zeus']
+    for preset in walker_presets:
+        try:
+            pair = quick_pair('cantor', 'helix', dim=D, depth=1,
+                              walker_preset=preset, use_inception=False).to(device)
+            fused = pair(x)
+            print(f"  {preset:12s} (static)    ✓  output {fused.shape}")
+
+            pair_inc = quick_pair('cantor', 'helix', dim=D, depth=1,
+                                  walker_preset=preset, use_inception=True).to(device)
+            fused_inc = pair_inc(x)
+            print(f"  {preset:12s} (inception) ✓  output {fused_inc.shape}, params {pair_inc.fusion_params:,}")
+        except Exception as e:
+            print(f"  {preset:12s} ✗  {e}")
+
+    # =========================================================================
+    # 6. Test inception aux types
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("6. Inception Aux Types")
+    print("-" * 70)
+
+    aux_types = ['geometric', 'cosine', 'learned', 'walker_path']
+    for aux_type in aux_types:
+        try:
+            pair = quick_pair('simplex', 'fractal', dim=D, depth=1,
+                              use_inception=True, inception_aux_type=aux_type).to(device)
+            fused = pair(x)
+            print(f"  {aux_type:12s} ✓  fusion_params {pair.fusion_params:,}")
+        except Exception as e:
+            print(f"  {aux_type:12s} ✗  {e}")
+
+    # =========================================================================
+    # 7. Large collective test
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("7. Large Collective (all geometries)")
+    print("-" * 70)
+
+    try:
+        all_geoms = list(GEOMETRY_CONFIGS.keys())
+        collective = quick_collective(all_geoms, dim=D, depth=2, fusion_type='walker_inception').to(device)
+        collective.discover_towers()
+
+        # Warmup
+        _ = collective(x)
+
+        # Timed forward
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(10):
+            result = collective(x)
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
+        elapsed = (time.perf_counter() - t0) / 10 * 1000
+
+        total_params = sum(p.numel() for p in collective.parameters())
+        print(f"  Towers: {len(all_geoms)}")
+        print(f"  Total params: {total_params:,}")
+        print(f"  Forward: {elapsed:.2f}ms")
+        print(f"  Output: fused {result.fused.shape}")
+        print(f"  Opinions: {list(result.opinions.keys())}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+
+    # =========================================================================
+    # 8. Inverted tower test
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("8. Inverted Towers")
+    print("-" * 70)
+
+    try:
+        tower_pos = quick_tower('cantor', dim=D, depth=1, inverted=False).to(device)
+        tower_neg = quick_tower('cantor', dim=D, depth=1, inverted=True).to(device)
+
+        op_pos, _ = tower_pos(x)
+        op_neg, _ = tower_neg(x)
+
+        fp_pos = tower_pos.fingerprint
+        fp_neg = tower_neg.fingerprint
+
+        # Fingerprints should be inverted
+        fp_diff = (fp_pos + fp_neg - 1.0).abs().mean().item()
+        print(f"  Pos fingerprint: {fp_pos[:3].tolist()}")
+        print(f"  Neg fingerprint: {fp_neg[:3].tolist()}")
+        print(f"  Inversion check (should be ~0): {fp_diff:.6f}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+
+    # =========================================================================
+    # 9. Direct TowerConfig construction
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("9. Direct TowerConfig Construction")
+    print("-" * 70)
+
+    try:
+        configs = [
+            TowerConfig('custom_a', rope='cantor', address='cantor',
+                        rope_params={'levels': 6, 'mode': 'hybrid'}),
+            TowerConfig('custom_b', rope='quad', address='simplex',
+                        rope_params={'theta_w': 8000.0}),
+            TowerConfig('custom_c', rope='sinusoidal', address='spherical',
+                        rope_params={'base_freq': 2.0}),
+        ]
+        collective = build_tower_collective(configs, dim=D, default_depth=2,
+                                             fusion_type='walker_static')
+        collective.to(device)
+        collective.discover_towers()
+        result = collective(x)
+        print(f"  Custom configs: {[c.name for c in configs]}")
+        print(f"  Output: {result.fused.shape}")
+    except Exception as e:
+        print(f"  ✗ {e}")
+
+    # =========================================================================
+    # 10. Stress test: deeper towers
+    # =========================================================================
+    print("\n" + "-" * 70)
+    print("10. Depth Scaling Test")
+    print("-" * 70)
+
+    for depth in [1, 2, 4, 6]:
+        try:
+            tower = quick_tower('helix', dim=D, depth=depth).to(device)
+            t0 = time.perf_counter()
+            opinion, _ = tower(x)
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+            elapsed = (time.perf_counter() - t0) * 1000
+            params = sum(p.numel() for p in tower.parameters())
+            print(f"  depth={depth}: params {params:,}, forward {elapsed:.2f}ms")
+        except Exception as e:
+            print(f"  depth={depth}: ✗ {e}")
+
+    # =========================================================================
+    # Summary
+    # =========================================================================
+    print("\n" + "=" * 70)
+    print("Summary")
+    print("=" * 70)
+    print(f"  RoPE types tested:     {len(rope_types)}")
+    print(f"  Address types tested:  {len(address_types)}")
+    print(f"  Geometry presets:      {len(geometries)}")
+    print(f"  Fusion types:          {len(fusion_types)}")
+    print(f"  Walker presets:        {len(walker_presets)}")
+    print(f"  Inception aux types:   {len(aux_types)}")
+    print("\n✓ Comprehensive forward test complete")
