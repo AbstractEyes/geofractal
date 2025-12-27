@@ -43,16 +43,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-# Import TorchComponent - adjust path as needed for your setup
-try:
-    from geofractal.router.components.torch_component import TorchComponent
-except ImportError:
-    # Fallback for standalone testing
-    class TorchComponent(nn.Module):
-        def __init__(self, name: str, uuid: Optional[str] = None, **kwargs):
-            super().__init__()
-            self.name = name
-            self.uuid = uuid or str(id(self))
+from geofractal.router.components.torch_component import TorchComponent
 
 
 # =============================================================================

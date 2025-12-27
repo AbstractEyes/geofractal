@@ -31,6 +31,7 @@ from torch import Tensor
 
 from geofractal.router.base_router import BaseRouter
 from geofractal.router.base_tower import BaseTower
+from geofractal.router.components.torch_component import TorchComponent
 from geofractal.router.wide_router import WideRouter
 from geofractal.router.components.transformer_component import (
     TransformerConfig,
@@ -468,7 +469,7 @@ class CollectiveOpinion:
 # HETEROGENEOUS FUSION (for multi-encoder with different dims)
 # =============================================================================
 
-class HeterogeneousFusion(nn.Module):
+class HeterogeneousFusion(TorchComponent):
     """
     WalkerFusion wrapper that projects heterogeneous inputs to common dimension.
 
@@ -544,7 +545,7 @@ class HeterogeneousFusion(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
-class HeterogeneousPair(nn.Module):
+class HeterogeneousPair(TorchComponent):
     """
     Fuse two inputs with different dimensions.
 
@@ -605,7 +606,7 @@ class HeterogeneousPair(nn.Module):
         return sum(p.numel() for p in self.fusion.parameters() if p.requires_grad)
 
 
-class WalkerPair(nn.Module):
+class WalkerPair(TorchComponent):
     """Two towers fused with WalkerFusion. Simplest collective unit."""
 
     def __init__(
