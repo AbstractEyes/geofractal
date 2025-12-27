@@ -34,6 +34,7 @@ from typing import Optional, List, Dict, Tuple, Union, Literal, Any
 from dataclasses import dataclass, field
 from enum import Enum
 import math
+from warnings import deprecated
 
 import torch
 import torch.nn as nn
@@ -58,7 +59,7 @@ from geofractal.router.components.fusion_component import (
     InceptiveFusion,
 )
 
-
+@deprecated("Use geofractal.router.components.fusion_component instead of fusion_builder.")
 # =============================================================================
 # ENUMS AND CONFIGS
 # =============================================================================
