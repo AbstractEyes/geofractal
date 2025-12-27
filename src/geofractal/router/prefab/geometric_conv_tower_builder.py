@@ -3,9 +3,15 @@ geofractal.router.prefab.geometric_conv_tower_builder
 =====================================================
 
 Convolutional tower variants with BATCHED collective processing.
+Now with WalkerFusion support for static and learnable fusion.
 
 Each tower is a TorchComponent-based stage system.
 ConvTowerCollective groups towers by type for batched forward.
+
+Quick Construction:
+    tower = quick_conv_tower('wide_resnet')
+    pair = quick_conv_pair('wide_resnet', 'frequency', use_inception=True)
+    collective = quick_conv_collective(['wide_resnet', 'frequency', 'squeeze_excite'])
 
 Multi-Channel Latent Support:
     Designed for VAE latent processing (Flux, SD, etc.):
@@ -61,6 +67,10 @@ from geofractal.router.wide_router import WideRouter
 from geofractal.router.components.torch_component import TorchComponent
 from geofractal.router.components.address_component import AddressComponent
 from geofractal.router.components.fusion_component import AdaptiveFusion
+from geofractal.router.components.walker_component import (
+    WalkerFusion,
+    WalkerInception,
+)
 
 
 # =============================================================================
@@ -78,6 +88,29 @@ class ConvTowerType(str, Enum):
     SQUEEZE_EXCITE = "squeeze_excite"  # SE blocks with channel attention
     INVERTED_BOTTLENECK = "inverted_bottleneck"  # MobileNetV2-style
     SPATIAL_ATTENTION = "spatial_attention"  # Spatial self-attention
+
+
+class FusionType(str, Enum):
+    """Fusion types for collectives."""
+    # Legacy
+    ADAPTIVE = "adaptive"
+    # Walker fusion types
+    WALKER_STATIC = "walker_static"
+    WALKER_INCEPTION = "walker_inception"
+    WALKER_SHIVA = "walker_shiva"
+    WALKER_SLERP = "walker_slerp"
+    WALKER_LERP = "walker_lerp"
+    WALKER_ZEUS = "walker_zeus"
+
+
+WALKER_PRESET_MAP = {
+    FusionType.WALKER_STATIC: 'shiva',
+    FusionType.WALKER_INCEPTION: 'shiva',
+    FusionType.WALKER_SHIVA: 'shiva',
+    FusionType.WALKER_SLERP: 'slerp',
+    FusionType.WALKER_LERP: 'lerp',
+    FusionType.WALKER_ZEUS: 'zeus',
+}
 
 
 # =============================================================================
@@ -941,6 +974,61 @@ class ConfigurableConvTower(BaseTower):
 
 
 # =============================================================================
+# WALKER CONV PAIR
+# =============================================================================
+
+class WalkerConvPair(nn.Module):
+    """
+    Two conv towers fused with WalkerFusion.
+
+    The simplest collective unit for geometric conv fusion.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        config_a: ConvTowerConfig,
+        config_b: ConvTowerConfig,
+        dim: int = 256,
+        depth: int = 2,
+        spatial_size: int = 16,
+        use_inception: bool = False,
+        walker_preset: str = 'shiva',
+        inception_aux_type: str = 'geometric',
+    ):
+        super().__init__()
+        self.name = name
+
+        self.tower_a = ConfigurableConvTower(
+            config=config_a, default_dim=dim, default_depth=depth, spatial_size=spatial_size
+        )
+        self.tower_b = ConfigurableConvTower(
+            config=config_b, default_dim=dim, default_depth=depth, spatial_size=spatial_size
+        )
+
+        inception = None
+        if use_inception:
+            inception = WalkerInception(
+                f'{name}_inception', in_features=dim,
+                num_steps=8, num_inputs=2, aux_type=inception_aux_type
+            )
+
+        self.fusion = WalkerFusion(
+            f'{name}_fusion', in_features=dim,
+            preset=walker_preset, num_steps=8, inception=inception
+        )
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        opinion_a, _ = self.tower_a(x, mask)
+        opinion_b, _ = self.tower_b(x, mask)
+        return self.fusion(opinion_a, opinion_b)
+
+    @property
+    def fusion_params(self) -> int:
+        return sum(p.numel() for p in self.fusion.parameters() if p.requires_grad)
+
+
+# =============================================================================
 # CONV TOWER COLLECTIVE (using WideRouter)
 # =============================================================================
 
@@ -949,6 +1037,7 @@ class ConvTowerCollective(WideRouter):
     Conv tower collective using WideRouter for optimized execution.
 
     Groups towers by type for batched processing via torch.compile.
+    Now supports WalkerFusion as an alternative to AdaptiveFusion.
     """
 
     def __init__(
@@ -959,6 +1048,8 @@ class ConvTowerCollective(WideRouter):
         default_depth: int = 2,
         fingerprint_dim: int = 64,
         spatial_size: int = 16,
+        fusion_type: Union[FusionType, str] = FusionType.ADAPTIVE,
+        fusion_params: Dict[str, Any] = None,
     ):
         # Initialize WideRouter with auto_discover=False (we register manually)
         super().__init__(name, strict=False, auto_discover=False)
@@ -967,9 +1058,13 @@ class ConvTowerCollective(WideRouter):
         self._fingerprint_dim = fingerprint_dim
         self._num_towers = len(tower_configs)
 
+        if isinstance(fusion_type, str):
+            fusion_type = FusionType(fusion_type)
+
         self.objects['config'] = {
             'dim': dim,
             'num_towers': self._num_towers,
+            'fusion_type': fusion_type.value,
         }
 
         # Build and attach towers
@@ -985,15 +1080,32 @@ class ConvTowerCollective(WideRouter):
             # Register with WideRouter for optimized execution
             self.register_tower(cfg.name)
 
-        # Fusion (attached after towers so it's not auto-discovered)
-        self.attach('fusion', AdaptiveFusion(
-            f'{name}_fusion',
-            num_inputs=self._num_towers,
-            in_features=dim,
-        ))
+        # Build fusion
+        fusion_params = fusion_params or {}
+        fusion = self._build_fusion(f'{name}_fusion', fusion_type, dim, fusion_params)
+        self.attach('fusion', fusion)
 
         # Fingerprint projection
         self.attach('fp_proj', nn.Linear(fingerprint_dim * self._num_towers, fingerprint_dim))
+
+    def _build_fusion(self, name: str, fusion_type: FusionType, dim: int, params: Dict) -> nn.Module:
+        """Build fusion module based on type."""
+        if fusion_type in WALKER_PRESET_MAP:
+            preset = WALKER_PRESET_MAP[fusion_type]
+            inception = None
+            if fusion_type == FusionType.WALKER_INCEPTION:
+                inception = WalkerInception(
+                    f'{name}_inception', in_features=dim,
+                    num_steps=params.get('num_steps', 8), num_inputs=2,
+                    aux_type=params.get('inception_aux_type', 'geometric')
+                )
+            return WalkerFusion(
+                name, in_features=dim, preset=preset,
+                num_steps=params.get('num_steps', 8), inception=inception
+            )
+        else:
+            # Legacy AdaptiveFusion
+            return AdaptiveFusion(name, num_inputs=self._num_towers, in_features=dim)
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Dict[str, Tensor]]:
         """
@@ -1032,6 +1144,105 @@ class ConvTowerCollective(WideRouter):
 
 
 # =============================================================================
+# QUICK CONSTRUCTION FUNCTIONS
+# =============================================================================
+
+def get_conv_config(
+    tower_type: str,
+    name: Optional[str] = None,
+    inverted: bool = False,
+    **kwargs
+) -> ConvTowerConfig:
+    """Get a conv tower config by type name."""
+    return ConvTowerConfig(
+        name=name or tower_type,
+        tower_type=tower_type,
+        inverted=inverted,
+        **kwargs
+    )
+
+
+def quick_conv_tower(
+    tower_type: str,
+    dim: int = 256,
+    depth: int = 2,
+    name: Optional[str] = None,
+    inverted: bool = False,
+    spatial_size: int = 16,
+    **kwargs
+) -> ConfigurableConvTower:
+    """
+    Quickly create a single conv tower by type name.
+
+    Example:
+        tower = quick_conv_tower('wide_resnet', dim=256, depth=3)
+    """
+    config = get_conv_config(tower_type, name=name, inverted=inverted, **kwargs)
+    return ConfigurableConvTower(
+        config=config,
+        default_dim=dim,
+        default_depth=depth,
+        spatial_size=spatial_size,
+    )
+
+
+def quick_conv_pair(
+    tower_type_a: str,
+    tower_type_b: str,
+    dim: int = 256,
+    depth: int = 2,
+    spatial_size: int = 16,
+    use_inception: bool = False,
+    walker_preset: str = 'shiva',
+    inception_aux_type: str = 'geometric',
+    name: Optional[str] = None,
+    **kwargs
+) -> WalkerConvPair:
+    """
+    Quickly create a pair of conv towers with WalkerFusion.
+
+    Example:
+        pair = quick_conv_pair('wide_resnet', 'frequency', use_inception=True)
+        fused = pair(x)  # [B, D]
+    """
+    name = name or f'{tower_type_a}_{tower_type_b}'
+    config_a = get_conv_config(tower_type_a, **kwargs)
+    config_b = get_conv_config(tower_type_b, **kwargs)
+    return WalkerConvPair(
+        name=name, config_a=config_a, config_b=config_b,
+        dim=dim, depth=depth, spatial_size=spatial_size,
+        use_inception=use_inception, walker_preset=walker_preset,
+        inception_aux_type=inception_aux_type,
+    )
+
+
+def quick_conv_collective(
+    tower_types: List[str],
+    dim: int = 256,
+    depth: int = 2,
+    spatial_size: int = 16,
+    fusion_type: Union[FusionType, str] = FusionType.WALKER_STATIC,
+    name: str = 'conv_collective',
+    **kwargs
+) -> ConvTowerCollective:
+    """
+    Quickly create a collective of conv towers.
+
+    Example:
+        collective = quick_conv_collective(
+            ['wide_resnet', 'frequency', 'squeeze_excite'],
+            fusion_type='walker_inception'
+        )
+    """
+    configs = [get_conv_config(t, **kwargs) for t in tower_types]
+    return ConvTowerCollective(
+        name=name, tower_configs=configs, dim=dim, default_depth=depth,
+        spatial_size=spatial_size, fusion_type=fusion_type,
+        fusion_params=kwargs.get('fusion_params', {}),
+    )
+
+
+# =============================================================================
 # BUILDER FUNCTIONS
 # =============================================================================
 
@@ -1059,6 +1270,7 @@ def build_conv_collective(
     fingerprint_dim: int = 64,
     spatial_size: int = 16,
     name: str = 'conv_collective',
+    fusion_type: Union[FusionType, str] = FusionType.ADAPTIVE,
 ) -> ConvTowerCollective:
     """Build a conv tower collective with batched forward."""
     return ConvTowerCollective(
@@ -1068,6 +1280,7 @@ def build_conv_collective(
         default_depth=default_depth,
         fingerprint_dim=fingerprint_dim,
         spatial_size=spatial_size,
+        fusion_type=fusion_type,
     )
 
 
@@ -1226,12 +1439,51 @@ if __name__ == '__main__':
     import time
 
     print("=" * 60)
-    print("WideRouter Conv Collective Test")
+    print("Conv Tower Builder - Quick Construction Test")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
 
+    # Test quick_conv_tower
+    print("\n--- quick_conv_tower ---")
+    tower = quick_conv_tower('wide_resnet', dim=256, depth=2)
+    tower.network_to(device=device)
+    x = torch.randn(4, 256, 256, device=device)
+    opinion, features = tower(x)
+    print(f"Tower output: opinion {opinion.shape}, features {features.shape}")
+
+    # Test quick_conv_pair
+    print("\n--- quick_conv_pair (static) ---")
+    pair = quick_conv_pair('wide_resnet', 'frequency', dim=256, depth=1)
+    pair.to(device)
+    fused = pair(x)
+    print(f"Pair output: {fused.shape}")
+    print(f"Pair params: {sum(p.numel() for p in pair.parameters()):,}")
+    print(f"Fusion params: {pair.fusion_params}")
+
+    print("\n--- quick_conv_pair (inception) ---")
+    pair_inc = quick_conv_pair('wide_resnet', 'frequency', dim=256, depth=1, use_inception=True)
+    pair_inc.to(device)
+    fused = pair_inc(x)
+    print(f"Pair output: {fused.shape}")
+    print(f"Pair params: {sum(p.numel() for p in pair_inc.parameters()):,}")
+    print(f"Fusion params: {pair_inc.fusion_params}")
+
+    # Test quick_conv_collective with walker fusion
+    print("\n--- quick_conv_collective (walker_static) ---")
+    collective = quick_conv_collective(
+        ['wide_resnet', 'frequency', 'squeeze_excite'],
+        dim=256, depth=1, fusion_type='walker_static'
+    )
+    collective.network_to(device=device)
+    collective.discover_towers()
+    fused, opinions = collective(x)
+    print(f"Collective output: {fused.shape}")
+    print(f"Collective params: {sum(p.numel() for p in collective.parameters()):,}")
+
+    # Legacy test
+    print("\n--- Legacy build_conv_collective ---")
     configs = preset_conv_pos_neg()
     print(f"Towers: {len(configs)}")
 
@@ -1251,7 +1503,7 @@ if __name__ == '__main__':
     if device.type == 'cuda':
         torch.cuda.synchronize()
 
-    # Benchmark eager
+    # Benchmark
     t0 = time.perf_counter()
     for _ in range(50):
         fused, opinions = collective(x)
@@ -1264,4 +1516,4 @@ if __name__ == '__main__':
     print(f"Opinions: {len(opinions)}")
     print(f"Eager forward: {eager_ms:.2f}ms ({B / (eager_ms/1000):.0f} samples/sec)")
 
-    print("\n✓ WideRouter conv collective ready")
+    print("\n✓ All conv tower tests passed")

@@ -3,11 +3,18 @@ geofractal.router.prefab.geometric_tower_builder
 ================================================
 
 Flexible tower builder with BATCHED forward for tower groups.
+Now with WalkerFusion support for static and learnable fusion.
 
-Uses actual component signatures from:
-- rope_component.py (RoPE, DualRoPE, TriRoPE, QuadRoPE, BeatrixRoPE, CantorRoPE)
-- address_component.py (AddressComponent, SimplexAddressComponent, etc.)
-- fusion_component.py (AdaptiveFusion, GatedFusion, etc.)
+Quick Construction:
+    tower = quick_tower('cantor')
+    pair = quick_pair('cantor', 'beatrix', use_inception=True)
+    collective = quick_collective(['cantor', 'beatrix', 'helix'], fusion='walker_shiva')
+
+Walker Fusion Options:
+    - 'walker_static' / 'walker_shiva': Pure formula (0 learnable params)
+    - 'walker_inception': Learnable modulation (~20k params)
+    - 'walker_slerp', 'walker_lerp', 'walker_zeus': Other presets
+    - Legacy: 'adaptive', 'gated', 'attention', 'concat', 'sum', 'mean'
 """
 
 from __future__ import annotations
@@ -54,6 +61,10 @@ from geofractal.router.components.fusion_component import (
     ConcatFusion,
     SumFusion,
 )
+from geofractal.router.components.walker_component import (
+    WalkerFusion,
+    WalkerInception,
+)
 
 
 # =============================================================================
@@ -67,12 +78,12 @@ class RoPEType(str, Enum):
     QUAD = "quad"
     CANTOR = "cantor"
     BEATRIX = "beatrix"
-    HELIX = "helix"      # -> TriRoPE
-    SIMPLEX = "simplex"  # -> QuadRoPE
-    FRACTAL = "fractal"  # -> DualRoPE
-    SINUSOIDAL = "sinusoidal"  # -> SinusoidalRoPE (pure harmonic)
-    GOLDEN = "golden"    # -> DualRoPE with golden ratio theta spacing
-    FIBONACCI = "fibonacci"  # -> TriRoPE with Fibonacci sequence theta spacing
+    HELIX = "helix"
+    SIMPLEX = "simplex"
+    FRACTAL = "fractal"
+    SINUSOIDAL = "sinusoidal"
+    GOLDEN = "golden"
+    FIBONACCI = "fibonacci"
 
 
 class AddressType(str, Enum):
@@ -81,20 +92,38 @@ class AddressType(str, Enum):
     SPHERICAL = "spherical"
     FRACTAL = "fractal"
     CANTOR = "cantor"
-    BEATRIX = "beatrix"  # -> CantorAddressComponent with mode='staircase'
-    HELIX = "helix"      # -> SphericalAddressComponent
-    SINUSOIDAL = "sinusoidal"  # -> AddressComponent (standard, pairs with SinusoidalRoPE)
-    GOLDEN = "golden"    # -> SimplexAddressComponent with golden ratio params
-    FIBONACCI = "fibonacci"  # -> SphericalAddressComponent (spiral geometry)
+    BEATRIX = "beatrix"
+    HELIX = "helix"
+    SINUSOIDAL = "sinusoidal"
+    GOLDEN = "golden"
+    FIBONACCI = "fibonacci"
 
 
 class FusionType(str, Enum):
+    # Legacy
     ADAPTIVE = "adaptive"
     GATED = "gated"
     ATTENTION = "attention"
     MEAN = "mean"
     CONCAT = "concat"
     SUM = "sum"
+    # Walker
+    WALKER_STATIC = "walker_static"
+    WALKER_INCEPTION = "walker_inception"
+    WALKER_SHIVA = "walker_shiva"
+    WALKER_SLERP = "walker_slerp"
+    WALKER_LERP = "walker_lerp"
+    WALKER_ZEUS = "walker_zeus"
+
+
+WALKER_PRESET_MAP = {
+    FusionType.WALKER_STATIC: 'shiva',
+    FusionType.WALKER_INCEPTION: 'shiva',
+    FusionType.WALKER_SHIVA: 'shiva',
+    FusionType.WALKER_SLERP: 'slerp',
+    FusionType.WALKER_LERP: 'lerp',
+    FusionType.WALKER_ZEUS: 'zeus',
+}
 
 
 # =============================================================================
@@ -104,12 +133,10 @@ class FusionType(str, Enum):
 @dataclass
 class TowerConfig:
     """Configuration for a single tower."""
-
     name: str
     rope: Union[RoPEType, str] = RoPEType.STANDARD
     address: Union[AddressType, str] = AddressType.STANDARD
     inverted: bool = False
-
     dim: Optional[int] = None
     depth: Optional[int] = None
     num_heads: Optional[int] = None
@@ -117,7 +144,6 @@ class TowerConfig:
     ffn_mult: Optional[float] = None
     dropout: Optional[float] = None
     fingerprint_dim: Optional[int] = None
-
     rope_params: Dict[str, Any] = field(default_factory=dict)
     address_params: Dict[str, Any] = field(default_factory=dict)
 
@@ -129,8 +155,33 @@ class TowerConfig:
 
     @property
     def structure_signature(self) -> str:
-        """Towers with same signature can be batched together."""
         return f"{self.rope.value}_{self.address.value}"
+
+
+# =============================================================================
+# GEOMETRY PRESETS
+# =============================================================================
+
+GEOMETRY_CONFIGS = {
+    'cantor': ('cantor', 'cantor'),
+    'beatrix': ('beatrix', 'beatrix'),
+    'helix': ('helix', 'helix'),
+    'simplex': ('simplex', 'simplex'),
+    'fractal': ('fractal', 'fractal'),
+    'standard': ('standard', 'standard'),
+    'golden': ('golden', 'golden'),
+    'fibonacci': ('fibonacci', 'fibonacci'),
+    'sinusoidal': ('sinusoidal', 'sinusoidal'),
+    'spherical': ('standard', 'spherical'),
+}
+
+
+def get_tower_config(geometry: str, name: Optional[str] = None, inverted: bool = False) -> TowerConfig:
+    """Get a tower config by geometry name."""
+    if geometry not in GEOMETRY_CONFIGS:
+        raise ValueError(f"Unknown geometry: {geometry}. Available: {list(GEOMETRY_CONFIGS.keys())}")
+    rope, addr = GEOMETRY_CONFIGS[geometry]
+    return TowerConfig(name=name or geometry, rope=rope, address=addr, inverted=inverted)
 
 
 # =============================================================================
@@ -151,259 +202,137 @@ class InvertedAddressWrapper(nn.Module):
 
 
 # =============================================================================
-# COMPONENT FACTORIES (using actual signatures)
+# BUILDER FUNCTIONS
 # =============================================================================
 
 def build_rope(name: str, rope_type: RoPEType, head_dim: int, **kwargs) -> nn.Module:
-    """Build RoPE component using actual signatures from rope_component.py."""
-
+    """Build RoPE component by type."""
     if rope_type == RoPEType.CANTOR:
-        # CantorRoPE(name, head_dim, theta, levels, tau, mode, blend_alpha, ...)
-        return CantorRoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            theta=kwargs.get('theta', 10000.0),
-            levels=kwargs.get('levels', 5),
-            tau=kwargs.get('tau', 0.25),
-            mode=kwargs.get('mode', 'hybrid'),
-        )
-
+        return CantorRoPE(f'{name}_rope', head_dim=head_dim,
+                         theta_primary=kwargs.get('theta_primary', 10000.0),
+                         cantor_depth=kwargs.get('cantor_depth', 5))
     elif rope_type == RoPEType.BEATRIX:
-        # BeatrixRoPE(name, head_dim, theta, levels, alpha, tau, ...)
-        return BeatrixRoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            theta=kwargs.get('theta', 10000.0),
-            levels=kwargs.get('levels', 5),
-            alpha=kwargs.get('alpha', 0.5),
-            tau=kwargs.get('tau', 0.25),
-        )
-
-    elif rope_type in (RoPEType.HELIX, RoPEType.TRI):
-        # TriRoPE(name, head_dim, theta_alpha, theta_beta, theta_gamma, augmentation, ...)
-        return TriRoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            theta_alpha=kwargs.get('theta_alpha', 10000.0),
-            theta_beta=kwargs.get('theta_beta', 5000.0),
-            theta_gamma=kwargs.get('theta_gamma', 2500.0),
-            augmentation=kwargs.get('augmentation', 'barycentric'),
-        )
-
-    elif rope_type in (RoPEType.SIMPLEX, RoPEType.QUAD):
-        # QuadRoPE(name, head_dim, theta_w, theta_x, theta_y, theta_z, augmentation, ...)
-        return QuadRoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            theta_w=kwargs.get('theta_w', 10000.0),
-            theta_x=kwargs.get('theta_x', 5000.0),
-            theta_y=kwargs.get('theta_y', 2500.0),
-            theta_z=kwargs.get('theta_z', 1000.0),
-            augmentation=kwargs.get('augmentation', 'simplex'),
-        )
-
+        return BeatrixRoPE(f'{name}_rope', head_dim=head_dim,
+                          theta_base=kwargs.get('theta_base', 10000.0),
+                          staircase_resolution=kwargs.get('staircase_resolution', 64))
+    elif rope_type in (RoPEType.QUAD, RoPEType.SIMPLEX):
+        return QuadRoPE(f'{name}_rope', head_dim=head_dim,
+                        theta_w=kwargs.get('theta_w', 10000.0),
+                        theta_x=kwargs.get('theta_x', 5000.0),
+                        theta_y=kwargs.get('theta_y', 2500.0),
+                        theta_z=kwargs.get('theta_z', 1000.0),
+                        augmentation=kwargs.get('augmentation', 'simplex'))
+    elif rope_type in (RoPEType.TRI, RoPEType.HELIX):
+        return TriRoPE(f'{name}_rope', head_dim=head_dim,
+                       theta_alpha=kwargs.get('theta_alpha', 10000.0),
+                       theta_beta=kwargs.get('theta_beta', 5000.0),
+                       theta_gamma=kwargs.get('theta_gamma', 2500.0),
+                       augmentation=kwargs.get('augmentation', 'barycentric'))
     elif rope_type in (RoPEType.FRACTAL, RoPEType.DUAL):
-        # DualRoPE(name, head_dim, theta_primary, theta_secondary, augmentation, ...)
-        return DualRoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            theta_primary=kwargs.get('theta_primary', 10000.0),
-            theta_secondary=kwargs.get('theta_secondary', 3000.0),
-            augmentation=kwargs.get('augmentation', 'lerp'),
-        )
-
+        return DualRoPE(f'{name}_rope', head_dim=head_dim,
+                        theta_primary=kwargs.get('theta_primary', 10000.0),
+                        theta_secondary=kwargs.get('theta_secondary', 3000.0),
+                        augmentation=kwargs.get('augmentation', 'lerp'))
     elif rope_type == RoPEType.SINUSOIDAL:
-        # SinusoidalRoPE - pure harmonic control with learnable phase/amplitude
-        return SinusoidalRoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            base_freq=kwargs.get('base_freq', 1.0),
-            num_harmonics=kwargs.get('num_harmonics', None),
-            learnable_phase=kwargs.get('learnable_phase', True),
-            learnable_amplitude=kwargs.get('learnable_amplitude', True),
-        )
-
+        return SinusoidalRoPE(f'{name}_rope', head_dim=head_dim,
+                              base_freq=kwargs.get('base_freq', 1.0),
+                              num_harmonics=kwargs.get('num_harmonics', None),
+                              learnable_phase=kwargs.get('learnable_phase', True),
+                              learnable_amplitude=kwargs.get('learnable_amplitude', True))
     elif rope_type == RoPEType.GOLDEN:
-        # Golden ratio spacing: θ_secondary = θ_primary / φ
-        # φ = (1 + √5) / 2 ≈ 1.618033988749895
         PHI = 1.618033988749895
         theta_primary = kwargs.get('theta_primary', 10000.0)
-        theta_secondary = kwargs.get('theta_secondary', theta_primary / PHI)
-        return DualRoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            theta_primary=theta_primary,
-            theta_secondary=theta_secondary,
-            augmentation=kwargs.get('augmentation', 'lerp'),  # Valid: add, lerp, residual
-        )
-
+        return DualRoPE(f'{name}_rope', head_dim=head_dim,
+                        theta_primary=theta_primary,
+                        theta_secondary=theta_primary / PHI,
+                        augmentation=kwargs.get('augmentation', 'lerp'))
     elif rope_type == RoPEType.FIBONACCI:
-        # Fibonacci sequence ratios: 1, 1, 2, 3, 5, 8, 13...
-        # Ratios converge to 1/φ ≈ 0.618, 1/φ² ≈ 0.382
         PHI = 1.618033988749895
         theta_base = kwargs.get('theta_base', 10000.0)
-        return TriRoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            theta_alpha=theta_base,                    # F_n
-            theta_beta=theta_base / PHI,              # F_{n-1} ratio ≈ 6180
-            theta_gamma=theta_base / (PHI * PHI),     # F_{n-2} ratio ≈ 3820
-            augmentation=kwargs.get('augmentation', 'barycentric'),  # Valid: barycentric, sum, attention
-        )
-
-    else:  # STANDARD
-        # RoPE(name, head_dim, theta, theta_scale, ...)
-        return RoPE(
-            f'{name}_rope',
-            head_dim=head_dim,
-            theta=kwargs.get('theta', 10000.0),
-            theta_scale=kwargs.get('theta_scale', 1.0),
-        )
+        return TriRoPE(f'{name}_rope', head_dim=head_dim,
+                       theta_alpha=theta_base,
+                       theta_beta=theta_base / PHI,
+                       theta_gamma=theta_base / (PHI * PHI),
+                       augmentation=kwargs.get('augmentation', 'barycentric'))
+    else:
+        return RoPE(f'{name}_rope', head_dim=head_dim,
+                    theta=kwargs.get('theta', 10000.0),
+                    theta_scale=kwargs.get('theta_scale', 1.0))
 
 
 def build_address(name: str, address_type: AddressType, fingerprint_dim: int, **kwargs) -> nn.Module:
-    """
-    Build Address component using actual signatures from address_component.py.
-
-    Signatures:
-        AddressComponent(name, fingerprint_dim, init_scale=0.02)
-        SimplexAddressComponent(name, k=4, embed_dim=64, method='regular', learnable=True)
-        SphericalAddressComponent(name, fingerprint_dim)
-        FractalAddressComponent(name, region='seahorse', orbit_length=64, learnable=True)
-        CantorAddressComponent(name, k_simplex=4, fingerprint_dim=64, mode='staircase', tau=0.25)
-    """
-
+    """Build Address component by type."""
     if address_type == AddressType.CANTOR:
-        return CantorAddressComponent(
-            f'{name}_addr',
-            k_simplex=kwargs.get('k_simplex', 4),
-            fingerprint_dim=fingerprint_dim,
-            mode=kwargs.get('mode', 'staircase'),
-            tau=kwargs.get('tau', 0.25),
-        )
-
-    elif address_type == AddressType.BEATRIX:
-        # Beatrix RoPE already has Devil's Staircase - use learned address for unique identity
-        return AddressComponent(
-            f'{name}_addr',
-            fingerprint_dim=fingerprint_dim,
-            init_scale=kwargs.get('init_scale', 0.02),
-        )
-
+        return CantorAddressComponent(f'{name}_addr', k_simplex=kwargs.get('k_simplex', 4),
+                                      fingerprint_dim=fingerprint_dim,
+                                      mode=kwargs.get('mode', 'staircase'),
+                                      tau=kwargs.get('tau', 0.25))
     elif address_type == AddressType.SIMPLEX:
-        return SimplexAddressComponent(
-            f'{name}_addr',
-            k=kwargs.get('k', 4),
-            embed_dim=fingerprint_dim,
-            method=kwargs.get('method', 'regular'),
-            learnable=kwargs.get('learnable', True),
-        )
-
+        return SimplexAddressComponent(f'{name}_addr', k=kwargs.get('k', 4),
+                                       embed_dim=fingerprint_dim,
+                                       method=kwargs.get('method', 'regular'),
+                                       learnable=kwargs.get('learnable', True))
     elif address_type in (AddressType.SPHERICAL, AddressType.HELIX):
-        return SphericalAddressComponent(
-            f'{name}_addr',
-            fingerprint_dim=fingerprint_dim,
-        )
-
+        return SphericalAddressComponent(f'{name}_addr', fingerprint_dim=fingerprint_dim)
     elif address_type == AddressType.FRACTAL:
-        # FractalAddressComponent fingerprint is built from orbit[:, :2].flatten()
-        # => output dim = 2 * orbit_length.
-        # Therefore, to get fingerprint_dim output, orbit_length must be fingerprint_dim // 2.
         if fingerprint_dim % 2 != 0:
-            raise ValueError(
-                f"Fractal address requires even fingerprint_dim (got {fingerprint_dim}) "
-                f"because it flattens (re, im) pairs."
-            )
-
-        return FractalAddressComponent(
-            f'{name}_addr',
-            region=kwargs.get('region', 'seahorse'),
-            orbit_length=fingerprint_dim // 2,
-            learnable=kwargs.get('learnable', True),
-        )
-
-
-    elif address_type == AddressType.SINUSOIDAL:
-        # Sinusoidal uses standard learned address
-        return AddressComponent(
-            f'{name}_addr',
-            fingerprint_dim=fingerprint_dim,
-            init_scale=kwargs.get('init_scale', 0.02),
-        )
-
+            raise ValueError(f"Fractal address requires even fingerprint_dim (got {fingerprint_dim})")
+        return FractalAddressComponent(f'{name}_addr', region=kwargs.get('region', 'seahorse'),
+                                       orbit_length=fingerprint_dim // 2,
+                                       learnable=kwargs.get('learnable', True))
     elif address_type == AddressType.GOLDEN:
-        # Golden uses SimplexAddressComponent with k=5 (pentagon geometry)
-        # k=5 gives pentagonal geometry (golden ratio appears in pentagons)
-        # Use 'regular' method - regular simplices have golden ratio properties
-        return SimplexAddressComponent(
-            f'{name}_addr',
-            k=kwargs.get('k', 5),  # Pentagon - golden ratio geometry
-            embed_dim=fingerprint_dim,
-            method='regular',  # Regular simplex (valid method)
-            learnable=kwargs.get('learnable', True),
-        )
-
+        return SimplexAddressComponent(f'{name}_addr', k=kwargs.get('k', 5),
+                                       embed_dim=fingerprint_dim, method='regular',
+                                       learnable=kwargs.get('learnable', True))
     elif address_type == AddressType.FIBONACCI:
-        # Fibonacci uses SphericalAddressComponent (spiral geometry)
-        # Fibonacci spirals appear in spherical/golden angle arrangements
-        return SphericalAddressComponent(
-            f'{name}_addr',
-            fingerprint_dim=fingerprint_dim,
-        )
-
-    else:  # STANDARD
-        return AddressComponent(
-            f'{name}_addr',
-            fingerprint_dim=fingerprint_dim,
-            init_scale=kwargs.get('init_scale', 0.02),
-        )
+        return SphericalAddressComponent(f'{name}_addr', fingerprint_dim=fingerprint_dim)
+    else:
+        return AddressComponent(f'{name}_addr', fingerprint_dim=fingerprint_dim,
+                                init_scale=kwargs.get('init_scale', 0.02))
 
 
-def build_fusion(name: str, fusion_type: FusionType, num_inputs: int, in_features: int, **kwargs) -> nn.Module:
-    """Build Fusion component using actual signatures from fusion_component.py."""
+def build_fusion(
+    name: str,
+    fusion_type: Union[FusionType, str],
+    num_inputs: int,
+    in_features: int,
+    num_steps: int = 8,
+    inception_aux_type: str = 'geometric',
+    walker_preset: str = 'shiva',
+    **kwargs
+) -> nn.Module:
+    """Build Fusion component by type."""
+    if isinstance(fusion_type, str):
+        fusion_type = FusionType(fusion_type)
 
+    # Walker fusion types
+    if fusion_type in WALKER_PRESET_MAP:
+        preset = WALKER_PRESET_MAP.get(fusion_type, walker_preset)
+        inception = None
+        if fusion_type == FusionType.WALKER_INCEPTION:
+            inception = WalkerInception(f'{name}_inception', in_features=in_features,
+                                        num_steps=num_steps, num_inputs=2,
+                                        aux_type=inception_aux_type)
+        return WalkerFusion(name, in_features=in_features, preset=preset,
+                           num_steps=num_steps, inception=inception)
+
+    # Legacy fusion types
     if fusion_type == FusionType.ADAPTIVE:
-        # AdaptiveFusion(name, num_inputs, in_features, hidden_features, temperature, ...)
-        return AdaptiveFusion(
-            name,
-            num_inputs=num_inputs,
-            in_features=in_features,
-            hidden_features=kwargs.get('hidden_features'),
-            temperature=kwargs.get('temperature', 1.0),
-        )
-
+        return AdaptiveFusion(name, num_inputs=num_inputs, in_features=in_features,
+                              hidden_features=kwargs.get('hidden_features'),
+                              temperature=kwargs.get('temperature', 1.0))
     elif fusion_type == FusionType.GATED:
-        # GatedFusion(name, num_inputs, in_features, ...)
         return GatedFusion(name, num_inputs=num_inputs, in_features=in_features)
-
     elif fusion_type == FusionType.ATTENTION:
-        # AttentionFusion(name, num_inputs, in_features, num_heads, dropout, ...)
-        return AttentionFusion(
-            name,
-            num_inputs=num_inputs,
-            in_features=in_features,
-            num_heads=kwargs.get('num_heads', 4),
-        )
-
+        return AttentionFusion(name, num_inputs=num_inputs, in_features=in_features,
+                               num_heads=kwargs.get('num_heads', 4))
     elif fusion_type == FusionType.CONCAT:
-        # ConcatFusion(name, num_inputs, in_features, out_features, ...)
-        return ConcatFusion(
-            name,
-            num_inputs=num_inputs,
-            in_features=in_features,
-            out_features=in_features,
-        )
-
+        return ConcatFusion(name, num_inputs=num_inputs, in_features=in_features,
+                            out_features=in_features)
     elif fusion_type == FusionType.SUM:
-        # SumFusion(name, num_inputs, in_features, normalize, ...)
-        return SumFusion(
-            name,
-            num_inputs=num_inputs,
-            in_features=in_features,
-            normalize=kwargs.get('normalize', True),
-        )
-
-    else:  # MEAN - use SumFusion with normalize
+        return SumFusion(name, num_inputs=num_inputs, in_features=in_features,
+                         normalize=kwargs.get('normalize', True))
+    else:
         return SumFusion(name, num_inputs=num_inputs, in_features=in_features, normalize=True)
 
 
@@ -417,7 +346,6 @@ class SafeAttachMixin:
             self.components[name] = component
         else:
             self.objects[name] = component
-
         if hasattr(component, 'parent') and hasattr(component, 'on_attach'):
             object.__setattr__(component, 'parent', self)
             component.on_attach(self)
@@ -458,41 +386,27 @@ class ConfigurableTower(SafeAttachMixin, BaseTower):
         self._inverted = config.inverted
 
         self.objects['tower_config'] = {
-            'name': config.name,
-            'rope': config.rope.value,
-            'address': config.address.value,
-            'inverted': config.inverted,
-            'dim': dim,
-            'depth': depth,
+            'name': config.name, 'rope': config.rope.value,
+            'address': config.address.value, 'inverted': config.inverted,
+            'dim': dim, 'depth': depth,
         }
 
         tf_config = TransformerConfig(
-            dim=dim,
-            num_heads=num_heads,
-            ffn_mult=ffn_mult,
-            variant=TransformerVariant.PRENORM,
-            activation=ActivationType.GELU,
-            dropout=dropout,
-            depth=depth,
+            dim=dim, num_heads=num_heads, ffn_mult=ffn_mult,
+            variant=TransformerVariant.PRENORM, activation=ActivationType.GELU,
+            dropout=dropout, depth=depth,
         )
 
-        # Build RoPE
         rope = build_rope(config.name, config.rope, head_dim, **config.rope_params)
         self.attach('rope', rope)
 
-        # Build Address
         address = build_address(config.name, config.address, fingerprint_dim, **config.address_params)
         if config.inverted:
             address = InvertedAddressWrapper(address)
         self.attach('address', address)
 
-        # Transformer blocks
         for i in range(depth):
-            block = PreNormBlock(
-                name=f'{config.name}_block_{i}',
-                config=tf_config,
-                block_idx=i,
-            )
+            block = PreNormBlock(name=f'{config.name}_block_{i}', config=tf_config, block_idx=i)
             self.append(block)
 
         self.attach('final_norm', nn.LayerNorm(dim))
@@ -509,25 +423,19 @@ class ConfigurableTower(SafeAttachMixin, BaseTower):
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         for block in self.stages:
             x, _ = block(x, mask=mask)
-
         features = self['final_norm'](x)
         pooled = features.mean(dim=1)
         opinion = self['opinion_proj'](pooled)
-
-        # Cache features for retrieval after wide_forward
-        # Uses ephemeral cache that can be bulk-cleared
         self.cache_set('features', features)
-
         return opinion, features
 
     @property
     def cached_features(self) -> Optional[Tensor]:
-        """Features from last forward pass (for WideRouter integration)."""
         return self.cache_get('features')
 
 
 # =============================================================================
-# TOWER OPINION CONTAINERS
+# OPINION CONTAINERS
 # =============================================================================
 
 @dataclass
@@ -548,11 +456,62 @@ class CollectiveOpinion:
 
 
 # =============================================================================
-# CONFIGURABLE COLLECTIVE (using WideRouter)
+# WALKER PAIR - Two towers with WalkerFusion
+# =============================================================================
+
+class WalkerPair(nn.Module):
+    """Two towers fused with WalkerFusion. Simplest collective unit."""
+
+    def __init__(
+        self,
+        name: str,
+        config_a: TowerConfig,
+        config_b: TowerConfig,
+        dim: int = 256,
+        depth: int = 2,
+        num_heads: int = 4,
+        fingerprint_dim: int = 64,
+        use_inception: bool = False,
+        walker_preset: str = 'shiva',
+        inception_aux_type: str = 'geometric',
+    ):
+        super().__init__()
+        self.name = name
+        head_dim = dim // num_heads
+
+        self.tower_a = ConfigurableTower(config=config_a, default_dim=dim, default_depth=depth,
+                                         default_num_heads=num_heads, default_head_dim=head_dim,
+                                         default_fingerprint_dim=fingerprint_dim)
+        self.tower_b = ConfigurableTower(config=config_b, default_dim=dim, default_depth=depth,
+                                         default_num_heads=num_heads, default_head_dim=head_dim,
+                                         default_fingerprint_dim=fingerprint_dim)
+
+        inception = None
+        if use_inception:
+            inception = WalkerInception(f'{name}_inception', in_features=dim,
+                                        num_steps=8, num_inputs=2, aux_type=inception_aux_type)
+
+        self.fusion = WalkerFusion(f'{name}_fusion', in_features=dim,
+                                   preset=walker_preset, num_steps=8, inception=inception)
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        opinion_a, _ = self.tower_a(x, mask)
+        opinion_b, _ = self.tower_b(x, mask)
+        return self.fusion(opinion_a, opinion_b)
+
+    @property
+    def fusion_params(self) -> int:
+        return sum(p.numel() for p in self.fusion.parameters() if p.requires_grad)
+
+
+# =============================================================================
+# CONFIGURABLE COLLECTIVE (WideRouter + WalkerFusion)
 # =============================================================================
 
 class ConfigurableCollective(SafeAttachMixin, WideRouter):
-    """Tower collective using WideRouter for optimized execution."""
+    """Tower collective with WideRouter optimization and WalkerFusion support."""
 
     def __init__(
         self,
@@ -565,10 +524,9 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
         ffn_mult: float = 4.0,
         dropout: float = 0.1,
         fingerprint_dim: int = 64,
-        fusion_type: Union[FusionType, str] = FusionType.ADAPTIVE,
+        fusion_type: Union[FusionType, str] = FusionType.WALKER_STATIC,
         fusion_params: Dict[str, Any] = None,
     ):
-        # Initialize WideRouter with auto_discover=False (we'll register manually)
         super().__init__(name, strict=False, auto_discover=False)
 
         self.dim = dim
@@ -580,37 +538,22 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
 
         self.objects['tower_configs'] = tower_configs
         self.objects['collective_config'] = {
-            'dim': dim,
-            'num_towers': self._num_towers,
-            'fusion_type': fusion_type.value,
+            'dim': dim, 'num_towers': self._num_towers, 'fusion_type': fusion_type.value,
         }
 
-        # Build and attach towers
         for config in tower_configs:
-            tower = ConfigurableTower(
-                config=config,
-                default_dim=dim,
-                default_depth=default_depth,
-                default_num_heads=num_heads,
-                default_head_dim=head_dim,
-                default_ffn_mult=ffn_mult,
-                default_dropout=dropout,
-                default_fingerprint_dim=fingerprint_dim,
-            )
+            tower = ConfigurableTower(config=config, default_dim=dim, default_depth=default_depth,
+                                      default_num_heads=num_heads, default_head_dim=head_dim,
+                                      default_ffn_mult=ffn_mult, default_dropout=dropout,
+                                      default_fingerprint_dim=fingerprint_dim)
             self.attach(config.name, tower)
-            # Register with WideRouter for optimized execution
             self.register_tower(config.name)
 
-        # Fusion (attached after towers so it's not auto-discovered)
         fusion_params = fusion_params or {}
-        fusion = build_fusion(f'{name}_fusion', fusion_type,
-                              num_inputs=self._num_towers, in_features=dim, **fusion_params)
+        fusion = build_fusion(f'{name}_fusion', fusion_type, num_inputs=self._num_towers,
+                              in_features=dim, **fusion_params)
         self.attach('fusion', fusion)
-
-        # Input projection
         self.attach('input_proj', nn.Linear(dim, dim))
-
-        # Fingerprint aggregation
         self.attach('fp_proj', nn.Linear(fingerprint_dim * self._num_towers, fingerprint_dim))
 
         self.objects['debug'] = False
@@ -618,80 +561,159 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
 
     @property
     def towers(self) -> Dict[str, ConfigurableTower]:
-        """Dict of tower name -> ConfigurableTower."""
         return {name: self[name] for name in self.tower_names}
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> CollectiveOpinion:
-        """Forward using WideRouter's optimized wide_forward."""
-        debug = self.objects['debug']
-        debug_info = self.objects['debug_info']
-
         if x.dim() == 2:
             x = x.unsqueeze(1)
-
         x = self['input_proj'](x)
-
-        # Use WideRouter's optimized execution
-        # Returns Dict[tower_name, opinion_tensor]
         opinions_dict = self.wide_forward(x, mask=mask)
 
-        # Build TowerOpinion objects with cached features
         all_opinions = []
         opinion_tensors = []
-
         for tower_name in self.tower_names:
             tower = self[tower_name]
             opinion = opinions_dict[tower_name]
-            features = tower.cached_features  # Retrieved from tower's cache
-
-            tower_opinion = TowerOpinion(
-                name=tower_name,
-                opinion=opinion,
-                features=features,
-                fingerprint=tower.fingerprint,
-                config=tower.config,
-            )
+            features = tower.cached_features
+            tower_opinion = TowerOpinion(name=tower_name, opinion=opinion, features=features,
+                                         fingerprint=tower.fingerprint, config=tower.config)
             all_opinions.append(tower_opinion)
             opinion_tensors.append(opinion)
 
-            if debug:
-                debug_info[f'{tower_name}_opinion_norm'] = opinion.norm(dim=-1).mean().item()
-
-        # Fuse
         fused = self['fusion'](*opinion_tensors)
-
-        # Aggregate fingerprints
         fp_stack = torch.cat([op.fingerprint for op in all_opinions], dim=-1)
         collective_fp = F.normalize(self['fp_proj'](fp_stack), dim=-1)
 
-        if debug:
-            debug_info['fused_norm'] = fused.norm(dim=-1).mean().item()
-
-        # Clear tower caches to prevent memory leaks
         for tower_name in self.tower_names:
             self[tower_name].cache_clear()
 
-        return CollectiveOpinion(
-            fused=fused,
-            opinions={op.name: op for op in all_opinions},
-            weights=None,
-            collective_fingerprint=collective_fp,
-        )
+        return CollectiveOpinion(fused=fused, opinions={op.name: op for op in all_opinions},
+                                 weights=None, collective_fingerprint=collective_fp)
 
     def tower_fingerprints(self) -> Dict[str, Tensor]:
         return {name: self[name].fingerprint for name in self.tower_names}
 
-    def debug_on(self):
-        self.objects['debug'] = True
 
-    def debug_off(self):
-        self.objects['debug'] = False
+# =============================================================================
+# QUICK CONSTRUCTION
+# =============================================================================
+
+def quick_tower(
+    geometry: str,
+    dim: int = 256,
+    depth: int = 2,
+    name: Optional[str] = None,
+    inverted: bool = False,
+    **kwargs
+) -> ConfigurableTower:
+    """
+    Quick single tower by geometry name.
+
+    Example:
+        tower = quick_tower('cantor', dim=512, depth=3)
+    """
+    config = get_tower_config(geometry, name=name, inverted=inverted)
+    return ConfigurableTower(
+        config=config, default_dim=dim, default_depth=depth,
+        default_num_heads=kwargs.get('num_heads', 4),
+        default_head_dim=kwargs.get('head_dim', dim // 4),
+        default_ffn_mult=kwargs.get('ffn_mult', 4.0),
+        default_dropout=kwargs.get('dropout', 0.1),
+        default_fingerprint_dim=kwargs.get('fingerprint_dim', 64),
+    )
+
+
+def quick_pair(
+    geometry_a: str,
+    geometry_b: str,
+    dim: int = 256,
+    depth: int = 2,
+    use_inception: bool = False,
+    walker_preset: str = 'shiva',
+    inception_aux_type: str = 'geometric',
+    name: Optional[str] = None,
+    **kwargs
+) -> WalkerPair:
+    """
+    Quick tower pair with WalkerFusion.
+
+    Example:
+        pair = quick_pair('cantor', 'beatrix', use_inception=True)
+        fused = pair(x)  # [B, D]
+    """
+    name = name or f'{geometry_a}_{geometry_b}'
+    config_a = get_tower_config(geometry_a)
+    config_b = get_tower_config(geometry_b)
+    return WalkerPair(
+        name=name, config_a=config_a, config_b=config_b,
+        dim=dim, depth=depth, num_heads=kwargs.get('num_heads', 4),
+        fingerprint_dim=kwargs.get('fingerprint_dim', 64),
+        use_inception=use_inception, walker_preset=walker_preset,
+        inception_aux_type=inception_aux_type,
+    )
+
+
+def quick_collective(
+    geometries: List[str],
+    dim: int = 256,
+    depth: int = 2,
+    fusion_type: Union[FusionType, str] = FusionType.WALKER_STATIC,
+    name: str = 'collective',
+    **kwargs
+) -> ConfigurableCollective:
+    """
+    Quick tower collective.
+
+    Example:
+        collective = quick_collective(
+            ['cantor', 'beatrix', 'helix', 'simplex'],
+            fusion_type='walker_inception'
+        )
+    """
+    configs = [get_tower_config(g) for g in geometries]
+    return ConfigurableCollective(
+        name=name, tower_configs=configs, dim=dim, default_depth=depth,
+        num_heads=kwargs.get('num_heads', 4),
+        head_dim=kwargs.get('head_dim', dim // 4),
+        ffn_mult=kwargs.get('ffn_mult', 4.0),
+        dropout=kwargs.get('dropout', 0.1),
+        fingerprint_dim=kwargs.get('fingerprint_dim', 64),
+        fusion_type=fusion_type,
+        fusion_params=kwargs.get('fusion_params', {}),
+    )
 
 
 # =============================================================================
-# BUILDER FUNCTION
+# PRESETS
 # =============================================================================
 
+def preset_pos_neg_pairs(geometries: List[str] = None) -> List[TowerConfig]:
+    """Create pos/neg pairs for each geometry."""
+    geometries = geometries or ['cantor', 'beatrix', 'helix', 'simplex', 'sinusoidal', 'golden', 'fibonacci']
+    configs = []
+    for geom in geometries:
+        configs.append(get_tower_config(geom, f'{geom}_pos', inverted=False))
+        configs.append(get_tower_config(geom, f'{geom}_neg', inverted=True))
+    return configs
+
+
+def preset_all_six() -> List[TowerConfig]:
+    return [get_tower_config(g) for g in ['cantor', 'beatrix', 'helix', 'simplex', 'fractal', 'standard']]
+
+
+def preset_all_eight() -> List[TowerConfig]:
+    return [get_tower_config(g) for g in [
+        'cantor', 'beatrix', 'helix', 'simplex', 'fractal', 'standard', 'golden', 'fibonacci'
+    ]]
+
+
+def preset_dual_stack_full() -> List[TowerConfig]:
+    return preset_pos_neg_pairs([
+        'cantor', 'beatrix', 'helix', 'simplex', 'golden', 'fibonacci', 'sinusoidal', 'fractal'
+    ])
+
+
+# Legacy
 def build_tower_collective(
     configs: List[TowerConfig],
     dim: int = 256,
@@ -700,71 +722,14 @@ def build_tower_collective(
     ffn_mult: float = 4.0,
     dropout: float = 0.1,
     fingerprint_dim: int = 64,
-    fusion_type: str = 'adaptive',
+    fusion_type: str = 'walker_static',
     name: str = 'tower_collective',
 ) -> ConfigurableCollective:
-    """Build a tower collective with batched forward."""
     return ConfigurableCollective(
-        name=name,
-        tower_configs=configs,
-        dim=dim,
-        default_depth=default_depth,
-        num_heads=num_heads,
-        head_dim=dim // num_heads,
-        ffn_mult=ffn_mult,
-        dropout=dropout,
-        fingerprint_dim=fingerprint_dim,
-        fusion_type=fusion_type,
+        name=name, tower_configs=configs, dim=dim, default_depth=default_depth,
+        num_heads=num_heads, head_dim=dim // num_heads, ffn_mult=ffn_mult,
+        dropout=dropout, fingerprint_dim=fingerprint_dim, fusion_type=fusion_type,
     )
-
-
-# =============================================================================
-# PRESET CONFIGS
-# =============================================================================
-
-def preset_pos_neg_pairs(
-    geometries: List[str] = ['cantor', 'beatrix', 'helix', 'simplex', 'sinusoidal', 'golden', 'fibonacci'],
-) -> List[TowerConfig]:
-    """Create pos/neg pairs for each geometry."""
-    configs = []
-    for geom in geometries:
-        configs.append(TowerConfig(f'{geom}_pos', rope=geom, address=geom, inverted=False))
-        configs.append(TowerConfig(f'{geom}_neg', rope=geom, address=geom, inverted=True))
-    return configs
-
-
-def preset_all_six() -> List[TowerConfig]:
-    """Original 6-tower config."""
-    return [
-        TowerConfig('cantor', rope='cantor', address='cantor'),
-        TowerConfig('beatrix', rope='beatrix', address='beatrix'),
-        TowerConfig('helix', rope='helix', address='helix'),
-        TowerConfig('simplex', rope='simplex', address='simplex'),
-        TowerConfig('fractal', rope='fractal', address='fractal'),
-        TowerConfig('standard', rope='standard', address='standard'),
-    ]
-
-
-def preset_all_eight() -> List[TowerConfig]:
-    """Extended 8-tower config with golden and fibonacci."""
-    return [
-        TowerConfig('cantor', rope='cantor', address='cantor'),
-        TowerConfig('beatrix', rope='beatrix', address='beatrix'),
-        TowerConfig('helix', rope='helix', address='helix'),
-        TowerConfig('simplex', rope='simplex', address='simplex'),
-        TowerConfig('fractal', rope='fractal', address='fractal'),
-        TowerConfig('standard', rope='standard', address='standard'),
-        TowerConfig('golden', rope='golden', address='golden'),
-        TowerConfig('fibonacci', rope='fibonacci', address='fibonacci'),
-    ]
-
-
-def preset_dual_stack_full() -> List[TowerConfig]:
-    """Full dual stack: 8 geometries × 2 (pos/neg) = 16 towers."""
-    return preset_pos_neg_pairs([
-        'cantor', 'beatrix', 'helix', 'simplex',
-        'golden', 'fibonacci', 'sinusoidal', 'fractal'
-    ])
 
 
 # =============================================================================
@@ -772,67 +737,34 @@ def preset_dual_stack_full() -> List[TowerConfig]:
 # =============================================================================
 
 if __name__ == '__main__':
-    import time
-
     print("=" * 60)
-    print("WideRouter Tower Collective Test")
+    print("Geometric Tower Builder - Quick Construction Test")
     print("=" * 60)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-
-    configs = preset_pos_neg_pairs(['cantor', 'beatrix', 'helix', 'simplex'])
-    print(f"Towers: {len(configs)}")
-
-    collective = build_tower_collective(configs, dim=256, default_depth=1)
-    collective.network_to(device=device)
-
-    print(f"Tower names: {collective.tower_names}")
-    print(f"Params: {sum(p.numel() for p in collective.parameters()):,}")
-
-    B, L, D = 32, 256, 256
+    B, L, D = 4, 16, 256
     x = torch.randn(B, L, D, device=device)
 
-    # Warmup (eager)
-    print("\nEager warmup...")
-    for _ in range(5):
-        _ = collective(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
+    # Single tower
+    tower = quick_tower('cantor', dim=D, depth=2).to(device)
+    opinion, features = tower(x)
+    print(f"quick_tower: opinion {opinion.shape}, features {features.shape}")
 
-    # Benchmark eager
-    t0 = time.perf_counter()
-    for _ in range(50):
-        out = collective(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    eager_ms = (time.perf_counter() - t0) / 50 * 1000
+    # Pair (static)
+    pair = quick_pair('cantor', 'beatrix', dim=D, depth=1).to(device)
+    fused = pair(x)
+    print(f"quick_pair (static): {fused.shape}, fusion_params={pair.fusion_params}")
 
-    print(f"Eager forward: {eager_ms:.2f}ms")
+    # Pair (inception)
+    pair_inc = quick_pair('cantor', 'beatrix', dim=D, depth=1, use_inception=True).to(device)
+    fused = pair_inc(x)
+    print(f"quick_pair (inception): {fused.shape}, fusion_params={pair_inc.fusion_params}")
 
-    # Compile using WideRouter's method
-    print("\nCompiling with WideRouter.prepare_and_compile()...")
-    compiled = collective.prepare_and_compile()
+    # Collective
+    collective = quick_collective(['cantor', 'beatrix', 'helix', 'simplex'],
+                                   dim=D, depth=1, fusion_type='walker_shiva').to(device)
+    collective.discover_towers()
+    result = collective(x)
+    print(f"quick_collective: fused {result.fused.shape}")
 
-    # Warmup compiled
-    for _ in range(5):
-        _ = compiled(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-
-    # Benchmark compiled
-    t0 = time.perf_counter()
-    for _ in range(50):
-        out = compiled(x)
-    if device.type == 'cuda':
-        torch.cuda.synchronize()
-    compiled_ms = (time.perf_counter() - t0) / 50 * 1000
-
-    print(f"Compiled forward: {compiled_ms:.2f}ms")
-    print(f"Speedup: {eager_ms/compiled_ms:.2f}x")
-
-    print(f"\nInput: {x.shape}")
-    print(f"Fused: {out.fused.shape}")
-    print(f"Throughput: {B / (compiled_ms/1000):.0f} samples/sec")
-
-    print("\n✓ WideRouter collective ready")
+    print("\n✓ All quick construction tests passed")
