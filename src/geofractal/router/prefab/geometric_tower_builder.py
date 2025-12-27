@@ -464,6 +464,147 @@ class CollectiveOpinion:
 # WALKER PAIR - Two towers with WalkerFusion
 # =============================================================================
 
+# =============================================================================
+# HETEROGENEOUS FUSION (for multi-encoder with different dims)
+# =============================================================================
+
+class HeterogeneousFusion(nn.Module):
+    """
+    WalkerFusion wrapper that projects heterogeneous inputs to common dimension.
+
+    Use when fusing encoder outputs with different dimensions:
+        fusion = HeterogeneousFusion('meta', in_dims=[1536, 1280, 768], out_dim=512)
+        fused = fusion(conv_out, bigg_out, maxvit_out)  # All projected to 512, then fused
+    """
+
+    def __init__(
+        self,
+        name: str,
+        in_dims: List[int],
+        out_dim: int,
+        use_inception: bool = False,
+        walker_preset: str = 'shiva',
+        inception_aux_type: str = 'geometric',
+        num_steps: int = 8,
+    ):
+        super().__init__()
+        self.name = name
+        self.in_dims = in_dims
+        self.out_dim = out_dim
+        self.num_inputs = len(in_dims)
+
+        # Input projections
+        self.projections = nn.ModuleList([
+            nn.Sequential(
+                nn.LayerNorm(in_dim),
+                nn.Linear(in_dim, out_dim),
+                nn.GELU(),
+                nn.Linear(out_dim, out_dim),
+            ) for in_dim in in_dims
+        ])
+
+        # Walker fusion
+        inception = None
+        if use_inception:
+            inception = WalkerInception(
+                f'{name}_inception', in_features=out_dim,
+                num_steps=num_steps, num_inputs=2, aux_type=inception_aux_type
+            )
+
+        self.fusion = WalkerFusion(
+            f'{name}_fusion', in_features=out_dim,
+            preset=walker_preset, num_steps=num_steps, inception=inception
+        )
+
+    def forward(self, *inputs: Tensor) -> Tensor:
+        """
+        Args:
+            *inputs: Variable number of tensors, one per input dimension
+                     Each should be [B, in_dims[i]] or [B, L, in_dims[i]]
+        Returns:
+            Fused output [B, out_dim] or [B, L, out_dim]
+        """
+        assert len(inputs) == self.num_inputs, \
+            f"Expected {self.num_inputs} inputs, got {len(inputs)}"
+
+        # Project all inputs to common dimension
+        projected = [proj(x) for proj, x in zip(self.projections, inputs)]
+
+        # Fuse pairwise (WalkerFusion handles N inputs hierarchically)
+        return self.fusion(*projected)
+
+    @property
+    def fusion_params(self) -> int:
+        """Learnable params in fusion (excluding projections)."""
+        return sum(p.numel() for p in self.fusion.parameters() if p.requires_grad)
+
+    @property
+    def total_params(self) -> int:
+        """All learnable params including projections."""
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class HeterogeneousPair(nn.Module):
+    """
+    Fuse two inputs with different dimensions.
+
+    Example:
+        pair = HeterogeneousPair('bigg_conv', in_dim_a=1280, in_dim_b=1536, out_dim=512)
+        fused = pair(bigg_features, conv_features)
+    """
+
+    def __init__(
+        self,
+        name: str,
+        in_dim_a: int,
+        in_dim_b: int,
+        out_dim: int,
+        use_inception: bool = False,
+        walker_preset: str = 'shiva',
+        inception_aux_type: str = 'geometric',
+        num_steps: int = 8,
+    ):
+        super().__init__()
+        self.name = name
+
+        # Input projections
+        self.proj_a = nn.Sequential(
+            nn.LayerNorm(in_dim_a),
+            nn.Linear(in_dim_a, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+        self.proj_b = nn.Sequential(
+            nn.LayerNorm(in_dim_b),
+            nn.Linear(in_dim_b, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+        # Walker fusion
+        inception = None
+        if use_inception:
+            inception = WalkerInception(
+                f'{name}_inception', in_features=out_dim,
+                num_steps=num_steps, num_inputs=2, aux_type=inception_aux_type
+            )
+
+        self.fusion = WalkerFusion(
+            f'{name}_fusion', in_features=out_dim,
+            preset=walker_preset, num_steps=num_steps, inception=inception
+        )
+
+    def forward(self, a: Tensor, b: Tensor) -> Tensor:
+        """Fuse two inputs with different dimensions."""
+        pa = self.proj_a(a)
+        pb = self.proj_b(b)
+        return self.fusion(pa, pb)
+
+    @property
+    def fusion_params(self) -> int:
+        return sum(p.numel() for p in self.fusion.parameters() if p.requires_grad)
+
+
 class WalkerPair(nn.Module):
     """Two towers fused with WalkerFusion. Simplest collective unit."""
 
