@@ -1,6 +1,6 @@
 # 101_claude.txt
 # GeoFractal Router - Claude Reference Guide
-# Last Updated: 2025-12-24 (v1.0.4)
+# Last Updated: 2025-12-23 (v1.0.1)
 
 # Official router repo:
 # https://github.com/AbstractEyes/geofractal
@@ -43,7 +43,7 @@
 REPO DIRECTORY STRUCTURE
 ================================================================================
 ai_helpers/
-└──101_claude.txt             # THIS FILE, version 1.0.4
+└──101_claude.txt             # THIS FILE, version 1.0.1
 
 src/geofractal/router/
 ├── __init__.py
@@ -61,13 +61,12 @@ src/geofractal/router/
 │   ├── __init__.py
 │   ├── torch_component.py                    # BaseComponent + nn.Module
 │   ├── address_component.py                  # Geometric identity (Spherical, etc.)
-│   ├── aggregation_component.py              # EXPERIMENTAL: FieldWalkerFusion
 │   ├── cantor_address_component.py           # Cantor-based addressing
 │   ├── cantor_euclidean_attention_component.py
 │   ├── data_component.py                     # Data flow components
 │   ├── embedding_component.py                # Embedding variants
 │   ├── encoder_data_component.py             # Encoder data handling
-│   ├── fusion_component.py                   # FusionComponent + all strategies
+│   ├── fusion_component.py                   # AdaptiveFusion, GatedFusion, etc.
 │   ├── projection_component.py               # Shape transformations
 │   ├── rope_component.py                     # Rotary position embeddings
 │   ├── rope_eval.py                          # RoPE evaluation
@@ -93,7 +92,6 @@ src/geofractal/router/
     ├── geometric_tower_builder.py         # ConfigurableTower, ConfigurableCollective
     ├── geometric_conv_tower_builder.py    # ConvTower, multi-channel VAE support
     ├── geometric_towers.py                # Pre-built tower configurations
-    ├── fusion_builder.py                  # ConfigurableFusion, FusionCollective, FusionBuilder
     ├── debug_geometric_towers.py          # Debug utilities
     ├── train_test_towers.py               # Training/testing utilities
     │
@@ -134,30 +132,11 @@ BaseComponent (ABC, pure Python)  [base_component.py]
             ├── CantorAddressComponent              [components/cantor_address_component.py]
             │
             ├── FusionComponent                     [components/fusion_component.py]
-            │   │
-            │   │   # Basic strategies
-            │   ├── AdaptiveFusion         # Content-dependent weights
-            │   ├── GatedFusion            # Learned sigmoid gates
-            │   ├── AttentionFusion        # Cross-attention between inputs
-            │   ├── ConcatFusion           # Concatenate then project
-            │   ├── SumFusion              # Weighted sum
-            │   ├── BilinearFusion         # Bilinear interaction (2 inputs)
-            │   ├── ResidualFusion         # Fuse with residual connection
-            │   ├── SlotFusion             # Fuse across slot dimension
-            │   │
-            │   │   # Geometric strategies (from David)
-            │   ├── GeometricAttentionGate # Cayley-Menger + Angular + MHA
-            │   ├── CantorScaleFusion      # Fractal geometry routing
-            │   ├── HierarchicalTreeGating # Binary tree decisions
-            │   │
-            │   │   # Binding strategies (from Lyra)
-            │   ├── BindingMask            # Hard -inf masking for isolated groups
-            │   ├── InputVisibilityGate    # Per-input visibility (Lyra's α)
-            │   ├── BindingStrengthController # Per-pair boost (Lyra's β)
-            │   ├── AdaptiveBindingFusion  # Full Lyra adaptive system
-            │   │
-            │   │   # Cantor-derived
-            │   └── InceptiveFusion        # Auxiliary feature injection for weights
+            │   ├── AdaptiveFusion
+            │   ├── GatedFusion
+            │   ├── AttentionFusion
+            │   ├── ConcatFusion
+            │   └── SumFusion
             │
             ├── EmbeddingComponent                  [components/embedding_component.py]
             │
@@ -169,13 +148,7 @@ BaseComponent (ABC, pure Python)  [base_component.py]
             │
             ├── WormholeAttentionComponent          [components/wormhole_attention_component.py]
             │
-            ├── CantorEuclideanAttentionComponent   [components/cantor_euclidean_attention_component.py]
-            │
-            │   # Fusion Controllers [prefab/fusion_builder.py]
-            ├── AlphaController            # Neighbor bleed-over strength [0, 0.5]
-            ├── BetaController             # Geometric vs learned balance [0, 1]
-            ├── GammaController            # Per-input importance weights (softmax)
-            └── FusionControllerBundle     # Bundle of α/β/γ controllers
+            └── CantorEuclideanAttentionComponent   [components/cantor_euclidean_attention_component.py]
 
 ROUTERS (coordination):
 -----------------------
@@ -201,13 +174,7 @@ BaseRouter (ABC, nn.Module)  [base_router.py]
     │       - clear_tower_caches()
     │       │
     │       ├── ConfigurableCollective   [prefab/geometric_tower_builder.py]
-    │       ├── ConvTowerCollective      [prefab/geometric_conv_tower_builder.py]
-    │       └── FusionCollective         [prefab/fusion_builder.py]
-    │
-    ├── ConfigurableFusion (BaseRouter + fusion stages)  [prefab/fusion_builder.py]
-    │       - topology: PARALLEL | SEQUENTIAL | HIERARCHICAL | BLEND
-    │       - stages: fusion components
-    │       - controllers: α/β/γ bundle
+    │       └── ConvTowerCollective      [prefab/geometric_conv_tower_builder.py]
     │
     ├── NotifierRouter (BaseRouter + messaging)  [prefab/notifier_router.py]
     │       - register(address, channel)
@@ -239,121 +206,6 @@ BasePort (ABC, pure Python)  [base_port.py]
             - freeze(), unfreeze()
             │
             └── QwenPort  [ports/qwen.py]
-
-================================================================================
-FUSION BUILDER SYSTEM
-================================================================================
-
-The FusionBuilder mirrors ConfigurableTower for fusion operations.
-
-TOPOLOGIES:
------------
-PARALLEL:     (x1,x2,x3,x4,x5) ──→ [Fusion] ──→ output
-
-SEQUENTIAL:   x1 ─┬→ [F1] ─┬→ [F2] ─┬→ [F3] ─┬→ [F4] → output
-              x2 ─┘        │        │        │
-              x3 ──────────┘        │        │
-              x4 ───────────────────┘        │
-              x5 ────────────────────────────┘
-
-HIERARCHICAL: x1 ─┬→ [F] ─┐
-              x2 ─┘       ├→ [F] ─┐
-              x3 ─┬→ [F] ─┘       ├→ [F] → output
-              x4 ─┘               │
-              x5 ─────────────────┘
-
-BLEND:        inputs ──→ [Adaptive] ──┐
-                    └──→ [Geometric] ─┼──→ β-blend → output
-
-STRATEGIES:
------------
-FusionStrategy.ADAPTIVE     -> AdaptiveFusion
-FusionStrategy.GATED        -> GatedFusion
-FusionStrategy.ATTENTION    -> AttentionFusion
-FusionStrategy.CONCAT       -> ConcatFusion
-FusionStrategy.SUM          -> SumFusion
-FusionStrategy.BILINEAR     -> BilinearFusion
-FusionStrategy.GEOMETRIC    -> GeometricAttentionGate
-FusionStrategy.CANTOR       -> CantorScaleFusion
-FusionStrategy.TREE         -> HierarchicalTreeGating
-FusionStrategy.BINDING      -> AdaptiveBindingFusion (Lyra)
-FusionStrategy.INCEPTIVE    -> InceptiveFusion (Cantor)
-
-CONTROLLERS:
-------------
-Alpha (α): Neighbor bleed-over, range [0, 0.5], default 0.1
-           α=0: Hard attention, α=0.5: 50% bleed to neighbors
-
-Beta (β):  Pathway balance, range [0, 1], default 0.5
-           β=0: Fully learned, β=1: Fully geometric
-
-Gamma (γ): Per-input importance weights, softmax normalized
-           Used for weighting expert opinions or scale outputs
-
-LYRA BINDING COMPONENTS (in fusion_component.py):
--------------------------------------------------
-BindingMask:              Hard -inf mask for isolated input groups
-InputVisibilityGate:      Per-input visibility gating (different from α)
-BindingStrengthController: Per-pair attention boosting (different from β)
-AdaptiveBindingFusion:    Full system with mask + visibility + boost
-
-CANTOR-DERIVED COMPONENTS (in fusion_component.py):
----------------------------------------------------
-InceptiveFusion:          Auxiliary features injected into weight MLP
-                          weights = MLP([anchor, gathered, aux_features])
-                          Use: geometric staircase, PE, Cantor levels
-
-PRESETS:
---------
-'simple'       -> Adaptive, parallel, no controllers
-'geometric'    -> GeometricAttentionGate, parallel, β controller
-'cantor'       -> CantorScaleFusion, parallel, α controller
-'hierarchical' -> HierarchicalTreeGating, parallel, γ controller
-'david'        -> Geometric, blend topology, α + β + γ controllers
-'liminal'      -> Adaptive, hierarchical, α + β + γ (per-stage)
-'lyra'         -> AdaptiveBindingFusion, parallel, binding config
-'inceptive'    -> InceptiveFusion, parallel, aux_features=40
-
-USAGE:
-------
-```python
-from geofractal.router.prefab.fusion_builder import (
-    FusionBuilder, ConfigurableFusion, FusionCollective,
-    FusionConfig, FusionTopology, FusionStrategy, ControllerConfig
-)
-
-# Quick build - single strategy
-fusion = FusionBuilder.simple('my_fusion', num_inputs=5, in_features=256)
-output = fusion(x1, x2, x3, x4, x5)
-
-# From preset
-fusion = FusionBuilder.preset('geo_fusion', 'geometric', num_inputs=8, in_features=512)
-
-# Full config
-config = FusionConfig(
-    num_inputs=5,
-    in_features=256,
-    topology=FusionTopology.BLEND,
-    stages=[
-        FusionStageSpec(strategy=FusionStrategy.ADAPTIVE),
-        FusionStageSpec(strategy=FusionStrategy.GEOMETRIC),
-    ],
-    controllers=ControllerConfig(
-        use_alpha=True, alpha_init=0.1,
-        use_beta=True, beta_init=0.7,
-        use_gamma=True
-    ),
-)
-fusion = ConfigurableFusion('my_fusion', config)
-
-# Fusion collective - multiple pipelines
-collective = FusionCollective('ensemble', num_inputs=5, in_features=256)
-collective.add_preset('learned', 'simple')
-collective.add_preset('geometric', 'geometric')
-collective.add_preset('fractal', 'cantor')
-collective.finalize()
-output = collective(x1, x2, x3, x4, x5)
-```
 
 ================================================================================
 STORAGE MODEL
@@ -470,24 +322,6 @@ class FeatureCollective(WideRouter):
         return self['fusion'](*opinions.values())
 ```
 
-FUSION WITH CONTROLLERS:
-```python
-from geofractal.router.prefab.fusion_builder import FusionBuilder
-
-# Quick: single strategy
-fusion = FusionBuilder.simple('fuse', num_inputs=5, in_features=256)
-
-# Preset with geometric attention
-fusion = FusionBuilder.preset('fuse', 'david', num_inputs=5, in_features=256)
-
-# Access controller values
-if fusion.controllers:
-    alpha = fusion.controllers.get_alpha()
-    beta = fusion.controllers.get_beta()
-    gamma = fusion.controllers.get_gamma()
-    diagnostics = fusion.controllers.get_diagnostics()
-```
-
 ================================================================================
 ANTI-PATTERNS
 ================================================================================
@@ -542,15 +376,6 @@ WHEN CREATING A COLLECTIVE:
 3. Do towers use cache? -> Call clear_tower_caches() after retrieval
 4. Need geometric routing? -> Add NotifierRouter
 
-WHEN CREATING A FUSION:
-1. How many inputs? -> num_inputs parameter
-2. Need dimension change? -> out_features parameter
-3. Need geometric attention? -> Use 'geometric' or 'cantor' preset
-4. Need blending control? -> Enable β controller
-5. Need neighbor bleed? -> Enable α controller
-6. Need input weighting? -> Enable γ controller
-7. Multiple fusion strategies? -> Use FusionCollective
-
 WHEN DEBUGGING MEMORY:
 1. Check cache: model.cache_debug()
 2. Check VRAM: model.cache_size_bytes()
@@ -585,37 +410,11 @@ cantor_euclidean_attention_component.py - Cantor + Euclidean attention
 data_component.py                     - Data flow components
 embedding_component.py                - Embedding variants
 encoder_data_component.py             - Encoder data handling
-fusion_component.py                   - FusionComponent + all strategies
+fusion_component.py                   - AdaptiveFusion, GatedFusion, etc.
 projection_component.py               - Shape transformations (SlotProjection)
 rope_component.py                     - Rotary position embeddings
 transformer_component.py              - Transformer block components
 wormhole_attention_component.py       - Wormhole attention mechanism
-
-FUSION STRATEGIES (in fusion_component.py):
--------------------------------------------
-Basic:
-  AdaptiveFusion       - Content-dependent weights (Lyra pattern)
-  GatedFusion          - Learned sigmoid gates per input
-  AttentionFusion      - Cross-attention between inputs
-  ConcatFusion         - Concatenate then project
-  SumFusion            - Weighted sum with learnable weights
-  BilinearFusion       - Bilinear interaction (exactly 2 inputs)
-  ResidualFusion       - Fuse with residual connection
-  SlotFusion           - Fuse across slot dimension
-
-Geometric (from David):
-  GeometricAttentionGate   - Cayley-Menger volume + Angular + MHA
-  CantorScaleFusion        - Fractal coordinate routing (70/30 blend)
-  HierarchicalTreeGating   - Binary tree probability routing
-
-Binding (from Lyra):
-  BindingMask              - Hard -inf masking for isolated input groups
-  InputVisibilityGate      - Per-input learned visibility control
-  BindingStrengthController - Per-pair attention score boosting
-  AdaptiveBindingFusion    - Full system combining all three
-
-Cantor-derived:
-  InceptiveFusion          - Auxiliary features in weight computation
 
 DIAGNOSTICS (router/components/diagnostics/):
 ---------------------------------------------
@@ -634,26 +433,8 @@ notifier_router.py              - Geometric message routing
 geometric_tower_builder.py      - ConfigurableTower, ConfigurableCollective
 geometric_conv_tower_builder.py - ConvTower, multi-channel VAE support
 geometric_towers.py             - Pre-built tower configurations
-fusion_builder.py               - FusionBuilder, ConfigurableFusion, FusionCollective
 debug_geometric_towers.py       - Debug utilities for towers
 train_test_towers.py            - Training/testing utilities
-
-FUSION BUILDER (in fusion_builder.py):
---------------------------------------
-FusionTopology         - Enum: PARALLEL, SEQUENTIAL, HIERARCHICAL, BLEND
-FusionStrategy         - Enum: ADAPTIVE, GATED, ATTENTION, CONCAT, etc.
-ControllerConfig       - Dataclass: α/β/γ controller settings
-FusionStageSpec        - Dataclass: single stage specification
-FusionConfig           - Dataclass: complete fusion configuration
-
-AlphaController        - TorchComponent: neighbor bleed-over
-BetaController         - TorchComponent: pathway balance
-GammaController        - TorchComponent: input importance weights
-FusionControllerBundle - TorchComponent: bundle of controllers
-
-FusionBuilder          - Factory class with build_stage(), preset(), simple()
-ConfigurableFusion     - BaseRouter: multi-stage fusion with controllers
-FusionCollective       - WideRouter: multiple fusion pipelines
 
 AGATHA/BEATRIX (router/prefab/agatha/):
 ---------------------------------------
@@ -667,135 +448,8 @@ cifar100_core_test.py         - CIFAR-100 experiments
 BEATRIX_CORE.md               - Beatrix documentation
 
 ================================================================================
-EXPERIMENTAL - PENDING ABLATION TESTS
-================================================================================
-
-The following components are functional but pending comprehensive ablation tests.
-Use with appropriate caution in production systems.
-
-AGGREGATION COMPONENT (router/components/aggregation_component.py):
--------------------------------------------------------------------
-Status: EXPERIMENTAL - Core tests passing, awaiting ablation studies
-Origin: Derived from Alucard/Integra encoder walking system
-
-Multi-step interpolative fusion with universal masking support.
-Masking is first-class: mask=0 preserves original (fingerprint), mask=1 applies processing.
-
-Architecture:
-  FieldWalkerFusion = BlendMode × Schedule × Aggregation
-
-  BlendMode:   How to combine (a, b) at single alpha
-  Schedule:    How alpha evolves across steps
-  Aggregation: How to pool stepped results
-
-BLEND MODES (11):
-  lerp        - Linear interpolation
-  slerp       - Spherical interpolation (preserves magnitude)
-  slip        - Entropic phase gating: sigmoid((delta·b).sum())
-  zeus        - Sharp sigmoid threshold at alpha=0.5
-  helios      - Sine-weighted blend
-  surge       - Exponential: 1-exp(-k*alpha)
-  ripple      - Sinusoidal oscillation
-  gilgamesh   - Multi-axis projection
-  shiva       - Gradient decay
-  ifrit       - Squared sine spikes
-  min_p       - Adaptive gating: only blend where |delta| >= min_p * max(|delta|)
-
-SCHEDULES (7):
-  linear, cosine, sigmoid, tau, wave, learnable, adaptive
-
-AGGREGATIONS (19):
-  Basic:      mean, sum, max, min, first, last
-  Top/Bottom: top_k, bottom_k
-  Softmax:    softmax, softmin
-  Adaptive:   min_p (keeps steps where score >= min_p * max_score)
-  Weighted:   weighted, triangular
-  Similarity: similarity, cross_similarity, similarity_tree
-  Spherical:  slerp
-  Learned:    attention, learnable
-
-PRESETS:
-  'alucard'     - lerp + tau + mean (original Alucard behavior)
-  'slerp'       - slerp + linear + weighted
-  'slip'        - slip + cosine + similarity
-  'zeus'        - zeus + sigmoid + last
-  'gilgamesh'   - gilgamesh + linear + triangular
-  'shiva'       - shiva + cosine + similarity_tree
-  'ifrit'       - ifrit + wave + softmax
-  'learnable'   - lerp + learnable schedule + learnable aggregation
-  'fingerprint' - lerp + cosine + similarity (fingerprint preservation)
-  'min_p'       - min_p blend + linear + min_p aggregation
-
-MASKING:
-  All components support alpha (continuous) and binary (hard) masking.
-  - Alpha mask [0,1]: gradual blend with original
-  - Binary mask {0,1}: hard preservation/processing
-  - Fingerprint zones (mask=0) pass through unchanged
-  - binarize_mask(alpha_mask, threshold=0.5) converts alpha to binary
-
-USAGE:
-  from geofractal.router.components.aggregation_component import (
-      FieldWalkerFusion, from_preset, get_blend_mode, get_aggregation
-  )
-
-  # From preset
-  walker = from_preset('my_walker', 'slerp', in_features=256, num_steps=8)
-
-  # With masking (fingerprint first 8 tokens)
-  mask = torch.zeros(B, T)
-  mask[:, 8:] = 1.0
-  output = walker(source, target, mask=mask)
-
-  # Custom configuration
-  walker = FieldWalkerFusion(
-      'custom', in_features=256, num_steps=8,
-      blend_mode='slip', schedule='cosine', aggregation='min_p',
-      learnable_steps=True
-  )
-
-PENDING ABLATION TESTS:
-  - BlendMode comparison across modalities (vision, text, audio)
-  - Optimal num_steps for different tasks
-  - min_p threshold sensitivity analysis
-  - Learnable schedule convergence behavior
-  - Fingerprint preservation accuracy metrics
-  - Aggregation strategy impact on gradient flow
-
-================================================================================
 VERSION HISTORY
 ================================================================================
-
-v1.0.4 (2025-12-24):
-- EXPERIMENTAL: aggregation_component.py (pending ablation)
-  - FieldWalkerFusion: Multi-step interpolative fusion
-  - 11 BlendModes (lerp, slerp, slip, zeus, min_p, etc.)
-  - 7 Schedules (linear, cosine, learnable, adaptive, etc.)
-  - 19 Aggregations (mean, top_k, min_p, similarity_tree, etc.)
-  - Universal masking: alpha (continuous) + binary (hard)
-  - Fingerprint preservation for protected zones
-  - 10 presets including 'min_p' and 'fingerprint'
-
-v1.0.3 (2025-12-24):
-- Lyra-derived binding components:
-  - BindingMask (hard -inf isolation)
-  - InputVisibilityGate (per-input visibility)
-  - BindingStrengthController (per-pair boost)
-  - AdaptiveBindingFusion (full Lyra pattern)
-- Cantor-derived components:
-  - InceptiveFusion (auxiliary feature injection)
-- FusionStrategy.BINDING + 'lyra' preset
-- FusionStrategy.INCEPTIVE + 'inceptive' preset
-- HierarchicalTreeGating dropout kwarg
-
-v1.0.2 (2025-12-24):
-- FusionBuilder system (mirrors ConfigurableTower for fusion)
-- Geometric fusion strategies from David:
-  - GeometricAttentionGate (Cayley-Menger + Angular + MHA)
-  - CantorScaleFusion (fractal routing)
-  - HierarchicalTreeGating (binary tree)
-- Fusion controllers (α/β/γ)
-- FusionCollective for multi-pipeline fusion
-- All fusion strategies now accept out_features
 
 v1.0.1 (2025-12-23):
 - Cache system added to BaseRouter
@@ -861,10 +515,6 @@ COHESIVENESS RULES
     Individual towers don't need to be accurate.
     They need to see differently.
 
-11. UNIFORM FUSION SIGNATURES
-    All FusionComponent subclasses accept out_features parameter.
-    Use out_proj when input/output dimensions differ.
-
 ================================================================================
 QUICK LOOKUPS
 ================================================================================
@@ -892,39 +542,6 @@ QUICK LOOKUPS
 
 "Where are fusion strategies?"
 -> src/geofractal/router/components/fusion_component.py
-
-"Where is the fusion builder?"
--> src/geofractal/router/prefab/fusion_builder.py
--> FusionBuilder, ConfigurableFusion, FusionCollective
-
-"Where are fusion controllers?"
--> src/geofractal/router/prefab/fusion_builder.py
--> AlphaController, BetaController, GammaController, FusionControllerBundle
-
-"Where is geometric attention (Cayley-Menger)?"
--> src/geofractal/router/components/fusion_component.py
--> GeometricAttentionGate class
-
-"Where is Cantor fusion routing?"
--> src/geofractal/router/components/fusion_component.py
--> CantorScaleFusion class
-
-"Where is tree-based gating?"
--> src/geofractal/router/components/fusion_component.py
--> HierarchicalTreeGating class
-
-"Where are Lyra binding components?"
--> src/geofractal/router/components/fusion_component.py
--> BindingMask, InputVisibilityGate, BindingStrengthController, AdaptiveBindingFusion
-
-"Where is InceptiveFusion (auxiliary feature injection)?"
--> src/geofractal/router/components/fusion_component.py
--> InceptiveFusion class
-
-"Where is FieldWalkerFusion / multi-step interpolation?" [EXPERIMENTAL]
--> src/geofractal/router/components/aggregation_component.py
--> FieldWalkerFusion, BlendModes (lerp/slerp/slip/min_p), Aggregations (19 types)
--> Presets: 'alucard', 'slerp', 'slip', 'min_p', 'fingerprint', etc.
 
 "Where is geometric routing?"
 -> src/geofractal/router/prefab/notifier_router.py
@@ -991,3 +608,141 @@ QUICK LOOKUPS
 ================================================================================
 END OF REFERENCE
 ================================================================================
+================================================================================
+SHORTHAND CONVENTIONS (in development)
+================================================================================
+
+Import aliases for common usage:
+    import geofractal.components as gfc    # gfc.FusionComponent, gfc.ChainComponent
+    import geofractal.router as gfr        # gfr.BaseRouter, gfr.WideRouter
+    import geofractal.tower as gft         # gft.BaseTower, gft.ConfigurableTower
+
+================================================================================
+WALKER FUSION SYSTEM (v1.0.1)
+================================================================================
+
+CORE PRINCIPLE:
+    No configuration = just the formula.
+    Learnable sections are None by default.
+    Static utilities compose into walkers; inception adds optional learning.
+
+ARCHITECTURE:
+    ┌─────────────────────────────────────────────────────────────┐
+    │              UTILITIES (STATIC - BaseUtility)               │
+    │  Pure mathematical formulas - 0 learnable parameters        │
+    ├─────────────────────────────────────────────────────────────┤
+    │  BlendUtility      │ shiva, slerp, lerp, slip, zeus...     │
+    │  ScheduleUtility   │ cosine, linear, sigmoid, tau...       │
+    │  AggregationUtility│ mean, similarity_tree, softmax...     │
+    └─────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │         ConfigurableWalker (STATIC - NOT nn.Module)         │
+    │  Composes utilities into walking formula                    │
+    ├─────────────────────────────────────────────────────────────┤
+    │  walker = ConfigurableWalker(blend, schedule, aggregation)  │
+    │  stepped, result = walker.walk(a, b, num_steps=8)           │
+    │  WALKER_PRESETS: shiva, slerp, lerp, slip, zeus, gilgamesh  │
+    └─────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │      WalkerInception (OPTIONAL - TorchComponent)            │
+    │  Learnable modulation layer - None by default               │
+    ├─────────────────────────────────────────────────────────────┤
+    │  aux = compute_aux(a, b)         # cosine, geometric, etc.  │
+    │  alphas = modulate_schedule(aux) # base + learned offset    │
+    │  weights = compute_agg_weights(aux)  # learned step weights │
+    │  Aux types: cosine, geometric, learned, walker_path         │
+    └─────────────────────────────────────────────────────────────┘
+                                  │
+                                  ▼
+    ┌─────────────────────────────────────────────────────────────┐
+    │            WalkerFusion (TorchComponent)                    │
+    │  Houses walker + optional inception                         │
+    ├─────────────────────────────────────────────────────────────┤
+    │  walker: ConfigurableWalker      # STATIC (always present)  │
+    │  inception: Optional[...] = None # OPTIONAL learnable       │
+    │                                                             │
+    │  inception=None → pure static (0 params)                    │
+    │  inception=WalkerInception(...) → modulated (~20k params)   │
+    │                                                             │
+    │  forward(*inputs) → hierarchical fusion for N inputs        │
+    └─────────────────────────────────────────────────────────────┘
+
+FILE LOCATIONS:
+    router/components/utility/
+        ├── blend_utility.py       # 11 blend modes, create_blend()
+        ├── schedule_utility.py    # 8 schedules, create_schedule()
+        ├── aggregation_utility.py # 17 aggregations, create_aggregation()
+        └── chain_component.py     # Device-dispatching pipeline
+
+    router/components/
+        └── walker_component.py    # ConfigurableWalker, WalkerInception, WalkerFusion
+
+USAGE PATTERNS:
+
+    # Pure static walking (0 learnable params)
+    fusion = WalkerFusion("walk", in_features=512, preset='shiva')
+    result = fusion(a, b)  # Just the formula
+
+    # With learnable modulation (~20k params)
+    inception = WalkerInception("inc", in_features=512, num_steps=8, aux_type='cosine')
+    fusion = WalkerFusion("walk", in_features=512, preset='shiva', inception=inception)
+    result = fusion(a, b)  # Formula + learned modulation
+
+    # Convenience factory
+    static = create_walker_fusion("s", 512, preset='shiva')  # inception=None
+    learned = create_walker_fusion("l", 512, preset='shiva', with_inception=True)
+
+    # Multi-input fusion (hierarchical: (a,b)→ab, (ab,c)→abc)
+    result = fusion(a, b, c, d)
+
+WALKER PRESETS:
+    'shiva':     blend=shiva, schedule=cosine, aggregation=similarity_tree (98.21% CIFAR-10)
+    'slerp':     blend=slerp, schedule=cosine, aggregation=mean
+    'lerp':      blend=lerp, schedule=linear, aggregation=mean
+    'slip':      blend=slip, schedule=cosine, aggregation=similarity
+    'zeus':      blend=zeus, schedule=cosine, aggregation=softmax
+    'gilgamesh': blend=gilgamesh, schedule=tau, aggregation=weighted_mean
+
+BLEND SAFETY CATEGORIES:
+    ASYMPTOTIC_SAFE:     {'shiva', 'zeus', 'surge'}     - Safe for any alpha
+    EXTRAPOLATING:       {'lerp', 'slerp', 'slip'}      - Safe alpha ∈ [0, 2]
+    PERIODIC_DANGEROUS:  {'gilgamesh', 'helios', ...}   - Periodic/chaotic
+
+EXPERIMENTAL RESULTS:
+    Static shiva+cosine+similarity_tree: 98.21% CIFAR-10 (winner)
+    With cosine aux modulation:          89.00% CIFAR-100 (0.994 consistency)
+    With geometric aux modulation:       88.96% CIFAR-100 (0.997 consistency)
+    With walker_path aux:                perfect 1.000 consistency
+
+BEHAVIORAL IMPLICATIONS:
+    1. Utilities are FORMULAS - never add learnable params to them
+    2. ConfigurableWalker is a COMPOSITION - not an nn.Module
+    3. WalkerInception is WHERE LEARNING HAPPENS - optional, explicit
+    4. WalkerFusion is the INTERFACE - wraps walker + optional inception
+    5. 2D inputs [B,D] use simple weighted mean (avoids complex aggregation issues)
+    6. 3D inputs [B,T,D] use full aggregation utilities
+    7. Multi-input fusion is hierarchical by default: ((a,b),c)
+    8. Consistency > accuracy when inception is enabled
+
+================================================================================
+UTILITY HIERARCHY
+================================================================================
+
+BaseComponent (ABC)
+    ├── TorchComponent (+ nn.Module)  → learnable, device-managed
+    └── BaseUtility (+ __call__)      → lightweight formulas, no params
+            ├── BlendUtility          → interpolation formulas
+            ├── ScheduleUtility       → alpha curve generators
+            └── AggregationUtility    → step reduction methods
+
+================================================================================
+NEXT STEPS
+================================================================================
+
+    - Fusion strategies (multi-stack, multi-infuser)
+    - Integration with existing FusionComponent hierarchy
+    - Replace old fusion mechanisms with WalkerFusion where appropriate
