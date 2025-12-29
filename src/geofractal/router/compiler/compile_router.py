@@ -2,17 +2,14 @@
 geofractal.router.compiler.compile_router
 =========================================
 
-CompileRouter - Introspective analysis layer for arbitrary nn.Module structures.
+CompileRouter - Introspective compilation layer for arbitrary nn.Module structures.
 
 Takes any module tree (router, raw nn.Module, sloppy code) and:
 1. Introspects to find all nn.Module children regardless of attachment style
 2. Classifies modules by type (LINEAR, CONV, NORM, ACTIVATION, etc.)
 3. Computes structural signatures for grouping similar operations
 4. Identifies batchable operations at the same depth
-5. Provides detailed statistics about model structure
-
-This is purely ANALYTICAL - it does not restructure the model at runtime.
-The actual compilation is just torch.compile on the original model.
+5. Builds VMapTowerGroups for true vectorized execution
 
 Handles:
 - self.thing = nn.Linear(...)
@@ -25,16 +22,13 @@ Usage:
     compiler = CompileRouter.from_module(model)
     compiler.print_tree()      # Visual structure
     compiler.print_stages()    # Batchable groups
-    stats = compiler.get_compilation_stats()
 
-    # Compile (just torch.compile on original)
-    compiled = compiler.compile()
+    # Build vmap groups for batchable stages
+    vmap_groups = compiler.build_vmap_groups()
 
-    # Or use the one-liner
-    compiler = compile_module(model)
-
-The value is in understanding your model structure and identifying
-optimization opportunities - not runtime restructuring.
+    # Or build a WideRouter wrapper
+    wide = compiler.build_wide_router()
+    compiled = torch.compile(wide)
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -58,7 +52,7 @@ from geofractal.router.base_router import BaseRouter
 from geofractal.router.base_tower import BaseTower
 from geofractal.router.base_component import BaseComponent
 from geofractal.router.components.torch_component import TorchComponent
-from geofractal.router.wide_router import WideRouter
+from geofractal.router.wide_router import WideRouter, VMapTowerGroup
 
 
 # =============================================================================
@@ -130,7 +124,7 @@ class ExecutionStage:
 
 @dataclass
 class CompiledStructure:
-    """Result of compile_towers() - the staged execution plan."""
+    """Result of compile_towers() - analysis of the module structure."""
     stages: List[ExecutionStage]
     execution_order: List[str]  # Node paths in execution order
     wrapped_modules: Dict[str, 'WrappedModule']  # path -> wrapper
@@ -139,6 +133,105 @@ class CompiledStructure:
     total_params: int
     total_stages: int
     batchable_stages: int
+
+
+# =============================================================================
+# COMPILED WIDE ROUTER
+# =============================================================================
+
+class CompiledWideRouter(WideRouter):
+    """
+    WideRouter built from CompileRouter analysis.
+
+    Wraps the original model and provides vmap-based execution for
+    batchable module groups identified during analysis.
+
+    Usage:
+        compiler = CompileRouter.from_module(model)
+        wide = compiler.build_wide_router()
+        compiled = torch.compile(wide, mode='reduce-overhead')
+        output = compiled(x)
+    """
+
+    def __init__(
+        self,
+        name: str,
+        original_model: nn.Module,
+        vmap_groups: Dict[str, VMapTowerGroup],
+        structure: 'CompiledStructure',
+    ):
+        super().__init__(name, auto_discover=False)
+
+        # Store original model
+        self.objects['original_model'] = original_model
+        self.objects['structure'] = structure
+
+        # Attach original for parameter tracking
+        if original_model is not None:
+            self.attach('_original', original_model)
+
+        # Store vmap groups
+        self._vmap_groups_compiled = nn.ModuleDict()
+        for sig, group in vmap_groups.items():
+            # Clean signature for valid key
+            clean_sig = sig.replace(':', '_').replace('[', '').replace(']', '').replace(',', '_')
+            self._vmap_groups_compiled[clean_sig] = group
+            # Register as tower for wide_forward
+            self.attach(f'vmap_{clean_sig}', group)
+            self.register_tower(f'vmap_{clean_sig}')
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Forward through the original model.
+
+        The vmap groups are available via wide_forward() for
+        explicit batched execution of specific module groups.
+        """
+        original = self.objects.get('original_model')
+        if original is not None:
+            return original(x)
+        raise RuntimeError("No original model attached")
+
+    def forward_vmap(self, x: Tensor, group_sig: str) -> Dict[str, Tensor]:
+        """
+        Execute a specific vmap group.
+
+        Args:
+            x: Input tensor
+            group_sig: Signature of the group to execute
+
+        Returns:
+            Dict mapping module path -> output
+        """
+        clean_sig = group_sig.replace(':', '_').replace('[', '').replace(']', '').replace(',', '_')
+        if clean_sig in self._vmap_groups_compiled:
+            return self._vmap_groups_compiled[clean_sig](x)
+        raise KeyError(f"No vmap group with signature: {group_sig}")
+
+    @property
+    def vmap_group_signatures(self) -> List[str]:
+        """List of available vmap group signatures."""
+        return list(self._vmap_groups_compiled.keys())
+
+    @property
+    def num_vmap_groups(self) -> int:
+        """Number of vmap groups."""
+        return len(self._vmap_groups_compiled)
+
+    def get_vmap_group_info(self) -> List[Dict[str, Any]]:
+        """Get info about vmap groups."""
+        info = []
+        for sig, group in self._vmap_groups_compiled.items():
+            info.append({
+                'signature': sig,
+                'num_modules': group.n,
+                'names': group.names,
+            })
+        return info
+
+    def __repr__(self) -> str:
+        orig_name = type(self.objects.get('original_model')).__name__
+        return f"CompiledWideRouter(name='{self.name}', vmap_groups={self.num_vmap_groups}, original={orig_name})"
 
 
 # =============================================================================
@@ -528,15 +621,18 @@ class CompileRouter(BaseRouter):
     @torch.compiler.disable
     def compile_towers(self) -> CompiledStructure:
         """
-        Analyze structure and create staged execution plan.
+        Analyze structure and identify batchable operation groups.
 
         Groups similar operations by:
         1. Category (LINEAR, CONV, NORM, etc.)
         2. Signature (same shape, same params)
         3. Depth (same level in tree)
 
+        This is ANALYSIS only - it identifies what COULD be batched
+        if the model were restructured as a WideRouter.
+
         Returns:
-            CompiledStructure with execution stages
+            CompiledStructure with analysis results
         """
         if not self.objects['_introspected']:
             self.introspect()
@@ -645,85 +741,67 @@ class CompileRouter(BaseRouter):
 
         return torch.compile(original, mode=mode, **kwargs)
 
+    def build_vmap_groups(self, min_group_size: int = 2) -> Dict[str, VMapTowerGroup]:
+        """
+        Build VMapTowerGroups from batchable stages.
+
+        Creates a VMapTowerGroup for each batchable stage, enabling
+        true vectorized execution via torch.func.vmap.
+
+        Args:
+            min_group_size: Minimum modules to form a vmap group
+
+        Returns:
+            Dict mapping stage signature -> VMapTowerGroup
+        """
+        if not self.objects['_compiled']:
+            self.compile_towers()
+
+        vmap_groups = {}
+
+        for stage in self._compiled_structure.stages:
+            if stage.can_batch and stage.size >= min_group_size:
+                # Extract modules and names
+                modules = [node.module for node in stage.nodes]
+                names = [node.path for node in stage.nodes]
+
+                # Create VMapTowerGroup
+                group = VMapTowerGroup(modules, names)
+                vmap_groups[stage.signature] = group
+
+        return vmap_groups
+
+    def build_wide_router(self, name: str = None) -> 'CompiledWideRouter':
+        """
+        Build a WideRouter wrapper around the original model.
+
+        The WideRouter contains VMapTowerGroups for batchable stages,
+        enabling vmap-based execution when wide_forward is called.
+
+        Args:
+            name: Name for the WideRouter
+
+        Returns:
+            CompiledWideRouter wrapping the original model
+        """
+        if not self.objects['_compiled']:
+            self.compile_towers()
+
+        name = name or f"{self.name}_wide"
+        original = self.components['root'] if 'root' in self.components else None
+
+        return CompiledWideRouter(
+            name=name,
+            original_model=original,
+            vmap_groups=self.build_vmap_groups(),
+            structure=self._compiled_structure,
+        )
+
     def get_original(self) -> nn.Module:
         """Get the original model."""
         if 'root' in self.components:
             return self.components['root']
         raise RuntimeError("No root model attached")
-
-    # =========================================================================
-    # STAGED EXECUTION
-    # =========================================================================
-
-    def staged_forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """
-        Execute using staged batching.
-
-        Groups operations by stage and executes in batch where possible.
-
-        Args:
-            x: Input tensor
-
-        Returns:
-            Dict mapping node path -> output tensor
-        """
-        if not self.objects['_compiled']:
-            self.compile_towers()
-
-        outputs: Dict[str, Tensor] = {}
-
-        for stage in self._compiled_structure.stages:
-            if stage.can_batch and stage.size >= 2:
-                # Batched execution for aligned operations
-                stage_outputs = self._execute_stage_batched(x, stage)
-            else:
-                # Sequential execution
-                stage_outputs = self._execute_stage_sequential(x, stage)
-
-            outputs.update(stage_outputs)
-
-        return outputs
-
-    def _execute_stage_batched(
-        self,
-        x: Tensor,
-        stage: ExecutionStage,
-    ) -> Dict[str, Tensor]:
-        """Execute a stage with batched operations."""
-        outputs = {}
-
-        # For aligned operations of same signature, execute together
-        # torch.compile will fuse these kernels
-        for node in stage.nodes:
-            module = self._wrappers.get(node.path, node.module)
-            try:
-                out = module(x)
-                outputs[node.path] = out
-            except Exception:
-                # Fallback to original module on error
-                out = node.module(x)
-                outputs[node.path] = out
-
-        return outputs
-
-    def _execute_stage_sequential(
-        self,
-        x: Tensor,
-        stage: ExecutionStage,
-    ) -> Dict[str, Tensor]:
-        """Execute a stage sequentially."""
-        outputs = {}
-
-        for node in stage.nodes:
-            module = self._wrappers.get(node.path, node.module)
-            try:
-                out = module(x)
-                outputs[node.path] = out
-            except Exception:
-                out = node.module(x)
-                outputs[node.path] = out
-
-        return outputs
 
     # =========================================================================
     # FORWARD
@@ -733,7 +811,8 @@ class CompileRouter(BaseRouter):
         """
         Default forward - delegates to root component.
 
-        For staged execution, use staged_forward().
+        CompileRouter is analytical - it doesn't modify execution.
+        Use compile() to get a torch.compiled version.
         """
         if 'root' in self.components:
             return self.components['root'](x)
@@ -807,22 +886,23 @@ class CompileRouter(BaseRouter):
             self.print_tree(child, indent + 1)
 
     def print_stages(self) -> None:
-        """Print execution stages."""
+        """Print analysis stages (batchable operation groups)."""
         if not self._compiled_structure:
-            print("No stages compiled. Call compile_towers() first.")
+            print("No analysis done. Call compile_towers() first.")
             return
 
         print(f"\n{'='*60}")
-        print(f"EXECUTION STAGES ({self._compiled_structure.total_stages} total, "
+        print(f"BATCHABLE GROUPS ({self._compiled_structure.total_stages} groups, "
               f"{self._compiled_structure.batchable_stages} batchable)")
+        print("(Analysis only - shows what COULD batch in a WideRouter)")
         print(f"{'='*60}")
 
         for stage in self._compiled_structure.stages:
-            batch_marker = "⚡ BATCH" if stage.can_batch else "○ SEQ"
-            print(f"\nStage {stage.stage_id} [{stage.category.name}] {batch_marker}")
+            batch_marker = "⚡ BATCHABLE" if stage.can_batch else "○ SEQUENTIAL"
+            print(f"\nGroup {stage.stage_id} [{stage.category.name}] {batch_marker}")
             print(f"  Signature: {stage.signature}")
             print(f"  Depth: {stage.depth}")
-            print(f"  Nodes: {stage.size}")
+            print(f"  Count: {stage.size}")
             print(f"  Params: {stage.total_params:,}")
             print(f"  Modules:")
             for node in stage.nodes[:5]:  # Show first 5
@@ -944,12 +1024,56 @@ if __name__ == '__main__':
     print(f"\nStats: {stats2}")
 
     # -------------------------------------------------------------------------
-    # Test 3: Forward execution
+    # Test 3: Build VMap Groups
     # -------------------------------------------------------------------------
 
-    print("\n--- Test 3: Forward Execution ---")
+    print("\n--- Test 3: VMap Groups ---")
 
+    vmap_groups = compiler2.build_vmap_groups()
+    print(f"Created {len(vmap_groups)} VMapTowerGroup(s)")
+    for sig, group in vmap_groups.items():
+        print(f"  {sig[:50]}... : {group.n} modules")
+
+    # Test vmap execution on the heads
     x = torch.randn(4, 256)
+    if vmap_groups:
+        first_sig = list(vmap_groups.keys())[0]
+        first_group = vmap_groups[first_sig]
+
+        # Need input that matches the group's expected input
+        # For the heads, they expect [B, dim] after encoder+norm
+        encoded = multi.norm(multi.encoder(x))
+
+        vmap_out = first_group(encoded)
+        print(f"VMap group output: {len(vmap_out)} tensors")
+        for name, tensor in list(vmap_out.items())[:2]:
+            print(f"    {name}: {tensor.shape}")
+
+    # -------------------------------------------------------------------------
+    # Test 4: Build WideRouter
+    # -------------------------------------------------------------------------
+
+    print("\n--- Test 4: CompiledWideRouter ---")
+
+    wide = compiler2.build_wide_router()
+    print(f"Built: {wide}")
+    print(f"VMap groups: {wide.num_vmap_groups}")
+    print(f"Registered towers: {len(wide.tower_names)}")
+
+    for info in wide.get_vmap_group_info():
+        print(f"  {info['signature'][:40]}... : {info['num_modules']} modules")
+
+    # Forward through wide router (uses original model)
+    y_wide = wide(x)
+    y_orig = multi(x)
+    diff = (y_wide - y_orig).abs().max().item()
+    print(f"WideRouter forward matches original: {diff:.2e}")
+
+    # -------------------------------------------------------------------------
+    # Test 5: Forward execution
+    # -------------------------------------------------------------------------
+
+    print("\n--- Test 5: Forward Execution ---")
 
     # Original forward
     y_orig = sloppy(x)
@@ -963,12 +1087,7 @@ if __name__ == '__main__':
     diff = (y_orig - y_compiled).abs().max().item()
     print(f"Diff: {diff:.2e}")
 
-    # Multi-head model
-    y_multi_orig = multi(x)
-    y_multi_compiled = compiler2(x)
-    diff2 = (y_multi_orig - y_multi_compiled).abs().max().item()
-    print(f"Multi-head diff: {diff2:.2e}")
-
     print("\n✓ CompileRouter ready")
-    print("✓ Use compiler.compile() for torch.compile")
-    print("✓ Use compiler.get_compilation_stats() for analysis")
+    print("✓ Use compiler.build_vmap_groups() for VMapTowerGroups")
+    print("✓ Use compiler.build_wide_router() for CompiledWideRouter")
+    print("✓ Use torch.compile(wide_router) for optimized execution")
