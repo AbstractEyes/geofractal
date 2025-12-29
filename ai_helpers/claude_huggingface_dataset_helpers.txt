@@ -1,0 +1,431 @@
+# claude_huggingface_dataset_prep_helper.txt
+# HuggingFace Dataset Preparation - Claude Reference Guide
+# Last Updated: 2025-12-28 (v1.0.0)
+
+# ================================================================================
+# PURPOSE
+# ================================================================================
+# Reference guide for preparing and uploading datasets to HuggingFace Hub,
+# specifically for dense feature vectors (encoder outputs, embeddings, etc.)
+# Learned through trial and error - trust these patterns.
+
+# ================================================================================
+# SUPPORTED FILE FORMATS (Hub Native)
+# ================================================================================
+#
+# These formats get auto-converted to Parquet and work with Dataset Viewer:
+#   ✅ Parquet (.parquet)        - RECOMMENDED for large data
+#   ✅ CSV (.csv, .tsv)          - Simple tabular
+#   ✅ JSON Lines (.jsonl)       - Nested data
+#   ✅ JSON (.json)              - Small datasets
+#   ✅ Arrow (.arrow)            - Streaming format
+#   ✅ Text (.txt)               - Raw text
+#   ✅ Images (.png, .jpg, etc.) - With metadata
+#   ✅ Audio (.wav, .mp3, etc.)  - With metadata
+#   ✅ PDF (.pdf)                - Document datasets
+#   ✅ WebDataset (.tar)         - Large-scale streaming
+#
+# NOT SUPPORTED (no viewer, no auto-convert):
+#   ❌ PyTorch (.pt, .pth)       - Won't work
+#   ❌ Safetensors (.safetensors) - Won't work for datasets
+#   ❌ NumPy (.npy, .npz)        - Won't work
+#   ❌ HDF5 (.h5, .hdf5)         - Won't work
+#
+# For dense vectors: Use `datasets` library → push_to_hub → auto Parquet
+
+# ================================================================================
+# DENSE VECTOR SCHEMA (Embeddings, Features)
+# ================================================================================
+
+# CORRECT: Use Sequence with fixed length
+from datasets import Dataset, DatasetDict, Features, Sequence, Value
+import numpy as np
+
+features = Features({
+    'image_id': Value('int64'),
+    'features': Sequence(Value('float32'), length=768),  # Fixed dim
+})
+
+data = {
+    'image_id': list(range(100)),
+    'features': [np.random.randn(768).astype(np.float32) for _ in range(100)],
+}
+
+ds = Dataset.from_dict(data, features=features)
+
+# WRONG: Don't use Array1D (doesn't exist)
+# from datasets import Array1D  # ImportError!
+
+# WRONG: Don't omit features schema (viewer shows as generic 'list')
+# ds = Dataset.from_dict(data)  # Works but ugly viewer
+
+# ================================================================================
+# CRITICAL: FLOAT64 UPCAST ON LOAD
+# ================================================================================
+#
+# The datasets library ALWAYS returns float64 even if stored as float32.
+# You MUST cast when creating tensors:
+#
+# WRONG:
+#   features = torch.tensor(np.array(batch['features']))  # float64!
+#   model(features)  # RuntimeError: mat1 and mat2 must have same dtype
+#
+# CORRECT:
+#   features = torch.tensor(np.array(batch['features']), dtype=torch.float32)
+#   model(features)  # Works
+
+def collate_fn(batch):
+    """Proper collate function with dtype handling."""
+    image_ids = torch.tensor([b['image_id'] for b in batch])
+    features = torch.tensor(
+        np.array([b['features'] for b in batch]),
+        dtype=torch.float32  # CRITICAL
+    )
+    labels = torch.tensor([b['label'] for b in batch])
+    return image_ids, features, labels
+
+# ================================================================================
+# SUBSETS (CONFIGS) FOR DIFFERENT DIMENSIONS
+# ================================================================================
+#
+# Problem: Different encoders have different output dimensions
+#   - clip_l14: 768
+#   - dinov2_l14: 1024
+#   - siglip_so400m: 1152
+#
+# Solution: One subset (config) per encoder
+# Each subset can have its own schema/dimensions
+# Viewer shows dropdown to select subset
+
+# Structure on Hub:
+# my-dataset/
+# ├── clip_l14/
+# │   ├── train-00000-of-00001.parquet
+# │   └── val-00000-of-00001.parquet
+# ├── dinov2_l14/
+# │   ├── train-00000-of-00001.parquet
+# │   └── val-00000-of-00001.parquet
+# └── siglip_so400m/
+#     ├── train-00000-of-00001.parquet
+#     └── val-00000-of-00001.parquet
+
+# Upload code:
+def push_encoder_subset(repo_id: str, enc_name: str, dim: int, train_data, val_data):
+    """Push one encoder as a separate subset."""
+    features = Features({
+        'image_id': Value('int64'),
+        'features': Sequence(Value('float32'), length=dim),
+    })
+
+    ds_dict = DatasetDict({
+        'train': Dataset.from_dict(train_data, features=features),
+        'val': Dataset.from_dict(val_data, features=features),
+    })
+
+    ds_dict.push_to_hub(
+        repo_id,
+        config_name=enc_name,  # THIS CREATES THE SUBSET
+        commit_message=f"Add {enc_name} features"
+    )
+
+# Loading:
+from datasets import load_dataset
+
+ds = load_dataset("username/my-dataset", "clip_l14")  # Specific encoder
+ds = load_dataset("username/my-dataset", "dinov2_l14", split="train")
+
+# ================================================================================
+# SPLITS (train/val/test)
+# ================================================================================
+#
+# Automatic detection by filename or directory:
+#
+# Option 1: Filename pattern
+#   train.parquet, val.parquet, test.parquet
+#   train-00000-of-00003.parquet, train-00001-of-00003.parquet, ...
+#
+# Option 2: Directory structure
+#   data/train/shard_0.parquet
+#   data/val/shard_0.parquet
+#   data/test/shard_0.parquet
+#
+# Keywords recognized:
+#   train, training
+#   val, valid, validation, dev
+#   test, testing, eval, evaluation
+
+# Using DatasetDict handles this automatically:
+ds_dict = DatasetDict({
+    'train': train_dataset,
+    'val': val_dataset,
+})
+ds_dict.push_to_hub("username/repo", config_name="encoder_name")
+
+# ================================================================================
+# MANUAL YAML CONFIGURATION
+# ================================================================================
+#
+# For complex structures, add YAML to README.md:
+#
+# ---
+# configs:
+# - config_name: clip_l14
+#   data_files:
+#   - split: train
+#     path: "clip_l14/train-*.parquet"
+#   - split: val
+#     path: "clip_l14/val-*.parquet"
+#   default: true
+# - config_name: dinov2_l14
+#   data_files:
+#   - split: train
+#     path: "dinov2_l14/train-*.parquet"
+#   - split: val
+#     path: "dinov2_l14/val-*.parquet"
+# ---
+
+# ================================================================================
+# COMPLETE ENCODER CACHING PATTERN
+# ================================================================================
+
+"""
+Full pattern for caching vision encoder features to HuggingFace Hub.
+"""
+
+import torch
+import numpy as np
+from datasets import Dataset, DatasetDict, Features, Sequence, Value
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+import timm
+
+REPO_ID = "username/bulk-features"
+
+ENCODERS = {
+    'clip_l14': ('openai/clip-vit-large-patch14', 768),
+    'dinov2_b14': ('timm/vit_base_patch14_dinov2.lvd142m', 768),
+    'siglip_b16': ('timm/ViT-B-16-SigLIP-512', 768),
+}
+
+
+def encode_dataset(encoder_name: str, model, transform, image_dataset, batch_size=128):
+    """Encode all images with a single encoder."""
+
+    loader = DataLoader(image_dataset, batch_size=batch_size,
+                       shuffle=False, num_workers=8, pin_memory=True)
+
+    all_features = []
+    all_ids = []
+
+    device = next(model.parameters()).device
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=f"Encoding {encoder_name}"):
+            images = batch['image'].to(device)
+            ids = batch['image_id']
+
+            features = model(images)
+            all_features.append(features.cpu().numpy())
+            all_ids.extend(ids.tolist())
+
+    return np.concatenate(all_features), all_ids
+
+
+def push_encoder_features(repo_id: str, enc_name: str, dim: int,
+                          train_features, train_ids,
+                          val_features, val_ids):
+    """Push encoder features as a subset."""
+
+    features_schema = Features({
+        'image_id': Value('int64'),
+        'features': Sequence(Value('float32'), length=dim),
+    })
+
+    train_ds = Dataset.from_dict({
+        'image_id': train_ids,
+        'features': [f.astype(np.float32) for f in train_features],
+    }, features=features_schema)
+
+    val_ds = Dataset.from_dict({
+        'image_id': val_ids,
+        'features': [f.astype(np.float32) for f in val_features],
+    }, features=features_schema)
+
+    ds_dict = DatasetDict({'train': train_ds, 'val': val_ds})
+
+    ds_dict.push_to_hub(
+        repo_id,
+        config_name=enc_name,
+        commit_message=f"Add {enc_name} features (dim={dim})"
+    )
+    print(f"✓ Pushed {enc_name}: train={len(train_ds)}, val={len(val_ds)}")
+
+
+# ================================================================================
+# LOADING FOR TRAINING
+# ================================================================================
+
+"""
+Pattern for loading multiple encoders and training a fusion model.
+"""
+
+import torch
+from torch.utils.data import Dataset as TorchDataset, DataLoader
+from datasets import load_dataset
+import numpy as np
+
+
+class MultiEncoderDataset(TorchDataset):
+    """Dataset that loads features from multiple encoders."""
+
+    def __init__(self, repo_id: str, encoders: list, split: str = 'train'):
+        self.encoders = encoders
+
+        # Load all encoder datasets
+        self.datasets = {
+            enc: load_dataset(repo_id, enc, split=split)
+            for enc in encoders
+        }
+
+        # Verify alignment
+        first_enc = encoders[0]
+        self.length = len(self.datasets[first_enc])
+
+        for enc in encoders[1:]:
+            assert len(self.datasets[enc]) == self.length, \
+                f"Length mismatch: {first_enc}={self.length}, {enc}={len(self.datasets[enc])}"
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        sample = {'image_id': self.datasets[self.encoders[0]][idx]['image_id']}
+
+        for enc in self.encoders:
+            # CRITICAL: Cast to float32
+            feats = np.array(self.datasets[enc][idx]['features'], dtype=np.float32)
+            sample[enc] = torch.from_numpy(feats)
+
+        return sample
+
+
+def create_dataloader(repo_id: str, encoders: list, split: str,
+                      batch_size: int = 128, shuffle: bool = True):
+    """Create DataLoader for multi-encoder training."""
+
+    dataset = MultiEncoderDataset(repo_id, encoders, split)
+
+    def collate_fn(batch):
+        result = {
+            'image_id': torch.tensor([b['image_id'] for b in batch]),
+        }
+        for enc in encoders:
+            result[enc] = torch.stack([b[enc] for b in batch])
+        return result
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collate_fn,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+
+# Usage:
+# loader = create_dataloader(
+#     "AbstractPhil/bulk-coco-features",
+#     encoders=['clip_l14', 'dinov2_b14', 'siglip_b16'],
+#     split='train',
+#     batch_size=128
+# )
+# for batch in loader:
+#     clip_feats = batch['clip_l14']      # [B, 768]
+#     dino_feats = batch['dinov2_b14']    # [B, 768]
+#     siglip_feats = batch['siglip_b16']  # [B, 1152]
+
+# ================================================================================
+# ADDING LABELS/METADATA
+# ================================================================================
+#
+# Option 1: Include in each encoder subset (redundant but simple)
+#
+# features = Features({
+#     'image_id': Value('int64'),
+#     'features': Sequence(Value('float32'), length=768),
+#     'labels': Sequence(Value('int64')),  # Multi-label
+# })
+#
+# Option 2: Separate metadata subset (cleaner)
+#
+# Push a "metadata" config with labels, captions, etc:
+#
+# metadata_ds = DatasetDict({
+#     'train': Dataset.from_dict({
+#         'image_id': train_ids,
+#         'labels': train_labels,  # [N, num_classes]
+#         'caption': train_captions,
+#     }),
+#     'val': ...
+# })
+# metadata_ds.push_to_hub(repo_id, config_name="metadata")
+
+# ================================================================================
+# TROUBLESHOOTING
+# ================================================================================
+#
+# "list" type in viewer instead of proper array:
+#   → Add explicit Features schema with Sequence(Value('float32'), length=dim)
+#
+# RuntimeError: mat1 and mat2 must have same dtype:
+#   → Add dtype=torch.float32 when creating tensors from loaded data
+#
+# Different dimensions per encoder:
+#   → Use separate config_name per encoder (subsets)
+#
+# Slow loading:
+#   → Data is streamed from Parquet on first access
+#   → Use snapshot_download() to cache locally first
+#   → Or use num_workers>0 in DataLoader
+#
+# Large dataset upload failures:
+#   → Use max_shard_size="500MB" in push_to_hub
+#   → Or use upload_large_folder from huggingface_hub
+#
+# Viewer not showing:
+#   → Check file format is supported
+#   → Wait for parquet-converter bot (~minutes)
+#   → Check repo is public (or PRO account)
+
+# ================================================================================
+# QUICK REFERENCE
+# ================================================================================
+#
+# Create dataset with dense vectors:
+#   features = Features({'features': Sequence(Value('float32'), length=DIM)})
+#   ds = Dataset.from_dict(data, features=features)
+#
+# Push with subset:
+#   ds_dict.push_to_hub(repo_id, config_name="encoder_name")
+#
+# Load specific encoder:
+#   ds = load_dataset(repo_id, "encoder_name", split="train")
+#
+# Convert to tensor (ALWAYS cast dtype):
+#   torch.tensor(np.array(sample['features']), dtype=torch.float32)
+#
+# ================================================================================
+# VERSION HISTORY
+# ================================================================================
+#
+# v1.0.0 (2025-12-28):
+#   - Initial version
+#   - Documented supported formats (no safetensors/pt)
+#   - Subset pattern for multi-encoder datasets
+#   - Float64 upcast fix
+#   - Complete encoding and loading patterns
+#
+# ================================================================================
+# END OF REFERENCE
+# ================================================================================

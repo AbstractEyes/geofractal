@@ -24,9 +24,8 @@ import time
 from geovocab2.shapes.factory.cantor_route_factory import (
     CantorRouteFactory,
     RouteMode,
-    SimplexConfig
+    SimplexConfig,
 )
-
 
 @dataclass
 class CantorFusionConfig:
