@@ -2,37 +2,39 @@
 geofractal.router.compiler.compile_router
 =========================================
 
-CompileRouter - Introspective compilation layer for arbitrary nn.Module structures.
+CompileRouter - Introspective analysis layer for arbitrary nn.Module structures.
 
 Takes any module tree (router, raw nn.Module, sloppy code) and:
 1. Introspects to find all nn.Module children regardless of attachment style
-2. Wraps raw modules in TorchComponent for proper lifecycle
-3. Groups similar operations by type/signature/depth
-4. Creates staged execution without modifying original structure
-5. Compiles the staged view for optimized execution
+2. Classifies modules by type (LINEAR, CONV, NORM, ACTIVATION, etc.)
+3. Computes structural signatures for grouping similar operations
+4. Identifies batchable operations at the same depth
+5. Provides detailed statistics about model structure
 
-This is the "make it work anyway" compiler - handles:
+This is purely ANALYTICAL - it does not restructure the model at runtime.
+The actual compilation is just torch.compile on the original model.
+
+Handles:
 - self.thing = nn.Linear(...)
 - self.stuff = nn.Sequential(...)
 - Nested routers with mixed attachment styles
 - Raw nn.Module trees with no router structure
 
 Usage:
-    # Wrap any module for compilation
-    compiler = CompileRouter.from_module(messy_model)
-    compiler.compile_towers()
+    # Analyze any module
+    compiler = CompileRouter.from_module(model)
+    compiler.print_tree()      # Visual structure
+    compiler.print_stages()    # Batchable groups
+    stats = compiler.get_compilation_stats()
+
+    # Compile (just torch.compile on original)
     compiled = compiler.compile()
 
-    # Or use directly
-    compiler = CompileRouter('compiler')
-    compiler.attach('model', messy_model)
-    compiler.compile_towers()
+    # Or use the one-liner
+    compiler = compile_module(model)
 
-Integration with WideRouter:
-    class MyCollective(WideRouter):
-        def compile_towers(self):
-            compiler = CompileRouter.from_module(self)
-            return compiler.compile_towers()
+The value is in understanding your model structure and identifying
+optimization opportunities - not runtime restructuring.
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
@@ -56,6 +58,7 @@ from geofractal.router.base_router import BaseRouter
 from geofractal.router.base_tower import BaseTower
 from geofractal.router.base_component import BaseComponent
 from geofractal.router.components.torch_component import TorchComponent
+from geofractal.router.wide_router import WideRouter
 
 
 # =============================================================================
@@ -302,6 +305,19 @@ class WrappedModule(TorchComponent):
 
     def __repr__(self) -> str:
         return f"WrappedModule(name='{self.name}', wraps={self._original_type})"
+
+
+# =============================================================================
+# COMPILATION - Simple and Clean
+# =============================================================================
+
+# CompileRouter provides:
+# 1. Introspection - understand model structure
+# 2. Analysis - identify batchable operations
+# 3. Compilation - torch.compile with analysis metadata
+#
+# It does NOT restructure models at runtime. If you want WideRouter benefits,
+# design your model as a WideRouter from the start.
 
 
 # =============================================================================
@@ -606,38 +622,34 @@ class CompileRouter(BaseRouter):
     # COMPILATION
     # =========================================================================
 
-    def compile(self, **kwargs) -> 'CompileRouter':
+    def compile(self, mode: str = 'reduce-overhead', **kwargs) -> nn.Module:
         """
-        Compile the router for optimized execution.
+        Compile the original model with torch.compile.
 
-        Calls compile_towers() if not already done, then torch.compile().
+        CompileRouter's value is in introspection and analysis.
+        Compilation just applies torch.compile to the original model.
 
         Args:
-            **kwargs: Passed to torch.compile
+            mode: torch.compile mode ('default', 'reduce-overhead', 'max-autotune')
+            **kwargs: Additional args passed to torch.compile
 
         Returns:
-            Compiled router
+            Compiled model
         """
         if not self.objects['_compiled']:
             self.compile_towers()
 
-        return torch.compile(self, **kwargs)
+        original = self.components['root'] if 'root' in self.components else None
+        if original is None:
+            raise RuntimeError("No root model to compile")
 
-    def prepare_and_compile(self, **kwargs) -> 'CompileRouter':
-        """
-        Full preparation and compilation.
+        return torch.compile(original, mode=mode, **kwargs)
 
-        Introspects, wraps, stages, then compiles.
-
-        Args:
-            **kwargs: Passed to torch.compile
-
-        Returns:
-            Compiled router
-        """
-        self.introspect()
-        self.compile_towers()
-        return self.compile(**kwargs)
+    def get_original(self) -> nn.Module:
+        """Get the original model."""
+        if 'root' in self.components:
+            return self.components['root']
+        raise RuntimeError("No root model attached")
 
     # =========================================================================
     # STAGED EXECUTION
@@ -904,11 +916,13 @@ if __name__ == '__main__':
             self.norm = nn.LayerNorm(dim)
 
             # Multiple identical heads - perfect batching target
+            self.head_dim = dim // num_heads
             self.heads = nn.ModuleList([
-                nn.Linear(dim, dim // 4) for _ in range(num_heads)
+                nn.Linear(dim, self.head_dim) for _ in range(num_heads)
             ])
 
-            self.out = nn.Linear(dim, dim)
+            # Output gets concatenated heads: num_heads * head_dim = dim
+            self.out = nn.Linear(num_heads * self.head_dim, dim)
 
         def forward(self, x):
             x = self.encoder(x)
@@ -941,12 +955,20 @@ if __name__ == '__main__':
     y_orig = sloppy(x)
     print(f"Original: {x.shape} -> {y_orig.shape}")
 
-    # Through compiler
+    # Through CompileRouter (delegates to original)
     y_compiled = compiler(x)
-    print(f"Compiled: {x.shape} -> {y_compiled.shape}")
+    print(f"CompileRouter: {x.shape} -> {y_compiled.shape}")
 
     # Check equivalence
     diff = (y_orig - y_compiled).abs().max().item()
-    print(f"Max diff: {diff}")
+    print(f"Diff: {diff:.2e}")
+
+    # Multi-head model
+    y_multi_orig = multi(x)
+    y_multi_compiled = compiler2(x)
+    diff2 = (y_multi_orig - y_multi_compiled).abs().max().item()
+    print(f"Multi-head diff: {diff2:.2e}")
 
     print("\n✓ CompileRouter ready")
+    print("✓ Use compiler.compile() for torch.compile")
+    print("✓ Use compiler.get_compilation_stats() for analysis")

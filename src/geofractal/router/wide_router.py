@@ -1075,7 +1075,7 @@ class WideRouter(BaseRouter):
     # COMPILATION
     # =========================================================================
 
-    def compile(self, **kwargs) -> 'WideRouter':
+    def compile(self, prepare_and_compile=True, **kwargs) -> 'WideRouter':
         """
         Compile the router for optimized execution.
 
@@ -1086,11 +1086,14 @@ class WideRouter(BaseRouter):
         alignment data, or use prepare_and_compile() for convenience.
 
         Args:
+            prepare_and_compile: If True, analyze structure before compiling.
             **kwargs: Passed to torch.compile (mode, fullgraph, etc.)
 
         Returns:
             Compiled router
         """
+        if prepare_and_compile:
+            self.analyze_structure()
         return torch.compile(self, **kwargs)
 
     def prepare_and_compile(self, **kwargs) -> 'WideRouter':
