@@ -87,6 +87,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.func import functional_call, vmap, stack_module_state
 
 from geofractal.router.base_router import BaseRouter
 from geofractal.router.base_tower import BaseTower
@@ -723,6 +724,93 @@ class BatchedModuleGroup(nn.Module):
         return results
 
 
+class VMapTowerGroup(nn.Module):
+    """
+    Vectorized tower execution using torch.func.vmap.
+
+    Instead of N sequential tower calls, executes all towers in ONE
+    vectorized operation by stacking parameters and using vmap.
+
+    This provides true batching - not just a for loop.
+    """
+
+    def __init__(self, towers: List[nn.Module], names: List[str]):
+        super().__init__()
+        self.names = names
+        self.n = len(towers)
+
+        # Store towers for parameter tracking
+        self.towers = nn.ModuleList(towers)
+
+        # Cached stacked state (use different names to avoid nn.Module collision)
+        self._stacked_params: Optional[Dict[str, Tensor]] = None
+        self._stacked_buffs: Optional[Dict[str, Tensor]] = None
+        self._stale = True
+
+    def _stack_state(self) -> None:
+        """Stack parameters and buffers from all towers."""
+        if not self._stale:
+            return
+        self._stacked_params, self._stacked_buffs = stack_module_state(list(self.towers))
+        self._stale = False
+
+    def _invalidate(self) -> None:
+        """Mark cached state as stale."""
+        self._stale = True
+        self._stacked_params = None
+        self._stacked_buffs = None
+
+    def train(self, mode: bool = True):
+        result = super().train(mode)
+        self._invalidate()
+        return result
+
+    def to(self, *args, **kwargs):
+        result = super().to(*args, **kwargs)
+        self._invalidate()
+        return result
+
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        """
+        Vectorized forward through all towers.
+
+        Args:
+            x: Input tensor [B, ...] - same input to all towers
+
+        Returns:
+            Dict mapping name -> output tensor [B, ...]
+        """
+        if self.n == 0:
+            return {}
+
+        if self.n == 1:
+            out = self.towers[0](x)
+            return {self.names[0]: out[0] if isinstance(out, tuple) else out}
+
+        # Ensure state is stacked
+        self._stack_state()
+
+        # Reference model for functional_call
+        base = self.towers[0]
+
+        # Single-tower forward via functional_call
+        def single_forward(params, buffers, data):
+            return functional_call(base, (params, buffers), (data,))
+
+        # vmap over params/buffers (dim 0), broadcast input
+        vmapped_forward = vmap(single_forward, in_dims=(0, 0, None))
+
+        # Execute all towers at once: [N, B, ...]
+        outputs = vmapped_forward(self._stacked_params, self._stacked_buffs, x)
+
+        # Handle tuple outputs (e.g., (opinion, features))
+        if isinstance(outputs, tuple):
+            outputs = outputs[0]
+
+        # Scatter to dict
+        return {name: outputs[i] for i, name in enumerate(self.names)}
+
+
 # =============================================================================
 
 class WideForwardHook:
@@ -838,6 +926,9 @@ class WideRouter(BaseRouter):
             'alignment_hits': 0,
         }
 
+        # vmap tower groups: signature -> VMapTowerGroup
+        self.objects['_vmap_groups'] = {}
+
     # =========================================================================
     # TOWER REGISTRATION
     # =========================================================================
@@ -881,6 +972,7 @@ class WideRouter(BaseRouter):
             # Cache signature at registration time
             self.objects['_tower_signatures'][name] = self._compute_tower_signature(self.components[name])
             self.objects['_analyzed'] = False  # Require re-analysis
+            self.objects['_vmap_groups'].clear()  # Invalidate vmap cache
 
     def unregister_tower(self, name: str) -> None:
         """Remove tower from wide execution."""
@@ -888,6 +980,7 @@ class WideRouter(BaseRouter):
             self.objects['_tower_names'].remove(name)
             self.objects['_tower_signatures'].pop(name, None)
             self.objects['_analyzed'] = False
+            self.objects['_vmap_groups'].clear()  # Invalidate vmap cache
 
     @torch.compiler.disable
     def _auto_discover_towers(self) -> None:
@@ -1052,24 +1145,36 @@ class WideRouter(BaseRouter):
         mask: Optional[Tensor] = None,
     ) -> Dict[str, Tensor]:
         """
-        Execute multiple aligned towers.
+        Execute multiple aligned towers using vmap.
 
-        Designed for torch.compile to fuse - no manual stream management.
-        The compiler handles kernel fusion automatically.
+        Uses torch.func.vmap to truly vectorize execution across towers,
+        replacing N sequential calls with ONE vectorized operation.
+
+        VMapTowerGroup instances are cached by signature for reuse.
         """
-        results = {}
-        for name in tower_names:
-            tower = self[name]
-            if mask is not None:
-                out = tower(x, mask=mask)
-            else:
-                out = tower(x)
+        if not tower_names:
+            return {}
 
-            if isinstance(out, tuple):
-                out = out[0]
-            results[name] = out
+        # Get signature for this group (all towers in group have same sig)
+        sig = self._tower_signature(tower_names[0])
 
-        return results
+        # Get or create VMapTowerGroup for this signature
+        vmap_groups = self.objects['_vmap_groups']
+
+        # Use frozenset of names as cache key (order-independent)
+        cache_key = (sig, frozenset(tower_names))
+
+        if cache_key not in vmap_groups:
+            # Build new VMapTowerGroup
+            towers = [self[name] for name in tower_names]
+            vmap_group = VMapTowerGroup(towers, list(tower_names))
+
+            # Move to same device as input
+            vmap_group = vmap_group.to(x.device)
+            vmap_groups[cache_key] = vmap_group
+
+        # Execute via vmap
+        return vmap_groups[cache_key](x)
 
     # =========================================================================
     # COMPILATION
@@ -1204,9 +1309,11 @@ class WideRouter(BaseRouter):
         - Base router cache (via super)
         - TensorPool pending/results
         - Tower caches (for all registered towers)
+        - VMap tower groups cache
         """
         super().reset()  # Clears self._cache and recurses to components
         self.pool.clear()
+        self.objects['_vmap_groups'].clear()
 
     def clear_tower_caches(self) -> None:
         """

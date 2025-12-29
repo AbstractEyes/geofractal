@@ -567,6 +567,7 @@ class BaseRouter(nn.Module, ABC):
                             UserWarning,
                         )
 
+
     @property
     def device(self) -> Optional[torch.device]:
         """Dominant device of first parameter, or None if empty."""
