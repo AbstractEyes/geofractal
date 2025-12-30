@@ -1467,34 +1467,22 @@ class WideRouter(BaseRouter):
         return module
 
     # =========================================================================
-    # FORWARD
+    # FORWARD (ABSTRACT - subclass must implement)
     # =========================================================================
 
-    def forward(self, x: Tensor, mask: Tensor = None) -> Tensor:
+    def forward(self, *args, **kwargs):
         """
-        Default forward: execute all towers via wide_forward and average outputs.
+        Subclass must implement forward.
 
-        Override this method for custom fusion strategies (weighted sum,
-        learned fusion, concatenation, etc.).
-
-        Args:
-            x: Input tensor [B, ...]
-            mask: Optional attention mask
-
-        Returns:
-            Averaged tower outputs [B, ...]
-
-        Example override:
+        Typical pattern:
             def forward(self, x):
                 opinions = self.wide_forward(x)
                 return self['fusion'](*opinions.values())
         """
-        opinions = self.wide_forward(x, mask=mask)
-        if not opinions:
-            raise RuntimeError(
-                "No towers registered. Use register_tower() or set auto_discover=True."
-            )
-        return torch.stack(list(opinions.values()), dim=0).mean(dim=0)
+        raise NotImplementedError(
+            "WideRouter subclass must implement forward(). "
+            "Use self.wide_forward(x) to execute registered towers."
+        )
 
     # =========================================================================
     # CLEANUP AND LIFECYCLE
@@ -1662,7 +1650,6 @@ if __name__ == '__main__':
     # -------------------------------------------------------------------------
 
     class TestCollective(WideRouter):
-        """Uses default forward() - no override needed!"""
         def __init__(self, name: str, num_towers: int, dim: int):
             super().__init__(name, strict=False, auto_discover=True)
 
@@ -1672,7 +1659,9 @@ if __name__ == '__main__':
             # Discover towers now (for compile safety)
             self.discover_towers()
 
-        # NOTE: No forward() override needed - default averages all tower outputs
+        def forward(self, x: Tensor) -> Tensor:
+            opinions = self.wide_forward(x)
+            return torch.stack(list(opinions.values()), dim=0).mean(dim=0)
 
     class SequentialCollective(BaseRouter):
         def __init__(self, name: str, num_towers: int, dim: int):
