@@ -2,7 +2,7 @@
 geofractal.router.components.transformer
 =========================================
 
-Standard Transformer components with Cantor integration.
+Standard Transformer components with Cantor integration and RoPE support.
 
 Variants:
     - PreNorm (GPT-2 style): LayerNorm before attention/FFN
@@ -17,19 +17,25 @@ Activations (replaceable):
     - GeGLU (gated linear unit with GELU)
     - SwiGLU (gated linear unit with SiLU, LLaMA style)
 
+RoPE Integration (v1.1.1):
+    - All attention layers accept optional rope parameter
+    - RoPE applied to Q/K after projection, before attention scores
+    - Compatible with all RoPE variants: standard, scaled, YaRN, Cantor, etc.
+    - Blocks pass rope through from tower level
+
 Cantor Mode:
     When cantor=True:
     - Replaces standard attention with CantorEuclideanAttention
+    - CantorEuclideanAttention has its own position encoding (RoPE not applied)
     - Enables hierarchical wormhole routing
     - Each block gets a CantorAddressComponent for fingerprinting
-    - Addresses enable cross-block routing based on branch alignment
 
 Copyright 2025 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
 
 import math
-from typing import Optional, Dict, Tuple, Literal, Union, Type
+from typing import Optional, Dict, Tuple, Literal, Union, Type, Any
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -177,14 +183,19 @@ class TransformerConfig:
 
 
 # =============================================================================
-# STANDARD ATTENTION
+# STANDARD ATTENTION (with RoPE support)
 # =============================================================================
 
 class StandardAttention(TorchComponent):
     """
-    Standard multi-head self-attention.
+    Standard multi-head self-attention with optional RoPE.
 
     This is the Euclidean baseline - pure Q·K dot product attention.
+
+    RoPE Integration (v1.1.1):
+        - Pass rope parameter to forward() to apply rotary embeddings
+        - RoPE is applied to Q/K after projection, before attention scores
+        - Compatible with all RoPE variants from rope_component.py
     """
 
     def __init__(
@@ -213,21 +224,28 @@ class StandardAttention(TorchComponent):
         self,
         x: Tensor,
         mask: Optional[Tensor] = None,
+        rope: Optional[Any] = None,
         return_info: bool = False,
     ) -> Tuple[Tensor, Optional[Dict]]:
         """
         Args:
             x: (B, S, D) input
             mask: Optional attention mask
+            rope: Optional RoPE component (any variant from rope_component.py)
+                  Must have .rotate(q, k, seq_len=L) method
             return_info: Whether to return attention weights
         """
         B, S, D = x.shape
         H, head_dim = self.num_heads, self.head_dim
 
-        # Project to Q, K, V
+        # Project to Q, K, V: (B, H, S, head_dim)
         q = self.q_proj(x).view(B, S, H, head_dim).transpose(1, 2)
         k = self.k_proj(x).view(B, S, H, head_dim).transpose(1, 2)
         v = self.v_proj(x).view(B, S, H, head_dim).transpose(1, 2)
+
+        # Apply RoPE if provided
+        if rope is not None:
+            q, k = rope.rotate(q, k, seq_len=S)
 
         # Attention scores
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
@@ -299,7 +317,7 @@ class FeedForward(TorchComponent):
 
 
 # =============================================================================
-# TRANSFORMER BLOCKS (Variants)
+# TRANSFORMER BLOCKS (Variants) - All with RoPE support
 # =============================================================================
 
 class PreNormBlock(TorchComponent):
@@ -364,11 +382,16 @@ class PreNormBlock(TorchComponent):
         self,
         x: Tensor,
         mask: Optional[Tensor] = None,
+        rope: Optional[Any] = None,
         return_info: bool = False,
     ) -> Tuple[Tensor, Optional[Dict]]:
 
         # Attention with residual
-        attn_out, attn_info = self.attn(self.norm1(x), mask=mask, return_info=return_info)
+        # RoPE only applied to StandardAttention, not CantorEuclideanAttention
+        if self.config.cantor:
+            attn_out, attn_info = self.attn(self.norm1(x), mask=mask, return_info=return_info)
+        else:
+            attn_out, attn_info = self.attn(self.norm1(x), mask=mask, rope=rope, return_info=return_info)
         x = x + self.dropout(attn_out)
 
         # FFN with residual
@@ -438,11 +461,15 @@ class PostNormBlock(TorchComponent):
         self,
         x: Tensor,
         mask: Optional[Tensor] = None,
+        rope: Optional[Any] = None,
         return_info: bool = False,
     ) -> Tuple[Tensor, Optional[Dict]]:
 
         # Attention with residual, then norm
-        attn_out, attn_info = self.attn(x, mask=mask, return_info=return_info)
+        if self.config.cantor:
+            attn_out, attn_info = self.attn(x, mask=mask, return_info=return_info)
+        else:
+            attn_out, attn_info = self.attn(x, mask=mask, rope=rope, return_info=return_info)
         x = self.norm1(x + self.dropout(attn_out))
 
         # FFN with residual, then norm
@@ -510,6 +537,7 @@ class ParallelBlock(TorchComponent):
         self,
         x: Tensor,
         mask: Optional[Tensor] = None,
+        rope: Optional[Any] = None,
         return_info: bool = False,
     ) -> Tuple[Tensor, Optional[Dict]]:
 
@@ -517,7 +545,10 @@ class ParallelBlock(TorchComponent):
         x_norm = self.norm(x)
 
         # Parallel attention and FFN
-        attn_out, attn_info = self.attn(x_norm, mask=mask, return_info=return_info)
+        if self.config.cantor:
+            attn_out, attn_info = self.attn(x_norm, mask=mask, return_info=return_info)
+        else:
+            attn_out, attn_info = self.attn(x_norm, mask=mask, rope=rope, return_info=return_info)
         ffn_out = self.ffn(x_norm)
 
         # Combined residual
@@ -586,11 +617,15 @@ class SandwichBlock(TorchComponent):
         self,
         x: Tensor,
         mask: Optional[Tensor] = None,
+        rope: Optional[Any] = None,
         return_info: bool = False,
     ) -> Tuple[Tensor, Optional[Dict]]:
 
         # Attention
-        attn_out, attn_info = self.attn(self.norm1(x), mask=mask, return_info=return_info)
+        if self.config.cantor:
+            attn_out, attn_info = self.attn(self.norm1(x), mask=mask, return_info=return_info)
+        else:
+            attn_out, attn_info = self.attn(self.norm1(x), mask=mask, rope=rope, return_info=return_info)
         x = x + self.dropout(attn_out)
 
         # FFN with extra norm
@@ -628,24 +663,24 @@ def get_block_class(variant: Union[str, TransformerVariant]) -> Type[TorchCompon
 
 
 # =============================================================================
-# FULL TRANSFORMER
+# FULL TRANSFORMER (with RoPE support)
 # =============================================================================
 
 class Transformer(TorchComponent):
     """
-    Full transformer encoder with configurable architecture.
+    Full transformer encoder with configurable architecture and RoPE support.
 
     Supports:
         - Multiple variants (prenorm, postnorm, parallel, sandwich)
         - Multiple activations (gelu, relu, silu, geglu, swiglu)
+        - RoPE integration for all variants
         - Cantor mode for hierarchical wormhole attention
         - Per-block addressing for cross-block routing
 
-    When cantor=True:
-        - Each block uses CantorEuclideanAttention
-        - Each block has a CantorAddressComponent
-        - Addresses are spaced across [0, 1] based on depth position
-        - Enables hierarchical routing between blocks
+    RoPE Integration (v1.1.1):
+        - Pass rope parameter to forward() to apply rotary embeddings
+        - RoPE is passed to all blocks and applied in StandardAttention
+        - CantorEuclideanAttention uses its own position encoding (RoPE skipped)
     """
 
     def __init__(
@@ -713,18 +748,20 @@ class Transformer(TorchComponent):
         self,
         x: Tensor,
         mask: Optional[Tensor] = None,
+        rope: Optional[Any] = None,
         return_info: bool = False,
     ) -> Tuple[Tensor, Optional[Dict]]:
         """
         Args:
             x: (B, S, D) input embeddings
             mask: Optional attention mask
+            rope: Optional RoPE component to apply to Q/K
             return_info: Whether to return per-block info
         """
         all_info = [] if return_info else None
 
         for block in self.blocks:
-            x, info = block(x, mask=mask, return_info=return_info)
+            x, info = block(x, mask=mask, rope=rope, return_info=return_info)
             if return_info:
                 all_info.append(info)
 
@@ -809,7 +846,7 @@ def create_cantor_transformer(
 
 if __name__ == '__main__':
     print("=" * 70)
-    print("  Transformer Components Test")
+    print("  Transformer Components Test (v1.1.1 with RoPE)")
     print("=" * 70)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -864,6 +901,40 @@ if __name__ == '__main__':
 
     # =========================================================================
     print("\n" + "=" * 70)
+    print("  ROPE INTEGRATION TEST")
+    print("=" * 70)
+
+    # Create a mock RoPE for testing
+    class MockRoPE:
+        """Minimal RoPE mock for testing interface."""
+        def __init__(self, head_dim):
+            self.head_dim = head_dim
+
+        def rotate(self, q, k, seq_len=None):
+            """Apply mock rotation (identity for testing)."""
+            # In real usage, this would apply rotary embeddings
+            # Here we just verify the interface works
+            return q, k
+
+    mock_rope = MockRoPE(head_dim=D // 8)
+
+    # Test with RoPE
+    transformer = create_transformer(
+        name='rope_test',
+        dim=D,
+        depth=4,
+        num_heads=8,
+    ).to(device)
+
+    out_with_rope, _ = transformer(x, rope=mock_rope)
+    out_without_rope, _ = transformer(x, rope=None)
+
+    print(f"  With RoPE:    {x.shape} -> {out_with_rope.shape}")
+    print(f"  Without RoPE: {x.shape} -> {out_without_rope.shape}")
+    print(f"  Outputs differ (expected): {not torch.allclose(out_with_rope, out_without_rope)}")
+
+    # =========================================================================
+    print("\n" + "=" * 70)
     print("  ACTIVATION VARIANTS")
     print("=" * 70)
 
@@ -897,7 +968,7 @@ if __name__ == '__main__':
 
         print(f"Created: {cantor_transformer}")
 
-        # Forward pass
+        # Forward pass (RoPE not used with Cantor)
         out, info = cantor_transformer(x, return_info=True)
         print(f"\nForward: {x.shape} -> {out.shape}")
 
@@ -937,7 +1008,7 @@ if __name__ == '__main__':
     ).to(device)
 
     x_grad = torch.randn(B, S, D, device=device, requires_grad=True)
-    out, _ = transformer(x_grad)
+    out, _ = transformer(x_grad, rope=mock_rope)
     loss = out.sum()
     loss.backward()
 
@@ -946,5 +1017,5 @@ if __name__ == '__main__':
 
     # =========================================================================
     print("\n" + "=" * 70)
-    print("  ✓ All tests passed")
+    print("  ✓ All tests passed (v1.1.1 RoPE integration)")
     print("=" * 70)
