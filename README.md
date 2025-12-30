@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-1.0.1-green.svg)]()
+[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)]()
 
 ---
 
@@ -56,11 +56,14 @@ Drop the v101_claude_helpers.txt again if needed to reinforce the concepts. AI t
 | **Tower** | Self-encapsulated processing unit | Produces an *opinion*, not just an output |
 | **Port** | Encoder wrapper with lifecycle | Standardized interface for any encoder |
 | **WideRouter** | Compile-optimized router for wide models | Near-linear scaling with tower count |
+| **CompileRouter** | Universal model compiler | Introspects any nn.Module for optimization |
+| **VMapTowerGroup** | Vectorized tower executor | True batching via torch.func.vmap |
 | **NotifierRouter** | Communication backbone | Routes messages based on geometry |
 | **Collective** | Multi-tower ensemble | Triangulates truth from diverse perspectives |
 | **Component** | Attachable unit with identity and lifecycle | Building block for routers and towers |
 | **Address** | Geometric identity on a manifold | Fingerprints enable similarity/distance routing |
 | **Fusion** | Opinion aggregation | Where emergence happens |
+| **Walker** | Geometric interpolation system | Blend tensors along learned/static paths |
 | **Cache** | Ephemeral tensor storage | Optional - only for towers exposing intermediates |
 
 More routers, towers, components, and collective patterns are planned for immediate and future releases.
@@ -112,8 +115,15 @@ BaseRouter (ABC - nn.Module)
 │
 ├── WideRouter (BaseRouter + wide execution)
 │       - Tower registration and discovery
-│       - wide_forward() for batched execution
+│       - wide_forward() for vectorized execution
+│       - VMapTowerGroup for true batching
 │       - torch.compile integration
+│
+├── CompileRouter (BaseRouter + introspection)
+│       - Module tree introspection
+│       - Signature-based grouping
+│       - VMap group building
+│       - build_wide_router() for WideRouter generation
 │
 └── NotifierRouter (BaseRouter + messaging)
         - Geometric message routing
@@ -129,7 +139,13 @@ BaseComponent (ABC - pure Python)
         │
         ├── AddressComponent      # Geometric identity, fingerprints
         ├── FusionComponent       # Combine opinions
+        ├── WalkerFusion          # Geometric interpolation
         └── ProjectionComponent   # Transform shapes
+
+VMapTowerGroup (nn.Module)
+        - Vectorized tower execution
+        - Uses torch.func.vmap + stack_module_state
+        - Lazy parameter stacking with cache invalidation
 ```
 
 ### Port Hierarchy
@@ -156,7 +172,7 @@ BasePort (ABC - pure protocol, no torch)
 
 ### WideRouter: Compile-Optimized Wide Models
 
-**WideRouter** is designed for collectives with many towers processing the same input. It leverages `torch.compile` for kernel fusion, achieving near-linear scaling:
+**WideRouter** is designed for collectives with many towers processing the same input. It leverages `torch.compile` for kernel fusion and **true vectorized batching via `torch.func.vmap`**, achieving near-linear scaling:
 
 | Towers | Time | Per-Tower |
 |--------|------|-----------|
@@ -180,7 +196,7 @@ class MyCollective(WideRouter):
         self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        opinions = self.wide_forward(x)  # Batched tower execution
+        opinions = self.wide_forward(x)  # Vectorized tower execution via vmap
         
         # If towers cache intermediates for retrieval, clear after use:
         # self.clear_tower_caches()
@@ -197,9 +213,56 @@ output = compiled(x)  # 1.4x faster than eager
 **Key features:**
 - **Auto-discovery**: Finds all `BaseTower` instances automatically
 - **Structure analysis**: Identifies aligned operations for fusion
+- **VMap batching**: True vectorized execution via `torch.func.vmap` (not just a for loop)
 - **Compile-safe**: Separates Python bookkeeping from tensor hot path
 - **Near-linear scaling**: Per-tower cost *decreases* with more towers
 - **Cache management**: `reset()` and `clear_tower_caches()` available if towers use cache
+
+### CompileRouter: Universal Model Compilation
+
+**CompileRouter** introspects *any* `nn.Module` and optimizes it for `torch.compile`. It doesn't require you to restructure your code into the GeoFractal hierarchy.
+
+```python
+from geofractal.router.compiler import CompileRouter, compile_module
+
+# Any messy PyTorch model
+class SloppyModel(nn.Module):
+    def __init__(self):
+        self.stuff = nn.ModuleList([nn.Linear(256, 256) for _ in range(8)])
+        self.thing = nn.Sequential(nn.Linear(256, 512), nn.GELU())
+        # ... arbitrarily nested
+    
+    def forward(self, x):
+        for s in self.stuff:
+            x = x + s(x)
+        return self.thing(x)
+
+# One-liner: analyze + stage + compile
+compiler = compile_module(SloppyModel(), "sloppy")
+compiled = compiler.compile(mode='reduce-overhead')
+
+# Or with analysis visibility
+compiler = CompileRouter.from_module(model)
+compiler.introspect()
+compiler.compile_towers()
+compiler.print_stages()  # See what's batchable
+print(compiler.get_compilation_stats())
+```
+
+**What it does:**
+1. **Introspects** the module tree recursively
+2. **Categorizes** modules (attention, linear, conv, norm, etc.)
+3. **Groups by signature** - modules with identical structure
+4. **Identifies batchable stages** - groups that can benefit from vmap
+5. **Builds VMapTowerGroups** for true vectorized execution
+
+**Integration with WideRouter:**
+```python
+# Build a WideRouter from any model's structure
+compiler = CompileRouter.from_module(complex_model)
+wide = compiler.build_wide_router()  # Returns CompiledWideRouter
+compiled = torch.compile(wide, mode='reduce-overhead')
+```
 
 ### The Collective Pattern
 
@@ -550,7 +613,8 @@ compiled = torch.compile(collective)  # May fail
 6. **Towers Produce Opinions** - Local conclusions, not final answers
 7. **Use network_to()** - Safe device movement with cache clearing
 8. **Divergence Over Accuracy** - See differently, triangulate truth
-9. **Compile First for Wide Models** - Let `torch.compile` handle fusion
+9. **Compile First for Wide Models** - Use `prepare_and_compile()` or `CompileRouter`
+10. **VMap Over For-Loops** - Use `VMapTowerGroup` for true vectorized batching
 
 ---
 
@@ -564,6 +628,105 @@ compiled = torch.compile(collective)  # May fail
 ---
 
 ## Changelog
+
+### v1.1.0 (2025-12-29)
+
+**CompileRouter** - Introspective Compilation System
+
+- **New `CompileRouter`**: Auto-discovers, wraps, and stages arbitrary `nn.Module` structures for optimized execution
+- **Module introspection**: Categorizes modules (attention, linear, conv, norm, gating, pooling, embedding)
+- **Execution staging**: Groups modules by signature for batching opportunities
+- **`compile_module()`**: One-liner standalone wrapper for any model
+- **`build_vmap_groups()`**: Creates VMapTowerGroups from batchable stages
+- **`build_wide_router()`**: Generates CompiledWideRouter with proper tower registration
+
+```python
+from geofractal.router.compiler import CompileRouter, compile_module
+
+# One-liner compilation
+compiler = compile_module(any_model, "my_model")
+compiled = compiler.compile(mode='reduce-overhead')
+
+# Or step-by-step with analysis
+compiler = CompileRouter.from_module(model)
+compiler.introspect()
+compiler.compile_towers()
+compiler.print_stages()  # See batching opportunities
+```
+
+**VMapTowerGroup** - True Vectorized Batching
+
+- **Replaces fake for-loop batching** with real vectorized execution via `torch.func.vmap`
+- **Uses `stack_module_state()`** to batch parameters across identical-signature towers
+- **Uses `functional_call()`** for efficient parameter-batched forward passes
+- **Lazy caching**: Stacked params/buffers cached until invalidated by `train()` or `to()`
+
+```python
+from torch.func import vmap, functional_call, stack_module_state
+
+# Old: Sequential (just a for loop)
+for tower in towers:
+    results[name] = tower(x)
+
+# New: True vectorized execution
+params, buffers = stack_module_state(towers)
+vmapped_forward = vmap(single_forward, in_dims=(0, 0, None))
+outputs = vmapped_forward(params, buffers, x)  # ONE operation
+```
+
+**WideRouter Enhancements**
+
+- **New `_batched_tower_forward()`**: Uses VMapTowerGroup for genuine parallel execution
+- **VMap group caching**: Groups cached by `(signature, frozenset(tower_names))`
+- **Cache invalidation**: Cleared on `register_tower()`, `unregister_tower()`, `reset()`
+- **Integration with CompileRouter**: `build_wide_router()` produces properly configured WideRouter
+
+**Walker Fusion System** - Geometric Interpolation
+
+- **`ConfigurableWalker`**: Static composition of blend/schedule/aggregation functions (NOT nn.Module)
+- **`WalkerInception`**: Optional learned modulation (~20k params, TorchComponent)
+- **`WalkerFusion`**: Interface wrapper housing walker + optional inception
+- **Preset walkers**: `shiva`, `slerp`, `lerp`, `slip`, `zeus`, `gilgamesh`
+- **Aux types**: `cosine`, `geometric`, `learned`, `walker_path`
+
+```python
+from geofractal.router.components.walker_component import (
+    WalkerFusion, WalkerInception, create_walker_fusion
+)
+
+# Static walker (no learning)
+fusion = WalkerFusion("walk", in_features=512, preset='shiva')
+
+# With learned modulation
+inception = WalkerInception("inc", in_features=512, num_steps=8, aux_type='cosine')
+fusion = WalkerFusion("walk", in_features=512, preset='shiva', inception=inception)
+
+# Factory functions
+static = create_walker_fusion("s", 512, preset='shiva')
+learned = create_walker_fusion("l", 512, preset='shiva', with_inception=True)
+```
+
+**Fusion System Updates**
+
+- **`AdaptiveBindingFusion`** (Lyra): Full binding system with mask + visibility + boost
+- **`CantorScaleFusion`**: Fractal geometry routing with Cantor set mathematics
+- **`HierarchicalTreeGating`**: Tree-structured gating for deep fusion
+- **`FusionBuilder`**: Mirrors ConfigurableTower pattern for fusion construction
+- **`FusionCollective`**: Multi-fusion ensemble with strategy selection
+
+**Benchmark Tools**
+
+- **`compile_benchmark.py`**: Comprehensive benchmark comparing:
+  - Eager execution (baseline)
+  - `torch.compile` (standard)
+  - `torch.compile` with `fullgraph=True`
+  - VMap WideRouter (vectorized batching)
+  - VMap WideRouter + `torch.compile` (best of both)
+- **`benchmark_model()`**: Standalone function for benchmarking any model
+
+```bash
+python compile_benchmark.py --towers 8 --depth 4 --dim 512
+```
 
 ### v1.0.1 (2025-12-23)
 
