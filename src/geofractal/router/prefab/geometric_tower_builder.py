@@ -824,24 +824,43 @@ def quick_collective(
     **kwargs
 ) -> ConfigurableCollective:
     """
-    Quick tower collective (uniform towers only).
+    Quick tower collective.
+
+    Supports:
+    - 'simplex' → single simplex tower
+    - ['cantor', 3] → 3 inverse pairs (6 towers: 3 pos, 3 neg)
 
     Example:
         collective = quick_collective(
-            ['cantor', 'beatrix', 'helix', 'simplex'],
+            ['simplex', ['cantor', 2], 'helix'],
             fusion_type='walker_inception'
         )
-
-    For inverse pairs, use quick_hybrid_collective instead.
+        # Creates: simplex, cantor_0_pos, cantor_0_neg, cantor_1_pos, cantor_1_neg, helix
+        # = 6 towers total
     """
-    # Generate unique names for duplicate geometries
+    # Generate configs, expanding inverse pairs
     name_counts = {}
     configs = []
-    for g in geometries:
-        count = name_counts.get(g, 0)
-        tower_name = f'{g}_{count}' if count > 0 or geometries.count(g) > 1 else g
-        name_counts[g] = count + 1
-        configs.append(get_tower_config(g, name=tower_name))
+
+    for item in geometries:
+        # Check for inverse pairs: ['geometry', count]
+        if isinstance(item, (list, tuple)) and len(item) == 2 and isinstance(item[1], int):
+            g, num_pairs = item
+            for i in range(num_pairs):
+                count = name_counts.get(g, 0)
+                pos_name = f'{g}_{count}_pos'
+                neg_name = f'{g}_{count}_neg'
+                name_counts[g] = count + 1
+
+                configs.append(get_tower_config(g, name=pos_name, inverted=False))
+                configs.append(get_tower_config(g, name=neg_name, inverted=True))
+        else:
+            # Single tower
+            g = item
+            count = name_counts.get(g, 0)
+            tower_name = f'{g}_{count}' if count > 0 or sum(1 for x in geometries if (x == g if isinstance(x, str) else x[0] == g)) > 1 else g
+            name_counts[g] = count + 1
+            configs.append(get_tower_config(g, name=tower_name))
 
     return ConfigurableCollective(
         name=name, tower_configs=configs, dim=dim, default_depth=depth,
