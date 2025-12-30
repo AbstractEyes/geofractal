@@ -774,11 +774,14 @@ def quick_tower(
     Example:
         tower = quick_tower('cantor', dim=512, depth=3)
     """
+    num_heads = kwargs.get('num_heads', 4)
+    head_dim = kwargs.get('head_dim', dim // num_heads)
+
     config = get_tower_config(geometry, name=name, inverted=inverted)
     return ConfigurableTower(
         config=config, default_dim=dim, default_depth=depth,
-        default_num_heads=kwargs.get('num_heads', 4),
-        default_head_dim=kwargs.get('head_dim', dim // 4),
+        default_num_heads=num_heads,
+        default_head_dim=head_dim,
         default_ffn_mult=kwargs.get('ffn_mult', 4.0),
         default_dropout=kwargs.get('dropout', 0.1),
         default_fingerprint_dim=kwargs.get('fingerprint_dim', 64),
@@ -862,10 +865,13 @@ def quick_collective(
             name_counts[g] = count + 1
             configs.append(get_tower_config(g, name=tower_name))
 
+    num_heads = kwargs.get('num_heads', 4)
+    head_dim = kwargs.get('head_dim', dim // num_heads)
+
     return ConfigurableCollective(
         name=name, tower_configs=configs, dim=dim, default_depth=depth,
-        num_heads=kwargs.get('num_heads', 4),
-        head_dim=kwargs.get('head_dim', dim // 4),
+        num_heads=num_heads,
+        head_dim=head_dim,
         ffn_mult=kwargs.get('ffn_mult', 4.0),
         dropout=kwargs.get('dropout', 0.1),
         fingerprint_dim=kwargs.get('fingerprint_dim', 64),
@@ -894,6 +900,7 @@ class InversePairModule(TorchComponent):
         super().__init__(name)
         self.dim = dim
         self._fingerprint_dim = fingerprint_dim
+        head_dim = dim // num_heads
 
         # Create positive and negative towers
         config_pos = get_tower_config(geometry, name=f'{name}_pos', inverted=False)
@@ -901,12 +908,14 @@ class InversePairModule(TorchComponent):
 
         tower_pos = ConfigurableTower(
             config=config_pos, default_dim=dim, default_depth=depth,
-            default_num_heads=num_heads, default_fingerprint_dim=fingerprint_dim,
+            default_num_heads=num_heads, default_head_dim=head_dim,
+            default_fingerprint_dim=fingerprint_dim,
             **{k: v for k, v in kwargs.items() if k.startswith('default_')}
         )
         tower_neg = ConfigurableTower(
             config=config_neg, default_dim=dim, default_depth=depth,
-            default_num_heads=num_heads, default_fingerprint_dim=fingerprint_dim,
+            default_num_heads=num_heads, default_head_dim=head_dim,
+            default_fingerprint_dim=fingerprint_dim,
             **{k: v for k, v in kwargs.items() if k.startswith('default_')}
         )
         self.attach('tower_pos', tower_pos)
@@ -1061,6 +1070,7 @@ def quick_hybrid_collective(
     """
     fingerprint_dim = kwargs.get('fingerprint_dim', 64)
     num_heads = kwargs.get('num_heads', 4)
+    head_dim = dim // num_heads
 
     units = []
     unit_names = []
@@ -1100,6 +1110,7 @@ def quick_hybrid_collective(
                 default_dim=dim,
                 default_depth=depth,
                 default_num_heads=num_heads,
+                default_head_dim=head_dim,
                 default_fingerprint_dim=fingerprint_dim,
                 default_ffn_mult=kwargs.get('ffn_mult', 4.0),
                 default_dropout=kwargs.get('dropout', 0.1),
