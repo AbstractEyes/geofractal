@@ -718,6 +718,7 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> CollectiveOpinion:
         if x.dim() == 2:
             x = x.unsqueeze(1)
+        B = x.shape[0]
         x = self['input_proj'](x)
         opinions_dict = self.wide_forward(x, mask=mask)
 
@@ -733,7 +734,9 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
             opinion_tensors.append(opinion)
 
         # Compute collective fingerprint BEFORE fusion (v1.1.1)
+        # Fingerprints are per-tower [fp_dim], expand to batch [B, fp_dim * num_towers]
         fp_stack = torch.cat([op.fingerprint for op in all_opinions], dim=-1)
+        fp_stack = fp_stack.unsqueeze(0).expand(B, -1)
         collective_fp = F.normalize(self['fp_proj'](fp_stack), dim=-1)
 
         # Pass fingerprint to fusion for modulation (WalkerFusion only)
