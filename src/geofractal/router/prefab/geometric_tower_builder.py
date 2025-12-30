@@ -735,8 +735,11 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
 
         # Compute collective fingerprint BEFORE fusion (v1.1.1)
         # Fingerprints are per-tower [fp_dim], expand to batch [B, fp_dim * num_towers]
-        fp_stack = torch.cat([op.fingerprint for op in all_opinions], dim=-1)
+        # Ensure fingerprints are on same device as input and detach to prevent grad issues
+        device = x.device
+        fp_stack = torch.cat([op.fingerprint.detach().to(device) for op in all_opinions], dim=-1)
         fp_stack = fp_stack.unsqueeze(0).expand(B, -1)
+        # fp_proj IS trainable - it learns to combine fingerprints
         collective_fp = F.normalize(self['fp_proj'](fp_stack), dim=-1)
 
         # Pass fingerprint to fusion for modulation (WalkerFusion only)
@@ -937,7 +940,9 @@ class InversePairModule(TorchComponent):
         """Combined fingerprint from both towers."""
         fp_pos = self['tower_pos'].fingerprint
         fp_neg = self['tower_neg'].fingerprint
-        combined = torch.cat([fp_pos, fp_neg], dim=-1)
+        # Ensure same device as fp_proj weights and detach to prevent grad issues
+        device = self['fp_proj'].weight.device
+        combined = torch.cat([fp_pos.detach().to(device), fp_neg.detach().to(device)], dim=-1)
         return F.normalize(self['fp_proj'](combined), dim=-1)
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
@@ -1020,7 +1025,9 @@ class HybridCollective(TorchComponent):
             fingerprints.append(unit.fingerprint)
 
         # Build collective fingerprint
-        fp_stack = torch.cat(fingerprints, dim=-1)
+        # Ensure fingerprints are on same device as input and detach to prevent grad issues
+        device = x.device
+        fp_stack = torch.cat([fp.detach().to(device) for fp in fingerprints], dim=-1)
         fp_stack = fp_stack.unsqueeze(0).expand(B, -1)
         collective_fp = F.normalize(self['fp_proj'](fp_stack), dim=-1)
 
