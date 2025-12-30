@@ -4,6 +4,8 @@ geofractal.router.components.walker_component
 
 Static interpolative walking with optional learnable modulation.
 
+v1.1.1: Added fingerprint modulation support
+
 Architecture:
 
     ConfigurableWalker (STATIC - no learnable params):
@@ -20,6 +22,7 @@ Architecture:
         Wraps ConfigurableWalker + optional WalkerInception
         inception=None → pure static walking (just the formula)
         inception=WalkerInception(...) → modulated walking
+        fingerprint_dim=N → enables collective fingerprint gating
 
 Key Principle:
     No configuration = just the formula
@@ -473,6 +476,8 @@ class WalkerFusion(TorchComponent):
         project_inputs: bool = False,
         project_output: bool = False,
         hidden_dim: Optional[int] = None,
+        # Fingerprint modulation (v1.1.1)
+        fingerprint_dim: Optional[int] = None,
         uuid: Optional[str] = None,
         **kwargs,
     ):
@@ -482,6 +487,7 @@ class WalkerFusion(TorchComponent):
         self.out_features = out_features or in_features
         self.num_steps = num_steps
         self.hidden_dim = hidden_dim or in_features
+        self.fingerprint_dim = fingerprint_dim
 
         # === Static Walker (formula only) ===
         walker_config = {}
@@ -511,12 +517,24 @@ class WalkerFusion(TorchComponent):
         else:
             self.output_proj = None
 
+        # === Fingerprint Gate (v1.1.1) ===
+        # Projects fingerprint to scale factor for output modulation
+        if fingerprint_dim is not None:
+            self.fingerprint_gate = nn.Sequential(
+                nn.Linear(fingerprint_dim, fingerprint_dim),
+                nn.GELU(),
+                nn.Linear(fingerprint_dim, self.out_features),
+                nn.Sigmoid(),
+            )
+        else:
+            self.fingerprint_gate = None
+
         # Diagnostics
         self._last_stepped = None
         self._last_alphas = None
         self._last_agg_weights = None
 
-    def forward(self, *inputs: Tensor) -> Tensor:
+    def forward(self, *inputs: Tensor, fingerprint: Optional[Tensor] = None) -> Tensor:
         """
         Walk through inputs.
 
@@ -525,6 +543,7 @@ class WalkerFusion(TorchComponent):
 
         Args:
             *inputs: 2+ tensors of [B, D] or [B, T, D]
+            fingerprint: Optional [B, fp_dim] collective fingerprint for modulation
 
         Returns:
             [B, D] or [B, T, D] fused result
@@ -533,22 +552,23 @@ class WalkerFusion(TorchComponent):
             raise ValueError(f"WalkerFusion requires at least 2 inputs, got {len(inputs)}")
 
         if len(inputs) == 2:
-            return self._walk_pair(inputs[0], inputs[1])
+            return self._walk_pair(inputs[0], inputs[1], fingerprint=fingerprint)
 
         # Hierarchical fusion for 3+ inputs
-        current = self._walk_pair(inputs[0], inputs[1])
+        current = self._walk_pair(inputs[0], inputs[1], fingerprint=fingerprint)
         for i in range(2, len(inputs)):
-            current = self._walk_pair(current, inputs[i])
+            current = self._walk_pair(current, inputs[i], fingerprint=fingerprint)
 
         return current
 
-    def _walk_pair(self, a: Tensor, b: Tensor) -> Tensor:
+    def _walk_pair(self, a: Tensor, b: Tensor, fingerprint: Optional[Tensor] = None) -> Tensor:
         """
         Walk from a to b (internal 2-input method).
 
         Args:
             a: [B, D] or [B, T, D] source
             b: [B, D] or [B, T, D] target
+            fingerprint: Optional [B, fp_dim] for output modulation
 
         Returns:
             [B, D] or [B, T, D] fused result
@@ -587,11 +607,18 @@ class WalkerFusion(TorchComponent):
         if self.output_proj is not None:
             result = self.output_proj(result)
 
+        # Fingerprint modulation (v1.1.1)
+        if fingerprint is not None and self.fingerprint_gate is not None:
+            gate = self.fingerprint_gate(fingerprint)  # [B, out_features]
+            if result.dim() == 3:
+                gate = gate.unsqueeze(1)  # [B, 1, out_features]
+            result = result * gate
+
         return result
 
-    def fuse(self, *inputs: Tensor) -> Tensor:
+    def fuse(self, *inputs: Tensor, fingerprint: Optional[Tensor] = None) -> Tensor:
         """Alias for forward (FusionComponent interface)."""
-        return self.forward(*inputs)
+        return self.forward(*inputs, fingerprint=fingerprint)
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """Get diagnostics from last forward pass."""

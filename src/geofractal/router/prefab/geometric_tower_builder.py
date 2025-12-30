@@ -198,7 +198,8 @@ class InvertedAddressWrapper(nn.Module):
 
     @property
     def fingerprint(self) -> Tensor:
-        return 1.0 - F.normalize(self.base_address.fingerprint, dim=-1)
+        # Negate the base fingerprint (negation survives normalization)
+        return -self.base_address.fingerprint
 
     def forward(self, *args, **kwargs):
         return self.base_address(*args, **kwargs)
@@ -307,6 +308,7 @@ def build_fusion(
     num_steps: int = 8,
     inception_aux_type: str = 'geometric',
     walker_preset: str = 'shiva',
+    fingerprint_dim: Optional[int] = None,
     **kwargs
 ) -> nn.Module:
     """Build Fusion component by type."""
@@ -322,7 +324,8 @@ def build_fusion(
                                         num_steps=num_steps, num_inputs=2,
                                         aux_type=inception_aux_type)
         return WalkerFusion(name, in_features=in_features, preset=preset,
-                           num_steps=num_steps, inception=inception)
+                           num_steps=num_steps, inception=inception,
+                           fingerprint_dim=fingerprint_dim)
 
     # Legacy fusion types
     if fusion_type == FusionType.ADAPTIVE:
@@ -700,7 +703,7 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
 
         fusion_params = fusion_params or {}
         fusion = build_fusion(f'{name}_fusion', fusion_type, num_inputs=self._num_towers,
-                              in_features=dim, **fusion_params)
+                              in_features=dim, fingerprint_dim=fingerprint_dim, **fusion_params)
         self.attach('fusion', fusion)
         self.attach('input_proj', nn.Linear(dim, dim))
         self.attach('fp_proj', nn.Linear(fingerprint_dim * self._num_towers, fingerprint_dim))
@@ -729,9 +732,16 @@ class ConfigurableCollective(SafeAttachMixin, WideRouter):
             all_opinions.append(tower_opinion)
             opinion_tensors.append(opinion)
 
-        fused = self['fusion'](*opinion_tensors)
+        # Compute collective fingerprint BEFORE fusion (v1.1.1)
         fp_stack = torch.cat([op.fingerprint for op in all_opinions], dim=-1)
         collective_fp = F.normalize(self['fp_proj'](fp_stack), dim=-1)
+
+        # Pass fingerprint to fusion for modulation (WalkerFusion only)
+        fusion = self['fusion']
+        if hasattr(fusion, 'fingerprint_gate'):
+            fused = fusion(*opinion_tensors, fingerprint=collective_fp)
+        else:
+            fused = fusion(*opinion_tensors)
 
         for tower_name in self.tower_names:
             self[tower_name].cache_clear()
@@ -1061,11 +1071,11 @@ if __name__ == '__main__':
         fp_pos = tower_pos.fingerprint
         fp_neg = tower_neg.fingerprint
 
-        # Fingerprints should be inverted
-        fp_diff = (fp_pos + fp_neg - 1.0).abs().mean().item()
+        # Fingerprints should be negated (fp_pos + fp_neg ≈ 0)
+        fp_sum = (fp_pos + fp_neg).abs().mean().item()
         print(f"  Pos fingerprint: {fp_pos[:3].tolist()}")
         print(f"  Neg fingerprint: {fp_neg[:3].tolist()}")
-        print(f"  Inversion check (should be ~0): {fp_diff:.6f}")
+        print(f"  Inversion check (should be ~0): {fp_sum:.6f}")
     except Exception as e:
         print(f"  ✗ {e}")
 

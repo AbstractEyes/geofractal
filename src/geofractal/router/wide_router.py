@@ -1151,6 +1151,7 @@ class WideRouter(BaseRouter):
         replacing N sequential calls with ONE vectorized operation.
 
         VMapTowerGroup instances are cached by signature for reuse.
+        Falls back to sequential execution if vmap fails (e.g., heterogeneous params).
         """
         if not tower_names:
             return {}
@@ -1164,17 +1165,55 @@ class WideRouter(BaseRouter):
         # Use frozenset of names as cache key (order-independent)
         cache_key = (sig, frozenset(tower_names))
 
-        if cache_key not in vmap_groups:
-            # Build new VMapTowerGroup
-            towers = [self[name] for name in tower_names]
-            vmap_group = VMapTowerGroup(towers, list(tower_names))
+        # Check if this group is marked as non-vmappable
+        non_vmappable = self.objects.get('_non_vmappable_groups', set())
+        if cache_key in non_vmappable:
+            # Fall back to sequential
+            return self._sequential_tower_forward(x, tower_names, mask)
 
-            # Move to same device as input
-            vmap_group = vmap_group.to(x.device)
-            vmap_groups[cache_key] = vmap_group
+        try:
+            if cache_key not in vmap_groups:
+                # Build new VMapTowerGroup
+                towers = [self[name] for name in tower_names]
+                vmap_group = VMapTowerGroup(towers, list(tower_names))
 
-        # Execute via vmap
-        return vmap_groups[cache_key](x)
+                # Move to same device as input
+                vmap_group = vmap_group.to(x.device)
+                vmap_groups[cache_key] = vmap_group
+
+            # Execute via vmap
+            return vmap_groups[cache_key](x)
+
+        except (KeyError, RuntimeError) as e:
+            # vmap failed - mark group as non-vmappable and use sequential
+            if '_non_vmappable_groups' not in self.objects:
+                self.objects['_non_vmappable_groups'] = set()
+            self.objects['_non_vmappable_groups'].add(cache_key)
+
+            # Clean up failed vmap group if cached
+            if cache_key in vmap_groups:
+                del vmap_groups[cache_key]
+
+            return self._sequential_tower_forward(x, tower_names, mask)
+
+    def _sequential_tower_forward(
+        self,
+        x: Tensor,
+        tower_names: List[str],
+        mask: Optional[Tensor] = None,
+    ) -> Dict[str, Tensor]:
+        """Sequential fallback when vmap is not possible."""
+        outputs = {}
+        for name in tower_names:
+            tower = self[name]
+            if mask is not None:
+                out = tower(x, mask=mask)
+            else:
+                out = tower(x)
+            if isinstance(out, tuple):
+                out = out[0]
+            outputs[name] = out
+        return outputs
 
     # =========================================================================
     # COMPILATION
