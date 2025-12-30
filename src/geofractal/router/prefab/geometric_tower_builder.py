@@ -832,7 +832,15 @@ def quick_collective(
             fusion_type='walker_inception'
         )
     """
-    configs = [get_tower_config(g) for g in geometries]
+    # Generate unique names for duplicate geometries
+    name_counts = {}
+    configs = []
+    for g in geometries:
+        count = name_counts.get(g, 0)
+        tower_name = f'{g}_{count}' if count > 0 or geometries.count(g) > 1 else g
+        name_counts[g] = count + 1
+        configs.append(get_tower_config(g, name=tower_name))
+
     return ConfigurableCollective(
         name=name, tower_configs=configs, dim=dim, default_depth=depth,
         num_heads=kwargs.get('num_heads', 4),
