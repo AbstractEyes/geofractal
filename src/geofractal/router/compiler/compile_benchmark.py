@@ -821,9 +821,9 @@ def main():
     )
 
     # Model config
-    parser.add_argument('--dim', type=int, default=256, help='Model dimension')
-    parser.add_argument('--towers', type=int, default=4, help='Number of parallel towers')
-    parser.add_argument('--depth', type=int, default=3, help='Depth of each tower')
+    parser.add_argument('--dim', type=int, default=512, help='Model dimension')
+    parser.add_argument('--towers', type=int, default=1, help='Number of parallel towers')
+    parser.add_argument('--depth', type=int, default=32, help='Depth of each tower')
     parser.add_argument('--heads', type=int, default=8, help='Attention heads')
     parser.add_argument('--classes', type=int, default=1000, help='Output classes')
 
