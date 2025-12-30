@@ -5,6 +5,8 @@ geofractal.router.prefab.geometric_tower_builder
 Flexible tower builder with BATCHED forward for tower groups.
 Now with WalkerFusion support for static and learnable fusion.
 
+v1.1.1: RoPE injection fix - rope now passed to attention layers.
+
 Quick Construction:
     tower = quick_tower('cantor')
     pair = quick_pair('cantor', 'beatrix', use_inception=True)
@@ -427,8 +429,11 @@ class ConfigurableTower(SafeAttachMixin, BaseTower):
         return self._inverted
 
     def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        # Get rope component for position encoding (v1.1.1 fix)
+        rope = self['rope']
+
         for block in self.stages:
-            x, _ = block(x, mask=mask)
+            x, _ = block(x, mask=mask, rope=rope)
         features = self['final_norm'](x)
         pooled = features.mean(dim=1)
         opinion = self['opinion_proj'](pooled)
@@ -488,8 +493,7 @@ class HeterogeneousFusion(TorchComponent):
         inception_aux_type: str = 'geometric',
         num_steps: int = 8,
     ):
-        super().__init__()
-        self.name = name
+        super().__init__(name)
         self.in_dims = in_dims
         self.out_dim = out_dim
         self.num_inputs = len(in_dims)
@@ -565,8 +569,7 @@ class HeterogeneousPair(TorchComponent):
         inception_aux_type: str = 'geometric',
         num_steps: int = 8,
     ):
-        super().__init__()
-        self.name = name
+        super().__init__(name)
 
         # Input projections
         self.proj_a = nn.Sequential(
@@ -622,8 +625,7 @@ class WalkerPair(TorchComponent):
         walker_preset: str = 'shiva',
         inception_aux_type: str = 'geometric',
     ):
-        super().__init__()
-        self.name = name
+        super().__init__(name)
         head_dim = dim // num_heads
 
         self.tower_a = ConfigurableTower(config=config_a, default_dim=dim, default_depth=depth,
