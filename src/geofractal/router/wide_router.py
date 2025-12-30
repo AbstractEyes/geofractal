@@ -732,6 +732,9 @@ class VMapTowerGroup(nn.Module):
     vectorized operation by stacking parameters and using vmap.
 
     This provides true batching - not just a for loop.
+
+    IMPORTANT: Call prepare_for_forward() before torch.compile() to avoid
+    graph breaks from stack_module_state() which uses requires_grad_().
     """
 
     def __init__(self, towers: List[nn.Module], names: List[str]):
@@ -746,17 +749,59 @@ class VMapTowerGroup(nn.Module):
         self._stacked_params: Optional[Dict[str, Tensor]] = None
         self._stacked_buffs: Optional[Dict[str, Tensor]] = None
         self._stale = True
+        self._prepared = False
+        self._current_device: Optional[torch.device] = None
 
+    @torch.compiler.disable
     def _stack_state(self) -> None:
-        """Stack parameters and buffers from all towers."""
+        """Stack parameters and buffers from all towers.
+
+        Decorated with @torch.compiler.disable because stack_module_state
+        uses requires_grad_() which breaks dynamo tracing.
+        """
         if not self._stale:
             return
         self._stacked_params, self._stacked_buffs = stack_module_state(list(self.towers))
         self._stale = False
 
+    @torch.compiler.disable
+    def prepare_for_forward(self, device: torch.device = None) -> 'VMapTowerGroup':
+        """
+        Prepare state for forward pass. Call BEFORE torch.compile().
+
+        This stacks parameters and buffers and optionally moves to device.
+        By doing it here outside the forward path, we avoid graph breaks.
+
+        Args:
+            device: Target device (optional)
+
+        Returns:
+            self for chaining
+        """
+        if self._prepared and self._current_device == device:
+            return self
+
+        # Stack params and buffers
+        self._stacked_params, self._stacked_buffs = stack_module_state(list(self.towers))
+        self._stale = False
+
+        # Move to device if specified
+        if device is not None:
+            self._stacked_params = {
+                k: v.to(device) for k, v in self._stacked_params.items()
+            }
+            self._stacked_buffs = {
+                k: v.to(device) for k, v in self._stacked_buffs.items()
+            }
+            self._current_device = device
+
+        self._prepared = True
+        return self
+
     def _invalidate(self) -> None:
         """Mark cached state as stale."""
         self._stale = True
+        self._prepared = False
         self._stacked_params = None
         self._stacked_buffs = None
 
@@ -767,7 +812,28 @@ class VMapTowerGroup(nn.Module):
 
     def to(self, *args, **kwargs):
         result = super().to(*args, **kwargs)
-        self._invalidate()
+
+        # Extract device from args
+        device = None
+        for arg in args:
+            if isinstance(arg, torch.device):
+                device = arg
+                break
+            elif isinstance(arg, str):
+                device = torch.device(arg)
+                break
+        if device is None:
+            device = kwargs.get('device')
+            if isinstance(device, str):
+                device = torch.device(device)
+
+        # Re-prepare with new device if we were previously prepared
+        if device is not None and self._prepared:
+            self._invalidate()
+            self.prepare_for_forward(device)
+        else:
+            self._invalidate()
+
         return result
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
@@ -787,8 +853,9 @@ class VMapTowerGroup(nn.Module):
             out = self.towers[0](x)
             return {self.names[0]: out[0] if isinstance(out, tuple) else out}
 
-        # Ensure state is stacked
-        self._stack_state()
+        # Ensure state is stacked (will cause graph break if not pre-prepared)
+        if not self._prepared:
+            self._stack_state()
 
         # Reference model for functional_call
         base = self.towers[0]
@@ -929,6 +996,11 @@ class WideRouter(BaseRouter):
         # vmap tower groups: signature -> VMapTowerGroup
         self.objects['_vmap_groups'] = {}
 
+        # Compile preparation tracking
+        self.objects['_prepared_for_compile'] = False
+        self.objects['_vmap_device'] = None
+        self.objects['_non_vmappable_groups'] = set()
+
     # =========================================================================
     # TOWER REGISTRATION
     # =========================================================================
@@ -1024,6 +1096,91 @@ class WideRouter(BaseRouter):
         self.objects['_analyzed'] = True
 
         return alignments
+
+    # =========================================================================
+    # COMPILE PREPARATION (pre-build vmap groups)
+    # =========================================================================
+
+    @torch.compiler.disable
+    def _prebuild_vmap_groups(self, device: torch.device = None) -> None:
+        """
+        Pre-build all VMapTowerGroups for registered towers.
+
+        This MUST be called before torch.compile() to avoid graph breaks.
+        Groups are built and their state is pre-stacked.
+
+        Args:
+            device: Target device for computation
+        """
+        if not self.objects.get('_analyzed', False):
+            self.analyze_structure()
+
+        # Clear existing groups
+        self.objects['_vmap_groups'].clear()
+        if '_non_vmappable_groups' not in self.objects:
+            self.objects['_non_vmappable_groups'] = set()
+        else:
+            self.objects['_non_vmappable_groups'].clear()
+
+        # Group towers by signature
+        sig_to_names: Dict[str, List[str]] = {}
+        for name in self.tower_names:
+            sig = self._tower_signature(name)
+            if sig not in sig_to_names:
+                sig_to_names[sig] = []
+            sig_to_names[sig].append(name)
+
+        # Build VMapTowerGroup for each signature group with 2+ towers
+        for sig, names in sig_to_names.items():
+            if len(names) < 2:
+                continue
+
+            try:
+                towers = [self[name] for name in names]
+                group = VMapTowerGroup(towers, names)
+
+                # Pre-prepare the group (stacks state and moves to device)
+                group.prepare_for_forward(device)
+
+                # Cache by (signature, frozenset of names)
+                cache_key = (sig, frozenset(names))
+                self.objects['_vmap_groups'][cache_key] = group
+
+            except Exception as e:
+                # Mark as non-vmappable
+                cache_key = (sig, frozenset(names))
+                self.objects['_non_vmappable_groups'].add(cache_key)
+
+        self.objects['_prepared_for_compile'] = True
+        self.objects['_vmap_device'] = device
+
+    def prepare_for_compile(self, device: torch.device = None) -> 'WideRouter':
+        """
+        Prepare router for torch.compile().
+
+        Call this method BEFORE torch.compile() to ensure all VMapTowerGroups
+        are pre-built and their state is pre-stacked, avoiding graph breaks.
+
+        Args:
+            device: Target device for computation. If None, inferred from parameters.
+
+        Returns:
+            self for chaining
+
+        Example:
+            router = WideRouter('my_router')
+            # ... attach towers ...
+            router.prepare_for_compile()
+            compiled = torch.compile(router)
+        """
+        # Infer device from parameters if not specified
+        if device is None:
+            for p in self.parameters():
+                device = p.device
+                break
+
+        self._prebuild_vmap_groups(device)
+        return self
 
     # =========================================================================
     # WIDE FORWARD
@@ -1150,8 +1307,11 @@ class WideRouter(BaseRouter):
         Uses torch.func.vmap to truly vectorize execution across towers,
         replacing N sequential calls with ONE vectorized operation.
 
-        VMapTowerGroup instances are cached by signature for reuse.
-        Falls back to sequential execution if vmap fails (e.g., heterogeneous params).
+        VMapTowerGroup instances should be PRE-BUILT via prepare_for_compile().
+        Falls back to sequential execution if group not found or vmap fails.
+
+        FIXED: No longer creates VMapTowerGroups during forward to avoid
+        graph breaks with torch.compile.
         """
         if not tower_names:
             return {}
@@ -1159,42 +1319,30 @@ class WideRouter(BaseRouter):
         # Get signature for this group (all towers in group have same sig)
         sig = self._tower_signature(tower_names[0])
 
-        # Get or create VMapTowerGroup for this signature
-        vmap_groups = self.objects['_vmap_groups']
-
         # Use frozenset of names as cache key (order-independent)
         cache_key = (sig, frozenset(tower_names))
 
         # Check if this group is marked as non-vmappable
         non_vmappable = self.objects.get('_non_vmappable_groups', set())
         if cache_key in non_vmappable:
-            # Fall back to sequential
             return self._sequential_tower_forward(x, tower_names, mask)
 
-        try:
-            if cache_key not in vmap_groups:
-                # Build new VMapTowerGroup
-                towers = [self[name] for name in tower_names]
-                vmap_group = VMapTowerGroup(towers, list(tower_names))
+        # Look up pre-built VMapTowerGroup
+        vmap_groups = self.objects['_vmap_groups']
 
-                # Move to same device as input
-                vmap_group = vmap_group.to(x.device)
-                vmap_groups[cache_key] = vmap_group
+        if cache_key in vmap_groups:
+            try:
+                return vmap_groups[cache_key](x)
+            except (KeyError, RuntimeError) as e:
+                # vmap failed - mark as non-vmappable for future
+                if '_non_vmappable_groups' not in self.objects:
+                    self.objects['_non_vmappable_groups'] = set()
+                self.objects['_non_vmappable_groups'].add(cache_key)
+                return self._sequential_tower_forward(x, tower_names, mask)
 
-            # Execute via vmap
-            return vmap_groups[cache_key](x)
-
-        except (KeyError, RuntimeError) as e:
-            # vmap failed - mark group as non-vmappable and use sequential
-            if '_non_vmappable_groups' not in self.objects:
-                self.objects['_non_vmappable_groups'] = set()
-            self.objects['_non_vmappable_groups'].add(cache_key)
-
-            # Clean up failed vmap group if cached
-            if cache_key in vmap_groups:
-                del vmap_groups[cache_key]
-
-            return self._sequential_tower_forward(x, tower_names, mask)
+        # Group not pre-built - fall back to sequential
+        # This happens if prepare_for_compile() wasn't called
+        return self._sequential_tower_forward(x, tower_names, mask)
 
     def _sequential_tower_forward(
         self,
@@ -1226,35 +1374,35 @@ class WideRouter(BaseRouter):
         This is the primary optimization path. torch.compile automatically
         discovers aligned operations and fuses kernels.
 
-        Note: Call analyze_structure() before compile() if you want
-        alignment data, or use prepare_and_compile() for convenience.
+        Note: Call prepare_for_compile() before compile() if you want
+        to pre-build vmap groups and avoid graph breaks.
 
         Args:
-            prepare_and_compile: If True, analyze structure before compiling.
+            prepare_and_compile: If True, call prepare_for_compile() before compiling.
             **kwargs: Passed to torch.compile (mode, fullgraph, etc.)
 
         Returns:
             Compiled router
         """
         if prepare_and_compile:
-            self.analyze_structure()
+            self.prepare_for_compile()
         return torch.compile(self, **kwargs)
 
     def prepare_and_compile(self, **kwargs) -> 'WideRouter':
         """
-        Analyze structure then compile.
+        Prepare and compile in one call.
 
-        Convenience method that ensures analysis happens before
-        torch.compile traces the forward pass.
+        Convenience method that ensures vmap groups are pre-built before
+        torch.compile traces the forward pass. This minimizes graph breaks.
 
         Args:
             **kwargs: Passed to torch.compile
 
         Returns:
-            Compiled router with structure pre-analyzed
+            Compiled router with vmap groups pre-built
         """
-        self.analyze_structure()
-        return self.compile(**kwargs)
+        self.prepare_for_compile()
+        return torch.compile(self, **kwargs)
 
     # =========================================================================
     # BATCHED LINEAR EXECUTION (Operation-level batching)
@@ -1319,22 +1467,34 @@ class WideRouter(BaseRouter):
         return module
 
     # =========================================================================
-    # FORWARD (ABSTRACT - subclass must implement)
+    # FORWARD
     # =========================================================================
 
-    def forward(self, *args, **kwargs):
+    def forward(self, x: Tensor, mask: Tensor = None) -> Tensor:
         """
-        Subclass must implement forward.
+        Default forward: execute all towers via wide_forward and average outputs.
 
-        Typical pattern:
+        Override this method for custom fusion strategies (weighted sum,
+        learned fusion, concatenation, etc.).
+
+        Args:
+            x: Input tensor [B, ...]
+            mask: Optional attention mask
+
+        Returns:
+            Averaged tower outputs [B, ...]
+
+        Example override:
             def forward(self, x):
                 opinions = self.wide_forward(x)
                 return self['fusion'](*opinions.values())
         """
-        raise NotImplementedError(
-            "WideRouter subclass must implement forward(). "
-            "Use self.wide_forward(x) to execute registered towers."
-        )
+        opinions = self.wide_forward(x, mask=mask)
+        if not opinions:
+            raise RuntimeError(
+                "No towers registered. Use register_tower() or set auto_discover=True."
+            )
+        return torch.stack(list(opinions.values()), dim=0).mean(dim=0)
 
     # =========================================================================
     # CLEANUP AND LIFECYCLE
@@ -1391,11 +1551,13 @@ class WideRouter(BaseRouter):
 
     def __repr__(self) -> str:
         tower_count = len(self.tower_names)
+        prepared = self.objects.get('_prepared_for_compile', False)
         return (
             f"{self.__class__.__name__}("
             f"name='{self.name}', "
             f"towers={tower_count}, "
-            f"analyzed={self.objects['_analyzed']}"
+            f"analyzed={self.objects['_analyzed']}, "
+            f"prepared={prepared}"
             f")"
         )
 
@@ -1500,6 +1662,7 @@ if __name__ == '__main__':
     # -------------------------------------------------------------------------
 
     class TestCollective(WideRouter):
+        """Uses default forward() - no override needed!"""
         def __init__(self, name: str, num_towers: int, dim: int):
             super().__init__(name, strict=False, auto_discover=True)
 
@@ -1509,9 +1672,7 @@ if __name__ == '__main__':
             # Discover towers now (for compile safety)
             self.discover_towers()
 
-        def forward(self, x: Tensor) -> Tensor:
-            opinions = self.wide_forward(x)
-            return torch.stack(list(opinions.values()), dim=0).mean(dim=0)
+        # NOTE: No forward() override needed - default averages all tower outputs
 
     class SequentialCollective(BaseRouter):
         def __init__(self, name: str, num_towers: int, dim: int):
@@ -1549,13 +1710,11 @@ if __name__ == '__main__':
     # Compile
     # -------------------------------------------------------------------------
 
-    print("\nPre-analyzing and compiling...")
+    print("\nPreparing and compiling...")
 
-    # Pre-analyze WideRouter before compile
-    wide.analyze_structure()
-
+    # compile() now auto-prepares (builds vmap groups, stacks state)
     compiled_baseline = torch.compile(baseline)
-    compiled_wide = wide.compile()
+    compiled_wide = wide.compile()  # Calls prepare_for_compile() internally
 
     # Warmup
     for _ in range(5):
@@ -1611,9 +1770,7 @@ if __name__ == '__main__':
         w = TestCollective(f'scale_{n_towers}', n_towers, DIM)
         w.network_to(device=device)
 
-        # Pre-analyze BEFORE compiling (avoids dynamo issues)
-        w.analyze_structure()
-
+        # compile() now calls prepare_for_compile() automatically
         wc = w.compile()
 
         # Warmup
