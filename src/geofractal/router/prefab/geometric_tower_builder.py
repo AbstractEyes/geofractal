@@ -824,13 +824,15 @@ def quick_collective(
     **kwargs
 ) -> ConfigurableCollective:
     """
-    Quick tower collective.
+    Quick tower collective (uniform towers only).
 
     Example:
         collective = quick_collective(
             ['cantor', 'beatrix', 'helix', 'simplex'],
             fusion_type='walker_inception'
         )
+
+    For inverse pairs, use quick_hybrid_collective instead.
     """
     # Generate unique names for duplicate geometries
     name_counts = {}
@@ -849,7 +851,251 @@ def quick_collective(
         dropout=kwargs.get('dropout', 0.1),
         fingerprint_dim=kwargs.get('fingerprint_dim', 64),
         fusion_type=fusion_type,
-        fusion_params=kwargs.get('fusion_params', {}),
+    )
+
+
+class InversePairModule(TorchComponent):
+    """
+    Wraps two towers (pos/neg) with AdaptiveGate fusion.
+
+    Acts as a single "expert" with internal inverse diversity.
+    The gate learns to blend the positive and negative perspectives.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        geometry: str,
+        dim: int = 256,
+        depth: int = 2,
+        num_heads: int = 4,
+        fingerprint_dim: int = 64,
+        **kwargs
+    ):
+        super().__init__(name)
+        self.dim = dim
+        self._fingerprint_dim = fingerprint_dim
+
+        # Create positive and negative towers
+        config_pos = get_tower_config(geometry, name=f'{name}_pos', inverted=False)
+        config_neg = get_tower_config(geometry, name=f'{name}_neg', inverted=True)
+
+        tower_pos = ConfigurableTower(
+            config=config_pos, default_dim=dim, default_depth=depth,
+            default_num_heads=num_heads, default_fingerprint_dim=fingerprint_dim,
+            **{k: v for k, v in kwargs.items() if k.startswith('default_')}
+        )
+        tower_neg = ConfigurableTower(
+            config=config_neg, default_dim=dim, default_depth=depth,
+            default_num_heads=num_heads, default_fingerprint_dim=fingerprint_dim,
+            **{k: v for k, v in kwargs.items() if k.startswith('default_')}
+        )
+        self.attach('tower_pos', tower_pos)
+        self.attach('tower_neg', tower_neg)
+
+        # AdaptiveGate for blending
+        self.attach('gate', nn.Sequential(
+            nn.Linear(dim * 2, dim),
+            nn.GELU(),
+            nn.Linear(dim, dim),
+            nn.Sigmoid(),
+        ))
+
+        # Combined fingerprint projection
+        self.attach('fp_proj', nn.Linear(fingerprint_dim * 2, fingerprint_dim))
+
+    @property
+    def fingerprint(self) -> Tensor:
+        """Combined fingerprint from both towers."""
+        fp_pos = self['tower_pos'].fingerprint
+        fp_neg = self['tower_neg'].fingerprint
+        combined = torch.cat([fp_pos, fp_neg], dim=-1)
+        return F.normalize(self['fp_proj'](combined), dim=-1)
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """Forward through both towers, gate-fused output."""
+        opinion_pos, _ = self['tower_pos'](x, mask)
+        opinion_neg, _ = self['tower_neg'](x, mask)
+
+        # Adaptive gating
+        combined = torch.cat([opinion_pos, opinion_neg], dim=-1)
+        gate = self['gate'](combined)
+
+        # Blend: gate * pos + (1-gate) * neg
+        return gate * opinion_pos + (1 - gate) * opinion_neg
+
+
+class HybridCollective(TorchComponent):
+    """
+    Collective supporting both regular towers and inverse pair modules.
+
+    Usage:
+        collective = quick_hybrid_collective(
+            ['simplex', ['cantor', 'inverse_pair']],
+            fusion_type='walker_inception'
+        )
+    """
+
+    def __init__(
+        self,
+        name: str,
+        units: List[nn.Module],  # Mix of ConfigurableTower and InversePairModule
+        unit_names: List[str],
+        dim: int = 256,
+        fingerprint_dim: int = 64,
+        fusion_type: Union[FusionType, str] = FusionType.WALKER_STATIC,
+        fusion_params: Dict[str, Any] = None,
+    ):
+        super().__init__(name)
+        self.dim = dim
+        self._fingerprint_dim = fingerprint_dim
+        self._num_units = len(units)
+        self.unit_names = unit_names
+
+        # Attach all units
+        for unit_name, unit in zip(unit_names, units):
+            self.attach(unit_name, unit)
+
+        # Build fusion
+        fusion_params = fusion_params or {}
+        fusion = build_fusion(
+            f'{name}_fusion', fusion_type, num_inputs=self._num_units,
+            in_features=dim, fingerprint_dim=fingerprint_dim, **fusion_params
+        )
+        self.attach('fusion', fusion)
+
+        # Fingerprint projection
+        self.attach('fp_proj', nn.Linear(fingerprint_dim * self._num_units, fingerprint_dim))
+
+    @property
+    def units(self) -> Dict[str, nn.Module]:
+        return {name: self[name] for name in self.unit_names}
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> CollectiveOpinion:
+        if x.dim() == 2:
+            x = x.unsqueeze(1)
+        B = x.shape[0]
+
+        opinions = []
+        fingerprints = []
+
+        for unit_name in self.unit_names:
+            unit = self[unit_name]
+
+            # Get opinion (both tower types return tensor from forward)
+            if isinstance(unit, ConfigurableTower):
+                opinion, _ = unit(x, mask)
+            else:
+                opinion = unit(x, mask)
+
+            opinions.append(opinion)
+            fingerprints.append(unit.fingerprint)
+
+        # Build collective fingerprint
+        fp_stack = torch.cat(fingerprints, dim=-1)
+        fp_stack = fp_stack.unsqueeze(0).expand(B, -1)
+        collective_fp = F.normalize(self['fp_proj'](fp_stack), dim=-1)
+
+        # Fuse opinions
+        fusion = self['fusion']
+        if hasattr(fusion, 'fingerprint_gate'):
+            fused = fusion(*opinions, fingerprint=collective_fp)
+        else:
+            fused = fusion(*opinions)
+
+        return CollectiveOpinion(
+            fused=fused,
+            opinions={name: TowerOpinion(name=name, opinion=op, features=None,
+                                         fingerprint=fp, config=None)
+                      for name, op, fp in zip(self.unit_names, opinions, fingerprints)},
+            weights=None,
+            collective_fingerprint=collective_fp,
+        )
+
+
+def quick_hybrid_collective(
+    geometries: List[Union[str, List]],
+    dim: int = 256,
+    depth: int = 2,
+    fusion_type: Union[FusionType, str] = FusionType.WALKER_STATIC,
+    name: str = 'hybrid_collective',
+    **kwargs
+) -> HybridCollective:
+    """
+    Quick hybrid collective supporting inverse pairs.
+
+    Syntax:
+        - 'simplex' → single simplex tower
+        - ['cantor', 'inverse_pair'] → InversePairModule with cantor+/cantor-
+
+    Example:
+        collective = quick_hybrid_collective(
+            ['simplex', ['cantor', 'inverse_pair'], 'helix'],
+            fusion_type='walker_inception'
+        )
+
+        # Creates:
+        # - simplex tower
+        # - cantor inverse pair (pos + neg with AdaptiveGate)
+        # - helix tower
+        # All fused with WalkerInception
+    """
+    fingerprint_dim = kwargs.get('fingerprint_dim', 64)
+    num_heads = kwargs.get('num_heads', 4)
+
+    units = []
+    unit_names = []
+    name_counts = {}
+
+    for item in geometries:
+        # Check for inverse pair: ['geometry', 'inverse_pair']
+        if isinstance(item, (list, tuple)) and len(item) == 2 and item[1] == 'inverse_pair':
+            g = item[0]
+            count = name_counts.get(g, 0)
+            pair_name = f'{g}_pair_{count}' if count > 0 else f'{g}_pair'
+            name_counts[g] = count + 1
+
+            pair = InversePairModule(
+                name=pair_name,
+                geometry=g,
+                dim=dim,
+                depth=depth,
+                num_heads=num_heads,
+                fingerprint_dim=fingerprint_dim,
+                default_ffn_mult=kwargs.get('ffn_mult', 4.0),
+                default_dropout=kwargs.get('dropout', 0.1),
+            )
+            units.append(pair)
+            unit_names.append(pair_name)
+
+        else:
+            # Regular tower
+            g = item
+            count = name_counts.get(g, 0)
+            tower_name = f'{g}_{count}' if count > 0 else g
+            name_counts[g] = count + 1
+
+            config = get_tower_config(g, name=tower_name)
+            tower = ConfigurableTower(
+                config=config,
+                default_dim=dim,
+                default_depth=depth,
+                default_num_heads=num_heads,
+                default_fingerprint_dim=fingerprint_dim,
+                default_ffn_mult=kwargs.get('ffn_mult', 4.0),
+                default_dropout=kwargs.get('dropout', 0.1),
+            )
+            units.append(tower)
+            unit_names.append(tower_name)
+
+    return HybridCollective(
+        name=name,
+        units=units,
+        unit_names=unit_names,
+        dim=dim,
+        fingerprint_dim=fingerprint_dim,
+        fusion_type=fusion_type,
+        fusion_params=kwargs.get('fusion_params'),
     )
 
 
