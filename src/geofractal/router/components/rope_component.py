@@ -1401,25 +1401,40 @@ class CantorRoPE(BaseEmbedding):
         - 'path_encoding': Use branch path as position (wormhole shortcuts)
         - 'hybrid': Blend standard RoPE with path-based RoPE
         - 'hierarchical': Per-level rotations with 0.5^k weighting
+        - 'aligned': Linear trend + zero-mean path deviations (RECOMMENDED)
+
+    Aligned Mode Formula:
+        effective_pos = trend × m + deviation × (path_encoding(m) - μ)
+
+        Where:
+            - trend: Linear slope (1.0 = matches Standard RoPE)
+            - deviation: Wormhole perturbation strength
+            - μ: Mean of path encodings (zero-centered perturbations)
+
+        This preserves monotonic ordering while adding wormhole shortcuts.
 
     Args:
         name: Component identifier
         head_dim: Dimension of attention heads (must be even)
         theta: Base frequency. Default 10000.0
-        levels: Number of ternary decomposition levels. Default 5
-        tau: Softmax temperature for branch assignment. Default 0.25
-        mode: Encoding mode. Default 'hybrid'
+        levels: Number of ternary decomposition levels. Default 4
+        tau: Softmax temperature for branch assignment. Default 0.01
+        mode: Encoding mode. Default 'aligned'
         blend_alpha: Blend factor for hybrid mode (0=standard, 1=cantor). Default 0.5
+        trend: Linear slope for aligned mode (1.0 = Standard RoPE). Default 1.0
+        deviation: Wormhole strength for aligned mode. Default 0.3
         learnable_blend: Whether blend_alpha is learnable. Default True
+        learnable_trend: Whether trend/deviation are learnable. Default True
         max_seq_len: Maximum sequence length. Default 8192
         uuid: Optional unique identifier
 
     Example:
-        rope = CantorRoPE('cantor', head_dim=64, levels=5, mode='hybrid')
+        # Aligned with Standard RoPE slope, moderate wormholes
+        rope = CantorRoPE('cantor', head_dim=64, mode='aligned', trend=1.0, deviation=0.3)
         q_rot, k_rot = rope.rotate(q, k, seq_len=128)
 
-        # Positions 0 and 63 might get similar rotations if they share
-        # branch paths at coarse levels, enabling long-range attention!
+        # Positions with aligned branch paths get similar rotations,
+        # enabling long-range attention while preserving sequential order!
     """
 
     def __init__(
@@ -1427,11 +1442,14 @@ class CantorRoPE(BaseEmbedding):
         name: str,
         head_dim: int,
         theta: float = 10000.0,
-        levels: int = 5,
-        tau: float = 0.25,
-        mode: Literal['path_encoding', 'hybrid', 'hierarchical'] = 'hybrid',
+        levels: int = 4,
+        tau: float = 0.01,
+        mode: Literal['path_encoding', 'hybrid', 'hierarchical', 'aligned'] = 'aligned',
         blend_alpha: float = 0.5,
+        trend: float = 1.0,
+        deviation: float = 0.3,
         learnable_blend: bool = True,
+        learnable_trend: bool = True,
         max_seq_len: int = 8192,
         uuid: Optional[str] = None,
         **kwargs,
@@ -1469,6 +1487,14 @@ class CantorRoPE(BaseEmbedding):
         else:
             self.register_buffer('_blend_alpha', torch.tensor(blend_alpha, dtype=torch.float32))
 
+        # Trend and deviation for aligned mode
+        if learnable_trend:
+            self._trend = nn.Parameter(torch.tensor(trend, dtype=torch.float32))
+            self._deviation = nn.Parameter(torch.tensor(deviation, dtype=torch.float32))
+        else:
+            self.register_buffer('_trend', torch.tensor(trend, dtype=torch.float32))
+            self.register_buffer('_deviation', torch.tensor(deviation, dtype=torch.float32))
+
         # Per-level theta for hierarchical mode
         # Coarse levels get lower theta (longer wavelength)
         if mode == 'hierarchical':
@@ -1488,6 +1514,16 @@ class CantorRoPE(BaseEmbedding):
     def blend_alpha(self) -> float:
         """Blend factor (0=standard, 1=cantor)."""
         return torch.sigmoid(self._blend_alpha).item()
+
+    @property
+    def trend(self) -> float:
+        """Linear trend component for aligned mode."""
+        return self._trend.item()
+
+    @property
+    def deviation(self) -> float:
+        """Wormhole deviation strength for aligned mode."""
+        return self._deviation.item()
 
     @property
     def mode(self) -> str:
@@ -1545,6 +1581,35 @@ class CantorRoPE(BaseEmbedding):
 
         return path_positions.float()
 
+    def _compute_aligned_positions(self, seq_len: int) -> Tensor:
+        """
+        Compute trend-aligned positions with zero-mean path deviations.
+
+        Formula: pos[i] = trend × i + deviation × (path[i] - mean(path))
+
+        This preserves linear ordering (like Standard RoPE) while adding
+        wormhole shortcuts via path-based perturbations.
+
+        Returns:
+            Aligned positions, shape (L,)
+        """
+        device = self.inv_freq.device
+
+        # Linear baseline (standard positions)
+        t_linear = torch.arange(seq_len, device=device, dtype=torch.float32)
+
+        # Path-based positions
+        t_path = self._compute_path_positions(seq_len)
+
+        # Zero-center the path deviations
+        path_mean = t_path.mean()
+        path_deviation = t_path - path_mean
+
+        # Combine: trend × linear + deviation × zero_mean_path
+        aligned = self._trend * t_linear + self._deviation * path_deviation
+
+        return aligned
+
     def _build_cache(self, seq_len: int) -> None:
         """Pre-compute cos/sin cache based on mode."""
         device = self.inv_freq.device
@@ -1574,6 +1639,18 @@ class CantorRoPE(BaseEmbedding):
             self.register_buffer('_sin_std', freqs_std.sin(), persistent=False)
             self.register_buffer('_cos_path', freqs_path.cos(), persistent=False)
             self.register_buffer('_sin_path', freqs_path.sin(), persistent=False)
+
+        elif self._mode == 'aligned':
+            # Trend-aligned mode: store components for dynamic blending
+            # This allows learnable trend/deviation to update positions
+            t_linear = torch.arange(seq_len, device=device, dtype=torch.float32)
+            t_path = self._compute_path_positions(seq_len)
+            path_mean = t_path.mean()
+            t_path_centered = t_path - path_mean
+
+            # Store linear and centered path for dynamic combination in embed()
+            self.register_buffer('_t_linear', t_linear, persistent=False)
+            self.register_buffer('_t_path_centered', t_path_centered, persistent=False)
 
         elif self._mode == 'hierarchical':
             # Per-level rotations with hierarchical weighting
@@ -1608,7 +1685,23 @@ class CantorRoPE(BaseEmbedding):
 
     def embed(self, seq_len: int) -> Tuple[Tensor, Tensor]:
         """Get cos/sin embeddings for sequence length."""
-        if self._mode == 'hybrid':
+        if self._mode == 'aligned':
+            # Dynamic computation allows learnable trend/deviation
+            if seq_len > self._t_linear.shape[0]:
+                self._build_cache(seq_len)
+
+            t_linear = self._t_linear[:seq_len]
+            t_path_centered = self._t_path_centered[:seq_len]
+
+            # Combine: trend × linear + deviation × centered_path
+            t_aligned = self._trend * t_linear + self._deviation * t_path_centered
+
+            freqs = torch.outer(t_aligned, self.inv_freq)
+            freqs = torch.cat([freqs, freqs], dim=-1)
+
+            return freqs.cos(), freqs.sin()
+
+        elif self._mode == 'hybrid':
             # Blend embeddings
             if seq_len > self._cos_std.shape[0]:
                 self._build_cache(seq_len)
@@ -1632,6 +1725,10 @@ class CantorRoPE(BaseEmbedding):
     def get_path_positions(self, seq_len: int) -> Tensor:
         """Get path-encoded positions for visualization/debugging."""
         return self._compute_path_positions(seq_len)
+
+    def get_aligned_positions(self, seq_len: int) -> Tensor:
+        """Get trend-aligned positions for visualization/debugging."""
+        return self._compute_aligned_positions(seq_len)
 
     def rotate(
         self,
@@ -1666,9 +1763,9 @@ class CantorRoPE(BaseEmbedding):
         rotated = torch.cat([-x2, x1], dim=-1)
         return (x * cos) + (rotated * sin)
 
-    def set_mode(self, mode: Literal['path_encoding', 'hybrid', 'hierarchical']) -> None:
+    def set_mode(self, mode: Literal['path_encoding', 'hybrid', 'hierarchical', 'aligned']) -> None:
         """Switch encoding mode at runtime."""
-        if mode not in ('path_encoding', 'hybrid', 'hierarchical'):
+        if mode not in ('path_encoding', 'hybrid', 'hierarchical', 'aligned'):
             raise ValueError(f"Invalid mode: {mode}")
         self._mode = mode
         self._build_cache(self.max_seq_len)
@@ -1683,10 +1780,17 @@ class CantorRoPE(BaseEmbedding):
         return self.embed(seq_len)
 
     def extra_repr(self) -> str:
-        return (
-            f"head_dim={self.head_dim}, theta={self.theta}, "
-            f"levels={self.levels}, mode='{self._mode}', blend={self.blend_alpha:.3f}"
-        )
+        if self._mode == 'aligned':
+            return (
+                f"head_dim={self.head_dim}, theta={self.theta}, "
+                f"levels={self.levels}, mode='{self._mode}', "
+                f"trend={self.trend:.3f}, deviation={self.deviation:.3f}"
+            )
+        else:
+            return (
+                f"head_dim={self.head_dim}, theta={self.theta}, "
+                f"levels={self.levels}, mode='{self._mode}', blend={self.blend_alpha:.3f}"
+            )
 
 
 # =============================================================================
@@ -2372,22 +2476,49 @@ if __name__ == '__main__':
 
     rope_std = RoPE('std', head_dim=64)
     rope_beatrix = BeatrixRoPE('beatrix', head_dim=64, levels=5)
-    rope_cantor = CantorRoPE('cantor', head_dim=64, levels=5, mode='hybrid')
+    rope_cantor_hybrid = CantorRoPE('cantor_hybrid', head_dim=64, levels=4, mode='hybrid')
+    rope_cantor_aligned = CantorRoPE('cantor_aligned', head_dim=64, levels=4, mode='aligned',
+                                      trend=1.0, deviation=0.3)
 
     print(f"{'Variant':<20} {'Position 0':>12} {'Position 63':>12} {'Position 127':>12}")
     print("-" * 60)
 
     # Get first cos value at each position as proxy for "effective position"
-    for name, r in [('Standard', rope_std), ('Beatrix', rope_beatrix), ('Cantor', rope_cantor)]:
+    for name, r in [('Standard', rope_std), ('Beatrix', rope_beatrix),
+                    ('Cantor (hybrid)', rope_cantor_hybrid), ('Cantor (aligned)', rope_cantor_aligned)]:
         cos, _ = r.embed(128)
         p0 = cos[0, 0].item()
         p63 = cos[63, 0].item()
         p127 = cos[127, 0].item()
         print(f"{name:<20} {p0:>12.4f} {p63:>12.4f} {p127:>12.4f}")
 
-    print("\n  Standard: monotonic progression")
-    print("  Beatrix:  non-uniform (plateaus from Devil's Staircase)")
-    print("  Cantor:   branch-aligned (wormhole shortcuts)")
+    print("\n  Standard: monotonic progression (linear)")
+    print("  Beatrix:  non-uniform (Devil's Staircase plateaus)")
+    print("  Cantor (hybrid):   branch-aligned (wormhole shortcuts, loses trend)")
+    print("  Cantor (aligned):  linear trend + wormhole perturbations (RECOMMENDED)")
+
+    # -------------------------------------------------------------------------
+    section("ALIGNED TRIAD DEMONSTRATION")
+    # -------------------------------------------------------------------------
+
+    print("The aligned triad: Standard + Beatrix + Cantor(aligned)")
+    print("All share the same linear slope, different micro-structure:\n")
+
+    seq_len = 64
+    std_pos = torch.arange(seq_len, dtype=torch.float32)
+    beatrix_pos = rope_beatrix.get_cantor_positions(seq_len)
+    cantor_pos = rope_cantor_aligned.get_aligned_positions(seq_len)
+
+    print(f"{'Position':<10} {'Standard':>12} {'Beatrix':>12} {'Cantor(a)':>12}")
+    print("-" * 50)
+    for i in [0, 15, 31, 47, 63]:
+        print(f"{i:<10} {std_pos[i]:>12.2f} {beatrix_pos[i]:>12.2f} {cantor_pos[i]:>12.2f}")
+
+    print(f"\n  Standard range:  [{std_pos.min():.1f}, {std_pos.max():.1f}]")
+    print(f"  Beatrix range:   [{beatrix_pos.min():.1f}, {beatrix_pos.max():.1f}]")
+    print(f"  Cantor(a) range: [{cantor_pos.min():.1f}, {cantor_pos.max():.1f}]")
+    print("\n  All three now share similar ranges - they form a geometric triad!")
+    print("  Use in towers: positive=Beatrix, negative=Cantor(aligned), or mix all three.")
 
     # -------------------------------------------------------------------------
     section("MULTI-SCALE UNIFIED EXAMPLE")
@@ -2472,10 +2603,21 @@ if __name__ == '__main__':
     print("  CantorRoPE:")
     print("    - Positions with aligned branch paths get similar rotations")
     print("    - Enables long-range information teleportation")
-    print("    - Three modes: path_encoding, hybrid, hierarchical")
+    print("    - Four modes: path_encoding, hybrid, hierarchical, aligned")
     print("    - Learnable blend factor for hybrid mode")
+    print("    - NEW 'aligned' mode: trend + deviation (RECOMMENDED)")
+    print("      pos = trend × i + deviation × (path[i] - mean)")
+    print("      Preserves linear ordering + wormhole shortcuts")
 
-    print("\nSinusoidal RoPE (NEW):")
+    print("\nAligned Triad (Standard + Beatrix + Cantor):")
+    print("  All three share the same linear slope (trend=1.0)")
+    print("  Different micro-structure for different reasoning patterns:")
+    print("    - Standard:  Pure sequential (baseline)")
+    print("    - Beatrix:   Hierarchical plateaus (grouping)")
+    print("    - Cantor:    Wormhole shortcuts (long-range)")
+    print("  Use in towers as inverse pairs or geometric collective!")
+
+    print("\nSinusoidal RoPE:")
     print("  SinusoidalRoPE:")
     print("    - Pure harmonic frequency bands (fundamental + overtones)")
     print("    - Learnable phase offsets per frequency")
@@ -2486,3 +2628,6 @@ if __name__ == '__main__':
     print("Key insight: 'Distance is an illusion.'")
     print("  Cantor routing doesn't care about sequential distance.")
     print("  It cares about branch path structure at coarse levels.")
+    print("  With aligned mode, you get the best of both worlds:")
+    print("    - Sequential order preserved (monotonic increase)")
+    print("    - Wormhole shortcuts enabled (branch-path perturbations)")
