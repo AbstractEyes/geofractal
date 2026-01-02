@@ -1785,12 +1785,15 @@ class CantorRoPE(BaseEmbedding):
 
         return self._rotate_half(x, cos, sin)
 
-    def _rotate_half(self, x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-        """Rotate using the half-dimension method."""
-        half = x.shape[-1] // 2
-        x1, x2 = x[..., :half], x[..., half:]
-        rotated = torch.cat([-x2, x1], dim=-1)
-        return (x * cos) + (rotated * sin)
+    def _rotate_half(self, x, cos, sin):
+        x_even = x[..., 0::2]
+        x_odd = x[..., 1::2]
+        x_rot = torch.stack(
+            (x_even * cos[..., 0::2] - x_odd * sin[..., 0::2],
+             x_even * sin[..., 0::2] + x_odd * cos[..., 0::2]),
+            dim=-1
+        )
+        return x_rot.flatten(-2)
 
     def set_mode(self, mode: Literal['path_encoding', 'hybrid', 'hierarchical', 'aligned']) -> None:
         """Switch encoding mode at runtime."""
