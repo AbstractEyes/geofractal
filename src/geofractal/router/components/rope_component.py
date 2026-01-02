@@ -1292,29 +1292,58 @@ class BeatrixRoPE(BaseEmbedding):
         return (cantor_positions * seq_len).float()
 
     def _build_cache(self, seq_len: int) -> None:
-        """Pre-compute cos/sin cache with Cantor-warped positions."""
-        # Get Cantor-warped positions
-        t = self._compute_cantor_positions(seq_len)
+        """Pre-compute non-learnable intermediates for dynamic embedding."""
+        device = self.inv_freq.device
 
-        # Compute frequencies: (L, D//2)
+        # Normalize positions to [0, 1]
+        positions = torch.linspace(0, 1, seq_len, dtype=torch.float64, device=device)
+        positions = positions.clamp(1e-6, 1.0 - 1e-6)
+
+        # Vectorized ternary decomposition (does NOT depend on learnable params)
+        y = (positions.unsqueeze(-1) * self._scales) % 3  # (L, levels)
+
+        # Squared distance to centers (does NOT depend on learnable params)
+        d2 = (y.unsqueeze(-1) - self._centers) ** 2  # (L, levels, 3)
+
+        # Store non-learnable intermediate for fresh computation in embed()
+        self.register_buffer('_d2_cache', d2, persistent=False)
+        self._cached_seq_len = seq_len
+
+    def embed(self, seq_len: int) -> Tuple[Tensor, Tensor]:
+        """Get cos/sin embeddings - recomputes fresh using learnable params."""
+        if not hasattr(self, '_d2_cache') or seq_len > self._cached_seq_len:
+            self._build_cache(seq_len)
+
+        d2 = self._d2_cache[:seq_len]  # (L, levels, 3)
+
+        # Compute soft assignment fresh (uses learnable _tau)
+        tau = self._tau.double()
+        logits = -d2 / tau
+        p = F.softmax(logits, dim=-1)  # (L, levels, 3)
+
+        # Extract probabilities
+        p_middle = p[..., 1]  # (L, levels)
+        p_right = p[..., 2]   # (L, levels)
+
+        # Bit indicator fresh (uses learnable _alpha)
+        alpha = self._alpha.double()
+        bit_k = p_right + alpha * p_middle  # (L, levels)
+
+        # Cantor measure: C(x) = Σ bit_k × 0.5^k
+        cantor_positions = (bit_k * self._cantor_weights).sum(dim=-1)  # (L,)
+
+        # Scale to sequence length
+        t = (cantor_positions * seq_len).float()
+
+        # Compute frequencies fresh
         freqs = torch.outer(t, self.inv_freq)
         freqs = torch.cat([freqs, freqs], dim=-1)  # (L, D)
 
-        self.register_buffer('_cos', freqs.cos(), persistent=False)
-        self.register_buffer('_sin', freqs.sin(), persistent=False)
-        self.register_buffer('_cantor_pos', t, persistent=False)
-
-    def embed(self, seq_len: int) -> Tuple[Tensor, Tensor]:
-        """Get cos/sin embeddings for sequence length."""
-        if seq_len > self._cos.shape[0]:
-            self._build_cache(seq_len)
-        return self._cos[:seq_len], self._sin[:seq_len]
+        return freqs.cos(), freqs.sin()
 
     def get_cantor_positions(self, seq_len: int) -> Tensor:
         """Get the Cantor-warped position values (for visualization/debugging)."""
-        if seq_len > self._cantor_pos.shape[0]:
-            self._build_cache(seq_len)
-        return self._cantor_pos[:seq_len]
+        return self._compute_cantor_positions(seq_len)
 
     def rotate(
         self,
@@ -2475,9 +2504,9 @@ if __name__ == '__main__':
     # -------------------------------------------------------------------------
 
     rope_std = RoPE('std', head_dim=64)
-    rope_beatrix = BeatrixRoPE('beatrix', head_dim=64, levels=5)
-    rope_cantor_hybrid = CantorRoPE('cantor_hybrid', head_dim=64, levels=4, mode='hybrid')
-    rope_cantor_aligned = CantorRoPE('cantor_aligned', head_dim=64, levels=4, mode='aligned',
+    rope_beatrix = BeatrixRoPE('beatrix', head_dim=1024, levels=9)
+    rope_cantor_hybrid = CantorRoPE('cantor_hybrid', head_dim=1024, levels=4, mode='hybrid')
+    rope_cantor_aligned = CantorRoPE('cantor_aligned', head_dim=1024, levels=4, mode='aligned',
                                       trend=1.0, deviation=0.3)
 
     print(f"{'Variant':<20} {'Position 0':>12} {'Position 63':>12} {'Position 127':>12}")
