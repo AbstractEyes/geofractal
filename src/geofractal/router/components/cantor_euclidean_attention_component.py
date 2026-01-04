@@ -473,6 +473,7 @@ class CantorEuclideanAttention(TorchComponent):
             f")"
         )
 
+CantorEuclideanAttentionComponent = CantorEuclideanAttention  # Alias for easier imports
 
 # =============================================================================
 # FACTORY FUNCTION
