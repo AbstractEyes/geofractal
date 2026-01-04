@@ -1,5 +1,5 @@
 """
-geofractal.router.components.transformer
+geofractal.router.components.transformer_component
 =========================================
 
 Standard Transformer components with Cantor integration and RoPE support.
@@ -788,6 +788,7 @@ class Transformer(TorchComponent):
             f")"
         )
 
+TransformerComponent = Transformer  # Alias for easier imports
 
 # =============================================================================
 # FACTORY FUNCTIONS
