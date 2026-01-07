@@ -35,21 +35,7 @@ import torch.nn.functional as F
 from torch import Tensor
 import numpy as np
 
-
-# =============================================================================
-# BASE COMPONENT (simplified for standalone use)
-# =============================================================================
-
-class TorchComponent(nn.Module):
-    """Base component class for geofractal router system."""
-
-    def __init__(self, name: str, uuid: Optional[str] = None, **kwargs):
-        super().__init__()
-        self.name = name
-        self.uuid = uuid or name
-
-    def extra_repr(self) -> str:
-        return f"name='{self.name}'"
+from geofractal.router.components.torch_component import TorchComponent
 
 
 # =============================================================================
