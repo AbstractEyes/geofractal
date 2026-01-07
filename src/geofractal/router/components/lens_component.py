@@ -23,6 +23,7 @@ class CantorZipperLens(TorchComponent):
     def __init__(
         self,
         scales: List[float],
+        name: str = 'CantorZipperLens',
         omega: float = math.pi,
         alpha_base: float = 1.5,
         gate_mode: str = 'soft_xor',
@@ -31,7 +32,7 @@ class CantorZipperLens(TorchComponent):
         init_drift: float = 1.0,
         wave_mix: List[float] = [0.5, 0.5],
     ):
-        super().__init__()
+        super().__init__(name=name)
         scales = torch.tensor(scales)
         self.num_scales = len(scales)
         self.gate_mode = gate_mode
@@ -106,13 +107,14 @@ class TriWaveLens(nn.Module):
     def __init__(
         self,
         scales: List[float],
+        name: str = 'TriWaveLens',
         omega: float = math.pi,
         alpha_base: float = 1.5,
         invert: bool = False,
         xor_weight: float = 0.7,
         accum_weights: List[float] = [0.4, 0.2, 0.4],
     ):
-        super().__init__()
+        super().__init__(name=name)
         scales = torch.tensor(scales)
         self.num_scales = len(scales)
         self.invert = invert
