@@ -874,10 +874,8 @@ class VMapTowerGroup(nn.Module):
         if isinstance(outputs, tuple):
             outputs = outputs[0]
 
-        # Scatter to dict - MUST clone to prevent CUDAGraphs memory reuse conflicts
-        # Without clone, outputs[i] are views into the same buffer that CUDAGraphs
-        # will overwrite on subsequent iterations, breaking backward pass
-        return {name: outputs[i].clone() for i, name in enumerate(self.names)}
+        # Scatter to dict
+        return {name: outputs[i] for i, name in enumerate(self.names)}
 
 
 # =============================================================================
