@@ -140,6 +140,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
+from geofractal.router.base_component import BaseComponent
+
 
 class BaseRouter(nn.Module, ABC):
     """
@@ -225,6 +227,12 @@ class BaseRouter(nn.Module, ABC):
         If component is not nn.Module, it is stored in auxiliary dict
         without parameter tracking.
 
+        If component is a BaseComponent, sets parent reference and calls
+        on_attach() lifecycle hook. Uses object.__setattr__ for parent
+        assignment to bypass nn.Module's __setattr__, which would
+        register the router as a child of the component and create a
+        circular module reference.
+
         Args:
             name: Name to register component under.
             component: Any object. nn.Module recommended.
@@ -238,6 +246,13 @@ class BaseRouter(nn.Module, ABC):
             self.components[name] = component
         else:
             self.objects[name] = component
+
+        # Lifecycle hooks for BaseComponent subclasses.
+        # object.__setattr__ bypasses nn.Module.__setattr__ to prevent
+        # circular parent-child registration that causes recursion on .to()
+        if isinstance(component, BaseComponent):
+            object.__setattr__(component, 'parent', self)
+            component.on_attach(self)
 
     def _validate_component(self, name: str, component: nn.Module) -> None:
         """
@@ -427,17 +442,27 @@ class BaseRouter(nn.Module, ABC):
         """
         Remove and return a component.
 
+        If component is a BaseComponent, calls on_detach() lifecycle hook
+        and clears parent reference.
+
         Args:
             name: Component name.
 
         Returns:
             The removed component, or None if not found.
         """
+        component = None
         if name in self.components:
             component = self.components[name]
             del self.components[name]
-            return component
-        return self.objects.pop(name, None)
+        elif name in self.objects:
+            component = self.objects.pop(name)
+
+        if component is not None and isinstance(component, BaseComponent):
+            component.on_detach()
+            object.__setattr__(component, 'parent', None)
+
+        return component
 
     def reset(self) -> None:
         """

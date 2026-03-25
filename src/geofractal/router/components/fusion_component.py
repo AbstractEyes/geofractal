@@ -303,7 +303,6 @@ class AdaptiveFusion(FusionComponent):
     Content-dependent fusion weights.
 
     Weights computed dynamically from inputs.
-    The Lyra pattern - each input influences its own weight.
     """
 
     def __init__(
