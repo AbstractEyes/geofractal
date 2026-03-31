@@ -30,9 +30,20 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Backend extras — default install is PyTorch.
+# These are reserved for future standalone backend modules.
+# Installing them now is valid but they do not yet house
+# the backend-specific structures (those are still in-tree).
+numpy = ["numpy>=1.23"]
+tensorflow = ["tensorflow>=2.12"]
+
 hub = ["huggingface_hub", "safetensors"]
 train = ["PyYAML>=6.0"]
-all = ["huggingface_hub", "safetensors", "PyYAML>=6.0"]
+all = [
+  "huggingface_hub",
+  "safetensors",
+  "PyYAML>=6.0",
+]
 
 [project.urls]
 Homepage = "https://huggingface.co/AbstractPowered"

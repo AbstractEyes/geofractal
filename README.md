@@ -8,6 +8,13 @@
 
 ---
 
+> **Transition Notice (v1.2.0):**
+> GeoFractal is currently in a transition stage from a multistructural codebase (CPU/NumPy/PyTorch/TensorFlow) into a singularly PyTorch-dependent version. Legacy non-PyTorch code paths still exist in parts of the codebase and the dependency surface is muddier than it will be long-term. Future versions will factor out backend-specific structures into independent standalone modules with proper import guards for each elemental state (NumPy-only, TensorFlow, JAX, etc.), but that separation has not yet landed. For now, **treat PyTorch as the only supported runtime** — everything else is vestigial and subject to removal or reorganization.
+>
+> The package extras `[numpy]` and `[tensorflow]` are reserved and installable today (`pip install geofractal[numpy]`, `pip install geofractal[tensorflow]`), but they only pull in the backend dependency — the standalone backend-specific modules they will eventually gate do not yet exist.
+
+---
+
 ## What Is This?
 
 GeoFractal Router is a coordination architecture for building **collectives of autonomous AI units**. Instead of one monolithic model, you build multiple *towers* that produce opinions, coordinate through *geometric routing*, and fuse their perspectives into emergent collective intelligence.
