@@ -25,8 +25,14 @@ dependencies = [
   "numpy>=1.23",
   "datasets>=2.15",
   "torch>=2.1",
-  "geometricvocab @ git+https://github.com/AbstractEyes/lattice_vocabulary.git"
+  "geometricvocab @ git+https://github.com/AbstractEyes/lattice_vocabulary.git",
+  "wide_compiler @ git+https://github.com/AbstractEyes/pytorch-parallel-compiler.git",
 ]
+
+[project.optional-dependencies]
+hub = ["huggingface_hub", "safetensors"]
+train = ["PyYAML>=6.0"]
+all = ["huggingface_hub", "safetensors", "PyYAML>=6.0"]
 
 [project.urls]
 Homepage = "https://huggingface.co/AbstractPowered"

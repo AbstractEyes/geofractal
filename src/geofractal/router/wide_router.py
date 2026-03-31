@@ -93,9 +93,8 @@ from torch.func import functional_call, vmap, stack_module_state
 from geofractal.router.base_router import BaseRouter
 from geofractal.router.base_tower import BaseTower
 
-# Wide compiler integration (optional dependency)
+# Wide compiler integration (installed via pyproject.toml)
 from wide_compiler.core.registry import get_registry as get_wide_registry, build_wide
-_HAS_WIDE_COMPILER = True
 
 
 # =============================================================================
@@ -1034,7 +1033,7 @@ class WidePrimitiveTowerGroup(nn.Module):
             plans.append(plan)
             return plans, coverage
 
-        registry = get_wide_registry() if _HAS_WIDE_COMPILER else None
+        registry = get_wide_registry()
 
         for si in range(num_stages):
             stages = [self.towers[ti].stages[si] for ti in range(self.n)]
@@ -2312,8 +2311,7 @@ class WideRouter(BaseRouter):
         elif strategy == ExecutionStrategy.AUTO:
             # Build both for fallback chain
             self._prebuild_vmap_groups(device)
-            if _HAS_WIDE_COMPILER:
-                self._prebuild_wide_primitive_groups(device)
+            self._prebuild_wide_primitive_groups(device)
         # SEQUENTIAL: nothing to pre-build
 
         if build_sub_ensembles:
@@ -2336,9 +2334,6 @@ class WideRouter(BaseRouter):
         Args:
             device: Target device for computation
         """
-        if not _HAS_WIDE_COMPILER:
-            return
-
         if not self.objects.get('_analyzed', False):
             self.analyze_structure()
 
@@ -2425,15 +2420,14 @@ class WideRouter(BaseRouter):
             except Exception:
                 pass
 
-            # Add wide_compiler group if available
-            if _HAS_WIDE_COMPILER:
-                try:
-                    wide_group = WidePrimitiveTowerGroup(towers, names)
-                    wide_group.prepare_for_forward(device)
-                    if wide_group._fusion_coverage.fused_ops > 0:
-                        se.add_group('wide', wide_group)
-                except Exception:
-                    pass
+            # Add wide_compiler group
+            try:
+                wide_group = WidePrimitiveTowerGroup(towers, names)
+                wide_group.prepare_for_forward(device)
+                if wide_group._fusion_coverage.fused_ops > 0:
+                    se.add_group('wide', wide_group)
+            except Exception:
+                pass
 
             if len(se.groups) > 0:
                 sub_ensembles[str(cache_key)] = se

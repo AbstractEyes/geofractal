@@ -1,5 +1,5 @@
-git+https://github.com/AbstractEyes/lattice_vocabulary.git
-git+https://github.com/AbstractEyes/pytorch-parallel-compiler.git
+geofractal @ git+https://github.com/AbstractEyes/lattice_vocabulary.git
+wide_compiler @ git+https://github.com/AbstractEyes/pytorch-parallel-compiler.git
 torch
 huggingface_hub
 datasets
