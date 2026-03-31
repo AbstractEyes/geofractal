@@ -4,7 +4,9 @@
       "WebFetch(domain:github.com)",
       "Bash(xargs grep:*)",
       "WebFetch(domain:raw.githubusercontent.com)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(python -c \"from geofractal.router.wide_router import WideRouter, ExecutionStrategy, WidePrimitiveTowerGroup, SubEnsembleGroup, CacheDeviceController, GradientDebugger, FusionCoverage, StagePlan, OpPlan; print\\(''All imports successful''\\); print\\(f''ExecutionStrategy members: {[e.name for e in ExecutionStrategy]}''\\)\")",
+      "Bash(.venv/Scripts/python -c \"from geofractal.router.wide_router import WideRouter, ExecutionStrategy, WidePrimitiveTowerGroup, SubEnsembleGroup, CacheDeviceController, GradientDebugger, FusionCoverage, StagePlan, OpPlan; print\\(''All imports successful''\\); print\\(f''ExecutionStrategy members: {[e.name for e in ExecutionStrategy]}''\\)\")"
     ]
   }
 }
