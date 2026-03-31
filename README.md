@@ -4,7 +4,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
-[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-1.2.0-green.svg)]()
 
 ---
 
@@ -56,8 +56,11 @@ Drop the v101_claude_helpers.txt again if needed to reinforce the concepts. AI t
 | **Tower** | Self-encapsulated processing unit | Produces an *opinion*, not just an output |
 | **Port** | Encoder wrapper with lifecycle | Standardized interface for any encoder |
 | **WideRouter** | Compile-optimized router for wide models | Near-linear scaling with tower count |
+| **ExecutionStrategy** | Batching strategy selector | VMAP, WIDE_COMPILER, AUTO, SEQUENTIAL |
 | **CompileRouter** | Universal model compiler | Introspects any nn.Module for optimization |
 | **VMapTowerGroup** | Vectorized tower executor | True batching via torch.func.vmap |
+| **WidePrimitiveTowerGroup** | Wide primitive executor | Fused einsum/grouped-conv via wide_compiler registry |
+| **SubEnsembleGroup** | Multi-vantage gradient pooling | Learnable interpolation across execution paths |
 | **NotifierRouter** | Communication backbone | Routes messages based on geometry |
 | **Collective** | Multi-tower ensemble | Triangulates truth from diverse perspectives |
 | **Component** | Attachable unit with identity and lifecycle | Building block for routers and towers |
@@ -116,7 +119,12 @@ BaseRouter (ABC - nn.Module)
 ├── WideRouter (BaseRouter + wide execution)
 │       - Tower registration and discovery
 │       - wide_forward() for vectorized execution
-│       - VMapTowerGroup for true batching
+│       - ExecutionStrategy: VMAP, WIDE_COMPILER, AUTO, SEQUENTIAL
+│       - VMapTowerGroup for vmap-based batching
+│       - WidePrimitiveTowerGroup for wide_compiler primitive fusion
+│       - SubEnsembleGroup for multi-vantage gradient interpolation
+│       - CacheDeviceController for device-aware cache lifecycle
+│       - GradientDebugger for multi-level gradient monitoring
 │       - torch.compile integration
 │
 ├── CompileRouter (BaseRouter + introspection)
@@ -146,6 +154,20 @@ VMapTowerGroup (nn.Module)
         - Vectorized tower execution
         - Uses torch.func.vmap + stack_module_state
         - Lazy parameter stacking with cache invalidation
+
+WidePrimitiveTowerGroup (nn.Module)
+        - Operation-level fusion via wide_compiler primitives
+        - Stage classification: fully_fused / partially_fused / opaque
+        - Einsum-based linear, grouped-conv, manual LayerNorm kernels
+        - Three-tier fallback: Wide kernel → vmap → sequential
+        - Towers own parameters (no copying, no sync)
+        - Training: re-stacks per-forward; eval: cached stacked params
+
+SubEnsembleGroup (nn.Module)
+        - Multiple execution paths over same tower group
+        - Learnable interpolation weights (softmax-normalized)
+        - Gradients flow to ALL execution paths
+        - Gradient diversity from different computational vantage points
 ```
 
 ### Port Hierarchy
@@ -172,7 +194,7 @@ BasePort (ABC - pure protocol, no torch)
 
 ### WideRouter: Compile-Optimized Wide Models
 
-**WideRouter** is designed for collectives with many towers processing the same input. It leverages `torch.compile` for kernel fusion and **true vectorized batching via `torch.func.vmap`**, achieving near-linear scaling:
+**WideRouter** is designed for collectives with many towers processing the same input. It supports multiple execution strategies for batched tower execution, with automatic fallback chains and optional multi-vantage gradient interpolation:
 
 | Towers | Time | Per-Tower |
 |--------|------|-----------|
@@ -182,12 +204,13 @@ BasePort (ABC - pure protocol, no torch)
 | 32 | 7.27ms | 227µs |
 
 ```python
-from geofractal.router.wide_router import WideRouter
+from geofractal.router.wide_router import WideRouter, ExecutionStrategy
 
 
 class MyCollective(WideRouter):
     def __init__(self, name: str, num_towers: int, dim: int):
-        super().__init__(name, auto_discover=True)
+        super().__init__(name, auto_discover=True,
+                         execution_strategy=ExecutionStrategy.AUTO)
 
         for i in range(num_towers):
             self.attach(f'tower_{i}', ExpertTower(f'tower_{i}', dim))
@@ -196,11 +219,7 @@ class MyCollective(WideRouter):
         self.attach('fusion', AdaptiveFusion('fusion', num_towers, dim))
 
     def forward(self, x: Tensor) -> Tensor:
-        opinions = self.wide_forward(x)  # Vectorized tower execution via vmap
-        
-        # If towers cache intermediates for retrieval, clear after use:
-        # self.clear_tower_caches()
-            
+        opinions = self.wide_forward(x)  # Batched tower execution
         return self['fusion'](*opinions.values())
 
 
@@ -210,13 +229,26 @@ compiled = collective.prepare_and_compile()  # Analyze + compile
 output = compiled(x)  # 1.4x faster than eager
 ```
 
+**Execution Strategies:**
+
+| Strategy | Behavior | Best For |
+|----------|----------|----------|
+| `VMAP` | `torch.func.vmap` vectorization (default) | General use, compiled training |
+| `WIDE_COMPILER` | Wide primitive kernels (einsum, grouped conv) | Compiled inference |
+| `AUTO` | Training: VMAP, Eval: WIDE_COMPILER → VMAP → sequential | Adaptive |
+| `SEQUENTIAL` | Direct per-tower execution | Debugging, compatibility |
+
 **Key features:**
 - **Auto-discovery**: Finds all `BaseTower` instances automatically
 - **Structure analysis**: Identifies aligned operations for fusion
-- **VMap batching**: True vectorized execution via `torch.func.vmap` (not just a for loop)
-- **Compile-safe**: Separates Python bookkeeping from tensor hot path
+- **Dual execution engines**: VMap batching + Wide primitive kernels with automatic fallback
+- **Operation-level fusion**: Linear, LayerNorm, Conv layers fused via `wide_compiler` registry
+- **Fusion coverage tracking**: Reports what % of ops actually fused per tower group
+- **Sub-ensemble pooling**: `build_sub_ensembles()` creates multi-vantage gradient interpolation
+- **Compile-safe**: All preparation is `@torch.compiler.disable`; forward uses only compile-safe ops
 - **Near-linear scaling**: Per-tower cost *decreases* with more towers
-- **Cache management**: `reset()` and `clear_tower_caches()` available if towers use cache
+- **Gradient debugging**: Multi-level monitoring (per-tower norms, anomaly detection)
+- **Cache device controller**: Policies for cache lifecycle across device moves (`clear`, `migrate`, `reconstruct`)
 
 ### CompileRouter: Universal Model Compilation
 
@@ -615,6 +647,8 @@ compiled = torch.compile(collective)  # May fail
 8. **Divergence Over Accuracy** - See differently, triangulate truth
 9. **Compile First for Wide Models** - Use `prepare_and_compile()` or `CompileRouter`
 10. **VMap Over For-Loops** - Use `VMapTowerGroup` for true vectorized batching
+11. **ExecutionStrategy for Control** - `AUTO` adapts between training (VMAP) and inference (WIDE_COMPILER)
+12. **Wide Primitives for Inference** - `WidePrimitiveTowerGroup` fuses Linear/LayerNorm/Conv via einsum
 
 ---
 
@@ -628,6 +662,44 @@ compiled = torch.compile(collective)  # May fail
 ---
 
 ## Changelog
+
+### v1.2.0 (2026-03-31)
+
+**Wide Compiler Integration** - Operation-Level Fusion via `pytorch-parallel-compiler`
+
+- **`ExecutionStrategy` enum**: `VMAP`, `WIDE_COMPILER`, `SEQUENTIAL`, `AUTO` — controls how aligned towers are batched
+- **`WidePrimitiveTowerGroup`**: Walks tower stages and fuses compatible layers (Linear, LayerNorm, Conv) using `wide_compiler` registry primitives (einsum, grouped conv). Three-tier fallback: Wide kernel → vmap → sequential. Towers own parameters; group stacks views at prepare time via `torch.stack`. Gradients flow back through the stack to originals.
+- **`SubEnsembleGroup`**: Runs both VMap and Wide execution paths on the same tower group, with learnable interpolation weights (softmax-normalized). Gradients flow to ALL paths for multi-vantage gradient diversity.
+- **`CacheDeviceController`**: Manages cache lifecycle across device moves with three policies: `clear` (default, current behavior), `migrate` (move caches to new device), `reconstruct` (clear and mark for lazy rebuild). Validates cache device consistency.
+- **`GradientDebugger`**: Multi-level gradient monitoring. Level 0: off. Level 1: per-tower gradient norms after backward. Level 2+: stage norms, anomaly detection (NaN, Inf, dead, exploding gradients).
+- **`FusionCoverage` tracking**: Reports what percentage of ops fused per tower group (e.g., "4/6 ops fused (67%), 2 vmap, 0 sequential")
+- **`StagePlan` / `OpPlan`**: Stage classification system — fully_fused, partially_fused, opaque. Opaque stages (custom forward with residuals) use `vmap(functional_call)` instead of decomposition.
+
+**New WideRouter constructor parameters** (all backwards-compatible defaults):
+- `execution_strategy=ExecutionStrategy.VMAP`
+- `gradient_debug_level=0`
+- `cache_preservation_policy='clear'`
+
+**New WideRouter methods:**
+- `prepare_for_compile(execution_strategy=..., build_sub_ensembles=...)` — extended signature
+- `build_sub_ensembles()` — creates dual-path sub-ensembles
+- `wide_forward_ensemble(x)` — sub-ensemble-aware forward
+- `gradient_report()` — human-readable gradient health report
+- `check_fusion_health()` — Wide primitive gradient diagnostics
+- `get_fusion_coverage()` — per-group fusion stats
+- `validate_cache_devices()` — cache device mismatch checker
+
+**Behavioral changes:**
+- `_batched_tower_forward()` now dispatches based on `ExecutionStrategy` instead of always using VMap. Default `VMAP` preserves existing behavior.
+- `network_to()` now brackets with `CacheDeviceController` pre/post hooks. Default `clear` policy preserves existing behavior.
+- `reset()` also clears `_wide_primitive_groups` and sub-ensemble gradient tracking.
+- `get_wide_stats()` returns additional fields: `execution_strategy`, `wide_primitive_groups`, `sub_ensembles`, `fusion_coverage`.
+- `__repr__` includes strategy name and wide group count.
+- `compile()` and `prepare_and_compile()` accept `build_sub_ensembles` parameter.
+
+**Staleness note:** `torch.stack` creates new tensors, not views. During training, `WidePrimitiveTowerGroup` re-stacks every forward to pick up optimizer updates (causes graph break under `torch.compile`). For compiled training, prefer `ExecutionStrategy.VMAP`. For compiled inference, use `WIDE_COMPILER`. `AUTO` handles this automatically.
+
+**Deprecations:** None. All changes are additive with backwards-compatible defaults.
 
 ### v1.1.0 (2025-12-29)
 

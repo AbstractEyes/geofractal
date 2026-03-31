@@ -219,8 +219,19 @@ model.network_to(device='cuda', dtype=torch.float16)
 # Before device changes
 model.reset()  # Safe even if no cache
 
+# Cache preservation policy (v1.2.0)
+collective = MyCollective('c', cache_preservation_policy='migrate')  # Move caches on device change
+# Options: 'clear' (default), 'migrate', 'reconstruct'
+
 # Compile
 compiled = collective.prepare_and_compile()
+
+# Compile with execution strategy
+collective = MyCollective('c', execution_strategy=ExecutionStrategy.AUTO)
+compiled = collective.prepare_and_compile()
+
+# Compile with sub-ensembles for gradient diversity
+compiled = collective.compile(build_sub_ensembles=True)
 ```
 
 ---
@@ -233,7 +244,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from geofractal.router.base_tower import BaseTower
-from geofractal.router.wide_router import WideRouter
+from geofractal.router.wide_router import WideRouter, ExecutionStrategy
 from geofractal.router.components.torch_component import TorchComponent
 from geofractal.router.components.fusion_component import AdaptiveFusion
 ```
@@ -248,6 +259,7 @@ from geofractal.router.components.fusion_component import AdaptiveFusion
 - [ ] Collectives inherit `WideRouter` (4+ towers) or `BaseRouter`
 - [ ] Call `discover_towers()` after attaching towers
 - [ ] Use `prepare_and_compile()` not raw `torch.compile()`
+- [ ] Consider `ExecutionStrategy.AUTO` for adaptive training/inference batching
 - [ ] Use `network_to()` not `.to()` for production
 - [ ] Local variables for data used only in `forward()`
 - [ ] Cache only if external code needs tensors after `forward()`
@@ -313,6 +325,10 @@ return output  # Collective must clear!
 # ❌ Raw compile on WideRouter
 torch.compile(collective)  # Use prepare_and_compile()
 
+# ❌ WIDE_COMPILER strategy for compiled training (causes graph break per-forward)
+WideRouter('r', execution_strategy=ExecutionStrategy.WIDE_COMPILER)
+# Use AUTO or VMAP for training
+
 # ❌ .to() in production
 model.to('cuda')  # Use network_to()
 ```
@@ -334,9 +350,22 @@ model.reset()
 # List tower names
 print(collective.tower_names)
 
-# Get stats
+# Get stats (includes execution_strategy, fusion_coverage)
 print(collective.get_wide_stats())
 
 # Parameter count
 print(sum(p.numel() for p in model.parameters()))
+
+# Fusion coverage (v1.2.0)
+for key, cov in collective.get_fusion_coverage().items():
+    print(f"  {cov.summary}")  # e.g. "4/6 ops fused (67%)"
+
+# Gradient health (requires gradient_debug_level > 0)
+print(collective.gradient_report())
+
+# Cache device validation
+issues = collective.validate_cache_devices()
+if issues:
+    for issue in issues:
+        print(f"  MISMATCH: {issue}")
 ```

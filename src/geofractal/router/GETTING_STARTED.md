@@ -648,10 +648,15 @@ output = compiled(x)
 | `discover_towers()` | Find and register all BaseTower components |
 | `analyze_structure()` | Analyze tower structure for alignment |
 | `wide_forward(x)` | Execute all towers, return Dict[name, output] |
+| `wide_forward_ensemble(x)` | Execute via sub-ensemble pooling (if built) |
 | `compile(**kwargs)` | Compile with torch.compile |
 | `prepare_and_compile(**kwargs)` | Analyze + compile (recommended) |
-| `get_wide_stats()` | Get execution statistics |
-| `reset()` | Clear cache + pool, call reset() on towers |
+| `build_sub_ensembles()` | Create dual-path sub-ensembles for gradient diversity |
+| `get_wide_stats()` | Get execution statistics (includes fusion coverage) |
+| `gradient_report()` | Human-readable gradient health report |
+| `get_fusion_coverage()` | Per-group fusion stats (% of ops fused) |
+| `validate_cache_devices()` | Check caches for device mismatches |
+| `reset()` | Clear cache + pool + wide groups, call reset() on towers |
 | `clear_tower_caches()` | Clear cache on all registered towers |
 
 ### WideRouter Best Practices
@@ -660,20 +665,31 @@ output = compiled(x)
 2. **Use `prepare_and_compile()`** instead of raw `torch.compile()`
 3. **Pre-analyze before compile** - structure analysis uses Python constructs that dynamo can't trace
 4. **Set `torch.set_float32_matmul_precision('high')`** for better performance
+5. **Use `ExecutionStrategy.AUTO`** for adaptive behavior (VMAP for training, Wide for inference)
+6. **Check fusion coverage** after preparation to verify Wide integration is beneficial
 
 ```python
 # Recommended pattern
+from geofractal.router.wide_router import WideRouter, ExecutionStrategy
+
 torch.set_float32_matmul_precision('high')
 
-collective = WideCollective('wide', num_towers=16, dim=256)
+collective = WideCollective('wide', num_towers=16, dim=256,
+                            execution_strategy=ExecutionStrategy.AUTO)
 collective.network_to(device='cuda')
 
-# prepare_and_compile = analyze_structure() + compile()
+# prepare_and_compile = analyze_structure() + build execution groups + compile()
 compiled = collective.prepare_and_compile()
 
-# For fine control:
-# collective.analyze_structure()  # Separate analysis
-# compiled = collective.compile(mode='reduce-overhead')
+# Check fusion coverage
+for key, cov in collective.get_fusion_coverage().items():
+    print(f"  {cov.summary}")
+# e.g. "4/6 ops fused (67%), 2 vmap, 0 sequential"
+
+# For gradient debugging during development:
+collective = WideCollective('wide', num_towers=16, dim=256,
+                            gradient_debug_level=1)
+# After backward: print(collective.gradient_report())
 ```
 
 ### When to Use WideRouter vs BaseRouter
@@ -964,6 +980,41 @@ print(model.cache_debug())  # Should be empty between batches
 ```
 
 **The key insight:** Towers don't need to see the whole picture. They produce local opinions, and the collective triangulates truth from divergent viewpoints. WideRouter makes this efficient at scale, and the cache system ensures memory doesn't accumulate.
+
+---
+
+## Appendix: Architecture Changes (v1.2.0)
+
+### Wide Compiler Integration
+
+**File modified:** `wide_router.py`
+
+**New classes added to wide_router.py:**
+- `ExecutionStrategy` — enum controlling batched execution: VMAP, WIDE_COMPILER, AUTO, SEQUENTIAL
+- `WidePrimitiveTowerGroup` — operation-level fusion using `wide_compiler` registry primitives
+- `SubEnsembleGroup` — multi-vantage gradient interpolation across execution paths
+- `CacheDeviceController` — device-aware cache lifecycle management
+- `GradientDebugger` — multi-level gradient monitoring with anomaly detection
+- `StagePlan` / `OpPlan` / `FusionCoverage` — stage classification and fusion tracking
+
+**New WideRouter constructor parameters:**
+```python
+WideRouter(
+    name,
+    execution_strategy=ExecutionStrategy.VMAP,  # NEW — execution strategy
+    gradient_debug_level=0,                      # NEW — 0=off, 1=tower norms, 2+=stages
+    cache_preservation_policy='clear',           # NEW — 'clear', 'migrate', 'reconstruct'
+)
+```
+
+**Behavioral changes:**
+- `_batched_tower_forward()` dispatches based on `ExecutionStrategy` (default VMAP preserves prior behavior)
+- `network_to()` brackets with `CacheDeviceController` hooks (default `clear` preserves prior behavior)
+- `reset()` also clears `_wide_primitive_groups` and sub-ensemble state
+- `get_wide_stats()` returns additional fields: `execution_strategy`, `wide_primitive_groups`, `fusion_coverage`
+- `__repr__` includes strategy and wide group count
+
+**No deprecations.** All changes are additive with backwards-compatible defaults.
 
 ---
 
