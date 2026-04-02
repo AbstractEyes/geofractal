@@ -991,15 +991,15 @@ class WidePrimitiveTowerGroup(nn.Module):
         """
         Walk tower stages and classify each for execution strategy.
 
-        Only stages where ALL towers have identical structure at that position
-        are considered for fusion. Structural matching uses module type names
-        and parameter shapes.
+        When towers use append() → self.stages, decomposes stages directly.
+        When towers use attach() → self.components (stages empty), uses
+        CompileRouter to introspect the component tree and classify
+        components as stages.
         """
         coverage = FusionCoverage()
         plans: List[StagePlan] = []
 
         if not hasattr(self.towers[0], 'stages'):
-            # Tower has no stages — treat entire tower as one opaque stage
             plan = StagePlan(
                 stage_index=0,
                 classification='opaque',
@@ -1017,12 +1017,15 @@ class WidePrimitiveTowerGroup(nn.Module):
 
         num_stages = len(self.towers[0].stages)
 
+        # When stages is empty but components exist, use components as stages
+        if num_stages == 0 and hasattr(self.towers[0], 'components') and self.towers[0].components:
+            return self._classify_components_as_stages(coverage)
+
         # Verify all towers have same number of stages
         if not all(
             hasattr(t, 'stages') and len(t.stages) == num_stages
             for t in self.towers
         ):
-            # Mismatched stage counts — fall back to one opaque group
             plan = StagePlan(
                 stage_index=0,
                 classification='opaque',
@@ -1038,11 +1041,9 @@ class WidePrimitiveTowerGroup(nn.Module):
         for si in range(num_stages):
             stages = [self.towers[ti].stages[si] for ti in range(self.n)]
 
-            # Check if this stage is nn.Sequential (decomposable)
             if all(isinstance(s, nn.Sequential) for s in stages):
                 plan = self._classify_sequential_stage(si, stages, registry, coverage)
             else:
-                # Opaque stage: custom forward (may have residuals, branching)
                 plan = StagePlan(
                     stage_index=si,
                     classification='opaque',
@@ -1059,6 +1060,112 @@ class WidePrimitiveTowerGroup(nn.Module):
             plans.append(plan)
 
         return plans, coverage
+
+    @torch.compiler.disable
+    def _classify_components_as_stages(
+        self, coverage: FusionCoverage,
+    ) -> Tuple[List[StagePlan], FusionCoverage]:
+        """
+        Use CompileRouter to classify components when stages is empty.
+
+        Runs CompileRouter on tower[0] to find leaf-level batchable groups,
+        then verifies each group exists at the same path across all N towers.
+        Creates stage plans from verified groups.
+        """
+        plans: List[StagePlan] = []
+
+        # Lazy import to avoid circular dependency
+        from geofractal.router.compiler.compile_router import CompileRouter
+
+        # Use CompileRouter to analyze tower structure
+        compiler = CompileRouter.from_module(self.towers[0], 'tower_analysis')
+        compiled = compiler.compile_towers()
+
+        # Get batchable groups from CompileRouter
+        batchable = compiler.get_batchable_groups()
+
+        registry = get_wide_registry()
+
+        for gi, group in enumerate(batchable):
+            sig = group['signature']
+            paths = group['paths']
+            category = group['category']
+
+            # Strip 'root.' prefix from paths (CompileRouter adds it)
+            rel_paths = [p[len('root.'):] if p.startswith('root.') else p for p in paths]
+
+            # Verify: can we find matching modules at these relative paths
+            # in ALL N towers?
+            all_match = True
+            for rel_path in rel_paths:
+                for ti in range(self.n):
+                    try:
+                        self._resolve_component_path(self.towers[ti], rel_path)
+                    except (KeyError, AttributeError):
+                        all_match = False
+                        break
+                if not all_match:
+                    break
+
+            if not all_match:
+                continue
+
+            coverage.total_ops += 1
+
+            # Check if this is a Wide-fusable type
+            module_type = group.get('signature', '').split(':')[1] if ':' in group.get('signature', '') else ''
+            can_wide = registry is not None and registry.has(module_type)
+
+            if can_wide:
+                execution = 'wide_kernel'
+                coverage.fused_ops += 1
+            else:
+                execution = 'vmap'
+                coverage.vmap_ops += 1
+
+            # Store component paths in the op plan for _stack_params to resolve
+            plan = StagePlan(
+                stage_index=gi,
+                classification='component_fused' if can_wide else 'component_vmap',
+                ops=[OpPlan(
+                    path=rel_path,
+                    execution=execution,
+                    wide_type=module_type if can_wide else '',
+                    module_type=module_type or category,
+                ) for rel_path in rel_paths],
+            )
+            plans.append(plan)
+
+        if not plans:
+            # CompileRouter found nothing batchable — one opaque plan
+            plan = StagePlan(
+                stage_index=0,
+                classification='opaque',
+                ops=[OpPlan(path='', execution='vmap', wide_type='',
+                           module_type=type(self.towers[0]).__name__)],
+            )
+            coverage.total_ops += 1
+            coverage.vmap_ops += 1
+            plans.append(plan)
+
+        # Store analysis metadata
+        self._compile_analysis = compiled
+
+        return plans, coverage
+
+    @staticmethod
+    def _resolve_component_path(tower, rel_path: str):
+        """Resolve a dotted path within a tower's component tree."""
+        parts = rel_path.split('.')
+        current = tower
+        for part in parts:
+            if hasattr(current, 'components') and part in current.components:
+                current = current.components[part]
+            elif hasattr(current, part):
+                current = getattr(current, part)
+            else:
+                raise KeyError(f"Cannot resolve '{part}' in '{rel_path}'")
+        return current
 
     @staticmethod
     def _classify_sequential_stage(
@@ -1141,10 +1248,8 @@ class WidePrimitiveTowerGroup(nn.Module):
         """
         Stack tower parameters into N-first format for Wide kernels.
 
-        Each stacked tensor is [N, ...original_shape...] where dim 0 indexes towers.
-        Gradients flow back through torch.stack to original tower parameters.
-
-        Also stacks params/buffers for vmap-executed stages.
+        Handles both stage-based plans (append()) and component-based plans
+        (attach() + CompileRouter analysis).
         """
         self._stacked_params.clear()
         self._vmap_stage_params.clear()
@@ -1155,17 +1260,49 @@ class WidePrimitiveTowerGroup(nn.Module):
 
             if plan.classification == 'opaque':
                 # Stack entire stage for vmap(functional_call)
-                stage_modules = [self.towers[ti].stages[si] for ti in range(self.n)]
-                params, buffs = stack_module_state(stage_modules)
-                self._vmap_stage_params[si] = params
-                self._vmap_stage_buffs[si] = buffs
+                if hasattr(self.towers[0], 'stages') and si < len(self.towers[0].stages):
+                    stage_modules = [self.towers[ti].stages[si] for ti in range(self.n)]
+                    params, buffs = stack_module_state(stage_modules)
+                    self._vmap_stage_params[si] = params
+                    self._vmap_stage_buffs[si] = buffs
+                else:
+                    # Opaque on whole tower (no stages)
+                    params, buffs = stack_module_state(list(self.towers))
+                    self._vmap_stage_params[si] = params
+                    self._vmap_stage_buffs[si] = buffs
+
+            elif plan.classification in ('component_fused', 'component_vmap'):
+                # CompileRouter-derived plans: ops have component paths
+                for oi, op in enumerate(plan.ops):
+                    rel_path = op.path
+                    key_prefix = f"cstage_{si}.op_{oi}"
+
+                    # Resolve module at this path across all N towers
+                    modules = []
+                    for ti in range(self.n):
+                        m = self._resolve_component_path(self.towers[ti], rel_path)
+                        modules.append(m)
+
+                    if op.execution == 'wide_kernel':
+                        # Stack leaf parameters for Wide kernel
+                        for pname, param in modules[0].named_parameters(recurse=False):
+                            stacked = torch.stack(
+                                [dict(modules[ti].named_parameters(recurse=False))[pname]
+                                 for ti in range(self.n)],
+                                dim=0,
+                            )
+                            self._stacked_params[f"{key_prefix}.{pname}"] = stacked
+                    elif op.execution == 'vmap':
+                        # Stack for vmap(functional_call)
+                        params, buffs = stack_module_state(modules)
+                        self._vmap_stage_params[hash(key_prefix)] = params
+                        self._vmap_stage_buffs[hash(key_prefix)] = buffs
 
             elif plan.classification in ('fully_fused', 'partially_fused'):
                 for op in plan.ops:
                     ci = int(op.path) if op.path.isdigit() else 0
 
                     if op.execution == 'wide_kernel':
-                        # Stack leaf module parameters for Wide kernel
                         children = [
                             list(self.towers[ti].stages[si].children())[ci]
                             for ti in range(self.n)
@@ -1183,7 +1320,6 @@ class WidePrimitiveTowerGroup(nn.Module):
                             self._stacked_params[f"{key_prefix}.{pname}"] = stacked
 
                     elif op.execution == 'vmap':
-                        # Stack this specific child for vmap
                         children = [
                             list(self.towers[ti].stages[si].children())[ci]
                             for ti in range(self.n)
