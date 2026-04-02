@@ -1863,7 +1863,10 @@ class GradientDebugger:
         if self._level >= 1:
             # Hook on each tower's output
             for name in router.tower_names:
-                tower = router.get(name)
+                try:
+                    tower = router._resolve_tower(name)
+                except (KeyError, AttributeError):
+                    continue
                 if tower is not None:
                     handle = tower.register_full_backward_hook(
                         self._make_tower_hook(name)
@@ -2131,7 +2134,7 @@ class WideRouter(BaseRouter):
     @property
     def towers(self) -> Dict[str, BaseTower]:
         """Dict of registered towers."""
-        return {name: self[name] for name in self.tower_names}
+        return {name: self._resolve_tower(name) for name in self.tower_names}
 
     def register_tower(self, name: str) -> None:
         """
@@ -2223,7 +2226,7 @@ class WideRouter(BaseRouter):
 
         # Analyze each tower
         for name in self.tower_names:
-            tower = self[name]
+            tower = self._resolve_tower(name)
             self.analyzer.analyze(name, tower)
 
         # Find alignments
@@ -2272,7 +2275,7 @@ class WideRouter(BaseRouter):
                 continue
 
             try:
-                towers = [self[name] for name in names]
+                towers = [self._resolve_tower(name) for name in names]
                 group = VMapTowerGroup(towers, names)
 
                 # Pre-prepare the group (stacks state and moves to device)
@@ -2386,7 +2389,7 @@ class WideRouter(BaseRouter):
             cache_key = (sig, frozenset(names))
 
             try:
-                towers = [self[name] for name in names]
+                towers = [self._resolve_tower(name) for name in names]
                 group = WidePrimitiveTowerGroup(towers, names)
                 group.prepare_for_forward(device)
 
@@ -2438,7 +2441,7 @@ class WideRouter(BaseRouter):
                 continue
 
             cache_key = (sig, frozenset(names))
-            towers = [self[name] for name in names]
+            towers = [self._resolve_tower(name) for name in names]
             se = SubEnsembleGroup(name=f"se_{sig[:20]}", dim=dim)
 
             # Always add vmap group
@@ -2497,7 +2500,7 @@ class WideRouter(BaseRouter):
         uncovered = [n for n in names if n not in outputs]
         if uncovered:
             for name in uncovered:
-                tower = self[name]
+                tower = self._resolve_tower(name)
                 out = tower(x, mask=mask) if mask is not None else tower(x)
                 if isinstance(out, tuple):
                     out = out[0]
@@ -2604,7 +2607,7 @@ class WideRouter(BaseRouter):
         if sig is not None:
             return sig
         # Fallback: compute and cache (shouldn't happen if properly registered)
-        tower = self[name]
+        tower = self._resolve_tower(name)
         sig = self._compute_tower_signature(tower)
         self.objects['_tower_signatures'][name] = sig
         return sig
@@ -2888,7 +2891,10 @@ class WideRouter(BaseRouter):
         Note: ConfigurableCollective and ConvTowerCollective do this automatically.
         """
         for name in self.tower_names:
-            tower = self.get(name)
+            try:
+                tower = self._resolve_tower(name)
+            except (KeyError, AttributeError):
+                continue
             if tower is not None and hasattr(tower, 'cache_clear'):
                 tower.cache_clear()
 
