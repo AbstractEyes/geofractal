@@ -2163,13 +2163,42 @@ class WideRouter(BaseRouter):
 
     @torch.compiler.disable
     def _auto_discover_towers(self) -> None:
-        """Auto-discover towers from attached components."""
+        """Auto-discover towers from attached components, recursively."""
         for name, component in self.components.items():
             if isinstance(component, BaseTower):
                 if name not in self.objects['_tower_names']:
                     self.objects['_tower_names'].append(name)
-                    # Cache signature at discovery time
                     self.objects['_tower_signatures'][name] = self._compute_tower_signature(component)
+                self._discover_nested(name, component)
+
+    @torch.compiler.disable
+    def _discover_nested(self, parent_path: str, parent) -> None:
+        """Recursively register nested BaseTowers with dotted paths."""
+        children = (parent.components.items() if hasattr(parent, 'components')
+                    else parent.named_children())
+        for child_name, child in children:
+            if isinstance(child, BaseTower):
+                full_path = f"{parent_path}.{child_name}"
+                if full_path not in self.objects['_tower_names']:
+                    self.objects['_tower_names'].append(full_path)
+                    self.objects['_tower_signatures'][full_path] = (
+                        self._compute_tower_signature(child))
+                self._discover_nested(full_path, child)
+
+    def _resolve_tower(self, name: str) -> nn.Module:
+        """Resolve a tower by name, supporting dotted paths for nested access."""
+        if '.' not in name:
+            return self.components[name]
+        parts = name.split('.')
+        current = self.components[parts[0]]
+        for part in parts[1:]:
+            if hasattr(current, 'components') and part in current.components:
+                current = current.components[part]
+            elif hasattr(current, part):
+                current = getattr(current, part)
+            else:
+                raise KeyError(f"Cannot resolve '{part}' in path '{name}'")
+        return current
 
     # =========================================================================
     # STRUCTURE ANALYSIS (isolated from compile path)
@@ -2546,9 +2575,9 @@ class WideRouter(BaseRouter):
         # Process each structure group
         for sig, group_names in structure_groups.items():
             if len(group_names) == 1:
-                # Single tower - direct execution
+                # Single tower - direct execution (supports nested dotted paths)
                 name = group_names[0]
-                tower = self[name]
+                tower = self._resolve_tower(name)
                 if mask is not None:
                     out = tower(x, mask=mask)
                 else:
@@ -2582,15 +2611,19 @@ class WideRouter(BaseRouter):
 
     @torch.compiler.disable
     def _compute_tower_signature(self, tower: nn.Module) -> str:
-        """Compute structural signature for a tower (cached at registration)."""
-        # Use class name + total params as signature
+        """Compute structural signature capturing internal structure.
+
+        Includes class name, param count, stage count, component count,
+        and sorted child type list so structurally identical nested
+        towers (e.g. GeometricTransformerLayers) match each other.
+        """
         param_count = sum(p.numel() for p in tower.parameters())
-
-        # Also include stage count if it's a BaseTower
-        if isinstance(tower, BaseTower):
-            return f"{type(tower).__name__}_{len(tower.stages)}_{param_count}"
-
-        return f"{type(tower).__name__}_{param_count}"
+        class_name = type(tower).__name__
+        n_stages = len(tower.stages) if hasattr(tower, 'stages') else 0
+        n_comps = len(tower.components) if hasattr(tower, 'components') else 0
+        child_types = sorted(type(c).__name__ for _, c in tower.named_children())
+        child_sig = '_'.join(child_types[:8])
+        return f"{class_name}_{n_stages}_{n_comps}_{param_count}_{child_sig}"
 
     @staticmethod
     def _resolve_strategy_int(strategy: ExecutionStrategy, training: bool) -> int:
@@ -2688,7 +2721,7 @@ class WideRouter(BaseRouter):
         """Sequential fallback when vmap is not possible."""
         outputs = {}
         for name in tower_names:
-            tower = self[name]
+            tower = self._resolve_tower(name)
             if mask is not None:
                 out = tower(x, mask=mask)
             else:
