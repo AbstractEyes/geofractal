@@ -69,12 +69,15 @@ Drop the v101_claude_helpers.txt again if needed to reinforce the concepts. AI t
 | **WidePrimitiveTowerGroup** | Wide primitive executor | Fused einsum/grouped-conv via wide_compiler registry |
 | **SubEnsembleGroup** | Multi-vantage gradient pooling | Learnable interpolation across execution paths |
 | **NotifierRouter** | Communication backbone | Routes messages based on geometry |
-| **Collective** | Multi-tower ensemble | Triangulates truth from diverse perspectives |
+| **BaseCollective** | Multi-router ensemble manager | Health monitoring, device placement, gradient equalization |
 | **Component** | Attachable unit with identity and lifecycle | Building block for routers and towers |
+| **TorchComponent** | nn.Module + BaseComponent | Device affinity, freeze/unfreeze, home device |
+| **BaseUtility** | Stateless callable with config | No parameters — blend, schedule, aggregation logic |
 | **Address** | Geometric identity on a manifold | Fingerprints enable similarity/distance routing |
 | **Fusion** | Opinion aggregation | Where emergence happens |
 | **Walker** | Geometric interpolation system | Blend tensors along learned/static paths |
 | **Cache** | Ephemeral tensor storage | Optional - only for towers exposing intermediates |
+| **Prefab** | Ready-made builder systems | GeometricTower, FusionBuilder, CollectiveBuilder, Agatha |
 
 More routers, towers, components, and collective patterns are planned for immediate and future releases.
 
@@ -336,10 +339,22 @@ compiled = torch.compile(wide, mode='reduce-overhead')
 ### Installation
 
 ```bash
-git clone https://github.com/AbstractPhil/geofractal.git
+# install straight from GitHub
+pip install "geofractal @ git+https://github.com/AbstractEyes/geofractal.git"
+
+# or an editable clone
+git clone https://github.com/AbstractEyes/geofractal.git
 cd geofractal
 pip install -e .
 ```
+
+Both pull the two required git dependencies: `geometricvocab` (provides the `geovocab2` package, from
+[lattice_vocabulary](https://github.com/AbstractEyes/lattice_vocabulary)) and `wide_compiler` (from
+[pytorch-parallel-compiler](https://github.com/AbstractEyes/pytorch-parallel-compiler)). `geovocab2` is a hard import for
+`router/components/address_component.py` and many `model/` modules.
+
+Package `__init__.py` files do not re-export anything: import by full module path, e.g.
+`from geofractal.router.prefab.geometric_tower_builder import quick_tower`.
 
 ### Build a Wide Collective
 
@@ -568,6 +583,11 @@ model.network_to('cpu')  # Cache stays on GPU!
 | `BaseTower` | Ordered stage processing | Individual expert units |
 | `NotifierRouter` | Geometric message routing | Tower coordination |
 | `WideRouter` | Compile-optimized execution | Many towers (4+) |
+| `BaseCollective` | Multi-router ensemble | Cross-router health, device placement |
+| `CompileRouter` | Introspective compiler | Optimizing arbitrary `nn.Module` |
+| `WormholeRouter` | Cantor-bias attention routing | Sparse geometric token routing |
+| `SparseConstitutiveRouter` / `FullConstitutiveRouter` | Anchor-bank routing | Behavioral fingerprint dispatch |
+| `GlobalFractalRouter` | Registry-based global routing | Affinity-driven cross-module cooperation |
 
 ### When to Use WideRouter
 
@@ -659,16 +679,373 @@ compiled = torch.compile(collective)  # May fail
 
 ---
 
+## Base Types Reference
+
+All five base types you build with:
+
+| Type | File | Description |
+|------|------|-------------|
+| `BaseRouter` | `router/base_router.py` | Abstract `nn.Module` root — attach/detach, cache, `network_to()` |
+| `BaseTower` | `router/base_tower.py` | `BaseRouter` + ordered `stages` list — produces an opinion |
+| `WideRouter` | `router/wide_router.py` | `BaseRouter` + vectorized tower execution (vmap, wide primitives) |
+| `BaseCollective` | `router/base_collective.py` | `BaseRouter` + multi-router ensemble management |
+| `BaseComponent` | `router/base_component.py` | Pure-Python ABC — lifecycle, no torch dependency |
+| `TorchComponent` | `router/components/torch_component.py` | `nn.Module` + `BaseComponent` — device affinity, freeze/unfreeze |
+| `BasePort` | `router/base_port.py` | Encoder wrapper — preprocess → encode → postprocess pipeline |
+| `BaseUtility` | `router/base_utility.py` | Stateless callable with config — no parameters, no device |
+
+### BaseTower Subtypes
+
+All live in `router/base_tower.py` and are ready to use as-is or subclass:
+
+| Subtype | Behavior |
+|---------|----------|
+| `SequentialTower` | Passes output of each stage directly to the next |
+| `ResidualTower` | Adds input residual around each stage |
+| `PreNormTower` | Applies `LayerNorm` before each stage |
+| `GatedTower` | Learnable gate on each stage output |
+| `DualPathTower` | Two parallel stage paths merged at output |
+| `AttentionTower` | Multi-head self-attention stages |
+| `ConditionalTower` | Condition signal gates stage execution |
+| `CachingTower` | Exposes intermediate features via `cache_set()` for retrieval by a collective |
+
+### BaseCollective
+
+`BaseCollective` (`router/base_collective.py`) manages an ensemble of `WideRouter` instances:
+
+```python
+from geofractal.router.base_collective import BaseCollective, DevicePlacement
+
+class MyCollective(BaseCollective):
+    def forward(self, x):
+        return self.collective_forward(x)
+
+collective = MyCollective('coll', router_names=['vision', 'text'])
+collective.attach_router('vision', vision_wide_router)
+collective.attach_router('text', text_wide_router)
+
+# Device placement per router
+collective.set_placement('vision', DevicePlacement.local('cuda:0'))
+collective.set_placement('text', DevicePlacement.local('cuda:1'))
+collective.apply_placements()
+
+# Health monitoring
+health = collective.check_health()  # Dict[str, RouterHealth]
+if collective.is_collapsed():
+    collective.resurrect_dead_towers(reinit_scale=0.02)
+
+# Gradient equalization across routers
+collective.enable_gradient_equalization(True)
+```
+
+| Method | Purpose |
+|--------|---------|
+| `attach_router(name, router)` | Register a `WideRouter` in the collective |
+| `prepare_routers(device)` | Call `prepare_for_compile()` on all routers |
+| `compile_routers(mode)` | `torch.compile` all routers |
+| `check_health()` | Returns `RouterHealth` per router (collapse detection) |
+| `resurrect_dead_towers(scale)` | Re-initializes collapsed towers |
+| `equalize_gradients()` | Cross-router gradient norm equalization |
+| `collective_forward(x)` | Parallel forward across all routers |
+
+---
+
+## Component Reference
+
+Components are the building blocks you attach to routers and towers. All live under `router/components/`.
+
+### Fusion Components (`fusion_component.py`)
+
+| Class | Description |
+|-------|-------------|
+| `ConcatFusion` | Concatenates opinions along feature dim, projects back |
+| `SumFusion` | Weighted sum with learnable per-input weights |
+| `GatedFusion` | Sigmoid gate per opinion before summing |
+| `AttentionFusion` | Cross-attention over the opinion stack |
+| `AdaptiveFusion` | Softmax-weighted sum — general default |
+
+```python
+from geofractal.router.components.fusion_component import (
+    AdaptiveFusion, GatedFusion, AttentionFusion
+)
+fusion = AdaptiveFusion('fusion', num_inputs=8, dim=256)
+```
+
+### Walker Components (`walker_component.py`)
+
+| Class | Description |
+|-------|-------------|
+| `ConfigurableWalker` | Static blend + schedule + aggregation (not `nn.Module`) |
+| `WalkerInception` | ~20k learnable modulation on top of a walker |
+| `WalkerFusion` | `TorchComponent` wrapping walker + optional inception |
+
+Preset walkers: `shiva`, `slerp`, `lerp`, `slip`, `zeus`, `gilgamesh`
+
+### Address Components
+
+| Class | File | Description |
+|-------|------|-------------|
+| `AddressComponent` | `address_component.py` | Geometric fingerprint + mailbox (send/receive/collect) |
+| `CantorAddressComponent` | `cantor_address_component.py` | Cantor-set hierarchical identity with `BeatrixStaircase` |
+
+### Attention Components
+
+| Class | File | Description |
+|-------|------|-------------|
+| `WormholeAttentionComponent` | `wormhole_attention_component.py` | Cantor-bias routing, local-window mask, wormhole gating |
+| `CantorEuclideanAttention` | `cantor_euclidean_attention_component.py` | Branch-path alignment with WormholeGate |
+| `StandardAttention` | `transformer_component.py` | Standard MHSA wrapped as `TorchComponent` |
+| `FeedForward` | `transformer_component.py` | FFN with `GEGLU`, `SwiGLU`, `Mish` support |
+
+### Positional / Embedding Components
+
+| Class | File | Description |
+|-------|------|-------------|
+| `RoPE` | `rope_component.py` | Rotary position embedding |
+| `ScaledRoPE` | `rope_component.py` | RoPE with position interpolation scaling |
+| `YaRNRoPE` | `rope_component.py` | YaRN-style scaled RoPE |
+| `CantorPositionEncoder` | `cantor_pure_component.py` | 1D/2D Cantor-function positional features |
+| `FourierContentEncoder` | `cantor_pure_component.py` | Fourier basis content encoder |
+| `PureGeometricPatchEmbed` | `cantor_pure_component.py` | Patchify + Cantor/Fourier embed |
+| `BaseEmbedding` | `embedding_component.py` | Modulate/augment embedding base |
+| `DualEmbedding` | `embedding_component.py` | Primary + secondary embedding streams |
+| `TriEmbedding` | `embedding_component.py` | Three-stream embedding |
+
+### Lens Components (`lens_component.py`)
+
+Non-linear feature transformations. Attach as a tower stage or standalone component.
+
+| Class | Description |
+|-------|-------------|
+| `MobiusLens` | Möbius-inspired twist-center-twist transform |
+| `TriWaveLens` | Triple learnable wave modulation |
+| `CantorZipperLens` | Bidirectional Cantor wave zipper |
+
+### Projection Components (`projection_component.py`)
+
+| Class | Description |
+|-------|-------------|
+| `LinearProjection` | Single `nn.Linear` reshape |
+| `SlotProjection` | Slot attention-style collapse to N slots |
+| `MultiHeadProjection` | Split → project per head → merge |
+| `BottleneckProjection` | Down → nonlinear → up |
+
+### Data / Utility Components
+
+| Class | File | Description |
+|-------|------|-------------|
+| `DataComponent` | `data_component.py` | Bind data sources, generate noise, cast/reshape tensors |
+| `BaseAux` (+ 12 generators) | `aux_component.py` | Auxiliary signal producers (cosine sim, dot, magnitude, entropy…) |
+| `ChainComponent` | `components/utility/chain_component.py` | Ordered pipeline of mixed modules + utilities |
+| `StagedCacheBuilder` | `encoder_data_component.py` | Multi-encoder disk cache pipeline |
+| `CachedEmbeddingDataset` | `encoder_data_component.py` | Dataset over pre-cached encoder outputs |
+
+---
+
+## Utility Components
+
+Stateless callables (extend `BaseUtility`) in `router/components/utility/`:
+
+### Blend Utilities (`blend_utility.py`)
+
+All implement `__call__(a, b, alpha, delta=None, context=None)`:
+
+| Class | Behavior |
+|-------|---------|
+| `LerpBlend` | Linear interpolation |
+| `SlerpBlend` | Spherical linear interpolation |
+| `SlipBlend` | Slip-weighted slerp variant |
+| `ZeusBlend` | Power-law sharpened blend |
+| `HeliosBlend` | Helios smooth blend |
+
+### Aggregation Utilities (`aggregation_utility.py`)
+
+Reduce a stepped sequence of tensors:
+
+| Class | Behavior |
+|-------|---------|
+| `MeanAggregation` | Simple mean over steps |
+| `SumAggregation` | Sum over steps |
+| `MaxAggregation` | Max over steps |
+| `MinAggregation` | Min over steps |
+| `FirstStepAggregation` | Take first step only |
+| `LastStepAggregation` | Take last step only |
+| `WeightedMeanAggregation` | Alpha-weighted mean |
+
+### Schedule Utilities (`schedule_utility.py`)
+
+Generate interpolation schedules as tensors:
+
+| Class | Shape |
+|-------|-------|
+| `LinearSchedule` | `t → t` |
+| `CosineSchedule` | `cos` annealing |
+| `SigmoidSchedule` | Sigmoid with sharpness/center |
+| `TauSchedule` | Temperature-scaled |
+| `WaveSchedule` | Sinusoidal oscillation |
+| `ExponentialSchedule` | Exponential decay |
+| `PowerSchedule` | Power-law curve |
+
+---
+
+## Prefab Builders
+
+Ready-made builders in `router/prefab/` for common patterns:
+
+### GeometricTowerBuilder (`geometric_tower_builder.py`)
+
+Constructs towers with configurable geometry, RoPE, and address type from a `TowerConfig` dataclass.
+
+```python
+from geofractal.router.prefab.geometric_tower_builder import get_tower_config, ConfigurableTower, quick_tower
+
+config = get_tower_config('cantor', name='my_tower')  # RoPEType, AddressType set from the geometry
+tower = ConfigurableTower(config, default_dim=256)
+tower = quick_tower('cantor', dim=256, depth=2)      # same thing in one call
+```
+
+Geometries (`GEOMETRY_CONFIGS`): `cantor`, `beatrix`, `helix`, `simplex`, `fractal`, `standard`, `golden`, `fibonacci`, `sinusoidal`, `spherical`.
+
+`RoPEType`: `STANDARD`, `DUAL`, `TRI`, `QUAD`, `CANTOR`, `BEATRIX`, `HELIX`, `SIMPLEX`, `FRACTAL`, `SINUSOIDAL`, `GOLDEN`, `FIBONACCI`
+`AddressType`: `STANDARD`, `SIMPLEX`, `SPHERICAL`, `FRACTAL`, `CANTOR`, `BEATRIX`, `HELIX`, `SINUSOIDAL`, `GOLDEN`, `FIBONACCI`
+
+`prefab/geometric_towers.py` (`GeometricTower(name, dim=..., geometry=GeometryType...)`, `AgathaTowerCollective`) is the older
+Agatha tower collective, kept for reference.
+
+### GeometricConvTowerBuilder (`geometric_conv_tower_builder.py`)
+
+Builds convolutional towers for spatial / VAE-latent inputs via `ConvTowerConfig`:
+
+```python
+from geofractal.router.prefab.geometric_conv_tower_builder import ConvTowerConfig
+# ConvTowerType: STANDARD, DILATED, FREQUENCY, COARSE_FINE
+# FusionType: SUM, CONCAT, GATED
+```
+
+Stage components: `DilatedConvComponent`, `FrequencyComponent`, `InterpolatedNormComponent`, `CoarseFineComponent`
+
+Presets: `preset_flux_vae_towers()` (16-ch), `preset_sd_vae_towers()` (4-ch)
+
+### FusionBuilder (`fusion_builder.py`)
+
+Mirrors the `ConfigurableTower` pattern for composable fusion:
+
+```python
+from geofractal.router.prefab.fusion_builder import FusionConfig, FusionTopology, FusionStrategy
+# FusionTopology: FLAT, TREE, CHAIN, STAR
+# FusionStrategy: ADAPTIVE, GATED, WALKER, ATTENTION
+```
+
+Controllers: `AlphaController` (blend coefficients), `BetaController` (gating strengths)
+
+### CollectiveBuilder (`collective_builder.py`)
+
+`HealthyCollective` — a `BaseCollective` with built-in health monitoring, gradient equalization, and adaptive LR per tower. `CollectiveTrainer` wraps a training loop over it.
+
+```python
+from geofractal.router.prefab.collective_builder import HealthyCollective, CollectiveConfig, CollectiveTrainer
+config = CollectiveConfig(num_towers=8, dim=256, monitor_health=True)
+collective = HealthyCollective('hc', config)
+```
+
+---
+
+## Agatha Prefab (`router/prefab/agatha/`)
+
+The Agatha subsystem is a complete multi-modal generation/classification framework built on GeoFractal. See [`BEATRIX_CORE.md`](src/geofractal/router/prefab/agatha/BEATRIX_CORE.md) for full documentation.
+
+| Module | Key Types | Description |
+|--------|-----------|-------------|
+| `beatrix.py` | `BeatrixConfig`, `FluxVAEEncoder`, `DINOEncoder`, `QwenDualShotEncoder` | Multi-modal encoder wrappers |
+| `beatrix_collective.py` | `BeatrixCollective`, `BeatrixCollectiveConfig`, `ThetaProbeTower` | WideRouter collective over geometric + conv towers |
+| `beatrix_oscillator.py` | `BeatrixOscillator`, `OscillatorState`, `ManifoldOps` | Manifold-aware oscillator for opinion dynamics |
+| `beatrix_tension_oscillator.py` | `BeatrixOscillator`, `IntrinsicTension`, `TowerForceGenerator`, `BeatrixCore` | Tension-driven variant of oscillator |
+| `head_router.py` | `AgathaHeadRouter`, `EncoderStream`, `EncoderMail`, `HeadMail` | Multi-stream encoder routing head |
+| `beatrix_trainer.py` | `BeatrixTrainer`, `TrainerConfig`, `BeatrixDataset` | Full training loop for Beatrix models |
+
+`BeatrixOscillator` `ScheduleType` presets: `CONSTANT`, `LINEAR`, `COSINE`, `SIGMOID`, `TESLA_369`
+
+---
+
+## Advanced Router Types (`model/blocks/router/`)
+
+Lower-level routing modules that can be used standalone or embedded in towers/routers:
+
+### WormholeRouter (`wormhole_router.py`)
+
+Cantor-bias attention router with local-window masking. Routes tokens through learned "wormhole" routes based on content + geometric position scores.
+
+```python
+from geofractal.model.blocks.router.wormhole_router import WormholeRouter, WormholeRouterConfig
+config = WormholeRouterConfig(dim=256, num_positions=64, num_routes=8, temperature=0.1)
+router = WormholeRouter(config)
+out, routes, scores = router(x)  # [B, L, D], [B, L, k], [B, L, k]
+```
+
+### Constitutive routers (`constitutive_router.py`)
+
+Sparse and full variants. Routes inputs through a learned anchor bank using Cantor-index behavioral fingerprints.
+
+| Class | Description |
+|-------|-------------|
+| `SparseConstitutiveRouter` | Top-k sparse routing via `CantorBehavior` + `ConstitutiveAnchorBank` |
+| `FullConstitutiveRouter` | Dense modulated projection routing |
+| `CantorBehavior` | Builds Cantor-index behavioral routing biases |
+| `ConstitutiveAnchorBank` | Learnable anchor embeddings for destination selection |
+
+```python
+from geofractal.model.blocks.router.constitutive_router import create_router, ConstitutiveRouterConfig
+config = ConstitutiveRouterConfig(dim=256, num_anchors=16, num_routes=4, mode="sparse")  # or mode="full"
+router = create_router(config)
+```
+
+### GlobalFractalRouter (`global_fractal_router.py`)
+
+Singleton `FingerprintRegistry` assigns orthogonal fingerprints to all registered modules and computes affinity/cooperation matrices for global routing decisions.
+
+| Class | Description |
+|-------|-------------|
+| `FingerprintRegistry` | Singleton — registers modules, builds orthogonal basis, batched affinity |
+| `GlobalFractalRouterConfig` | Cooperation mode, capacity, fractal depth |
+| `CooperationMode` | `COMPETITIVE`, `COOPERATIVE`, `NEUTRAL` |
+| `ProvenanceTensor` | Tensor carrying lineage + depth metadata |
+
+```python
+from geofractal.model.blocks.router.global_fractal_router import get_registry
+registry = get_registry()
+registry.register(module_id='tower_0', module=my_tower, parent_id=None)
+affinity = registry.compute_affinity_batched('tower_0', ['tower_1', 'tower_2'])
+```
+
+---
+
 ## Documentation
 
 | Document | Description |
 |----------|-------------|
 | [QUICK_BUILD.md](src/geofractal/router/QUICK_BUILD.md) | Cheat sheet for rapid development |
 | [GETTING_STARTED.md](src/geofractal/router/GETTING_STARTED.md) | Complete tutorial with cache system |
+| [BEATRIX_CORE.md](src/geofractal/router/prefab/agatha/BEATRIX_CORE.md) | Agatha/Beatrix multi-modal system |
 
 ---
 
 ## Changelog
+
+### v1.2.1 (2026-10-15)
+
+**Install and loading fixes**
+
+- `requirements.txt` named the geometric vocabulary dependency `geofractal`; it is `geometricvocab` (same git URL as `pyproject.toml`).
+- `pyproject.toml` no longer lists a `geovocab2*` package pattern (there is no `src/geovocab2`; it comes from `geometricvocab`).
+- Install instructions point at `github.com/AbstractEyes/geofractal` and name the two git dependencies.
+- README class names and examples corrected against the source (tower builder, RoPE/address enums, constitutive routers, Agatha modules, `BaseAux`).
+- `model/core/bert_cantor.py` imports again on current transformers (`BertEncoder` / `BertPooler` come from `transformers.models.bert.modeling_bert`); the Cantor settings are stored on the config so `save_pretrained` / `from_pretrained` round-trip them; the positional gate `pos_gain` is initialized correctly when warm-starting from a stock BERT checkpoint.
+
+```python
+from geofractal.model.core.bert_cantor import BertCantorModel
+# stock BERT weights for the encoder, pooler and token/type embeddings; the Cantor position path starts fresh
+model = BertCantorModel.from_pretrained("bert-base-uncased", cantor_levels=12)
+```
 
 ### v1.2.0 (2026-03-31)
 
@@ -831,10 +1208,6 @@ python compile_benchmark.py --towers 8 --depth 4 --dim 512
 - **ChannelMixerBlock**: Cross-channel attention for multi-channel latents
 - **New presets**: `preset_flux_vae_towers()` (16-ch), `preset_sd_vae_towers()` (4-ch)
 - **ConvTowerConfig options**: `in_channels`, `input_mode`, `pool_mode`, `use_channel_mixer`
-
-**Documentation** - Comprehensive updates
-
-- New GETTING_STARTED.md sections: Storage Types, Cache Control, Device Movement, Dos/Don'ts
 
 ### v1.0.0-beta (2025-12-23)
 

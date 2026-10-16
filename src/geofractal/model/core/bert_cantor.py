@@ -61,11 +61,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from transformers import BertConfig, BertEncoder, BertPooler, BertPreTrainedModel
-except Exception as e:
+    from transformers import BertConfig
+    # BertEncoder / BertPooler are not exported at the transformers top level (4.4x+); import from the module.
+    from transformers.models.bert.modeling_bert import BertEncoder, BertPooler, BertPreTrainedModel
+except ImportError as e:
     raise ImportError(
-        "Transformers is required. In Colab:\n"
-        "!pip install --upgrade transformers"
+        f"bert_cantor needs transformers' BERT modules ({e}). "
+        "Install or upgrade transformers (pip install -U transformers), then re-import."
     ) from e
 
 
@@ -120,7 +122,9 @@ class CantorProjector(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(width, hidden_size),
         )
-        # Learnable gain for positional pathway
+        # Learnable gain for positional pathway; the init value is kept so _init_weights can restore it
+        # (from_pretrained materializes missing params without running this constructor's value).
+        self.pos_gain_init = float(pos_gain_init)
         self.pos_gain = nn.Parameter(torch.tensor(pos_gain_init, dtype=torch.float32))
 
     def forward(self, cantor_value: torch.Tensor) -> torch.Tensor:
@@ -226,10 +230,20 @@ class BertCantorModel(BertPreTrainedModel):
     """
     config_class = BertConfig
 
-    def __init__(self, config: BertConfig, cantor_levels: int = CONFIG["cantor_levels"],
-                 cantor_mlp_width: int = CONFIG["cantor_mlp_width"],
-                 cantor_dropout: float = CONFIG["cantor_dropout"],
-                 pos_gain_init: float = CONFIG["pos_gain_init"]):
+    def __init__(self, config: BertConfig, cantor_levels: Optional[int] = None,
+                 cantor_mlp_width: Optional[int] = None,
+                 cantor_dropout: Optional[float] = None,
+                 pos_gain_init: Optional[float] = None):
+        # Cantor settings live on the config so save_pretrained / from_pretrained round-trip them:
+        # explicit argument > value already on the config (a saved Cantor model) > CONFIG default.
+        for key, arg in (("cantor_levels", cantor_levels), ("cantor_mlp_width", cantor_mlp_width),
+                         ("cantor_dropout", cantor_dropout), ("pos_gain_init", pos_gain_init)):
+            if arg is not None:
+                setattr(config, key, arg)
+            elif not hasattr(config, key):
+                setattr(config, key, CONFIG[key])
+        cantor_levels, cantor_mlp_width = config.cantor_levels, config.cantor_mlp_width
+        cantor_dropout, pos_gain_init = config.cantor_dropout, config.pos_gain_init
         super().__init__(config)
 
         projector = CantorProjector(
@@ -243,6 +257,13 @@ class BertCantorModel(BertPreTrainedModel):
         self.pooler = BertPooler(config)
 
         self.post_init()
+
+    def _init_weights(self, module: nn.Module) -> None:
+        super()._init_weights(module)
+        # BERT's initializer knows Linear/Embedding/LayerNorm only; the Cantor gate is a bare scalar.
+        if isinstance(module, CantorProjector):
+            with torch.no_grad():
+                module.pos_gain.fill_(module.pos_gain_init)
 
     def forward(
         self,
