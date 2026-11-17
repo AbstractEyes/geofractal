@@ -158,12 +158,30 @@ class CantorAttention(nn.Module):
 
     def _get_routes_for_seq_len(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """Get or build routes for sequence length."""
+        # For speed, the device copy of each length's routes is kept (a plain attribute, not part of
+        # the state dict) instead of being copied or rebuilt in every forward; the routes are unchanged.
+        memo = self.__dict__.setdefault('_routes_device_memo', {})
+        device = torch.device(device)
         if seq_len in self.routes_cache:
-            return self.routes_cache[seq_len].to(device)
+            src = self.routes_cache[seq_len]
+            key = ('cached', seq_len, device)
+            hit = memo.get(key)
+            if hit is not None and hit[0] is src and hit[1] == src._version:
+                return hit[2]
+            routes = src.to(device)
+            memo[key] = (src, src._version, routes)
+            return routes
 
         # Build on-demand for non-cached lengths
-        routes = self._build_positional_routes(seq_len, self.k)
-        return routes.to(device)
+        key = ('built', seq_len, self.k, device)
+        hit = memo.get(key)
+        if hit is not None:
+            return hit[2]
+        routes = self._build_positional_routes(seq_len, self.k).to(device)
+        if len(memo) >= 64:
+            memo.pop(next(iter(memo)))
+        memo[key] = (None, None, routes)
+        return routes
 
     def _sparse_attention(
         self,

@@ -402,12 +402,25 @@ class CantorMultiheadFusion(nn.Module):
         device = x_anchor.device
 
         if self.config.fusion_mode == "weighted":
-            # Use pre-cached distance matrix (FIX #1)
-            distance_matrix = self._get_cached_distances(seq, device)
-
-            weights = torch.zeros(seq, k, device=device, dtype=x_anchor.dtype)
-            for i in range(seq):
-                weights[i] = distance_matrix[i, routes[i]]
+            # Speed: the per-position loop is replaced by one gather, and for
+            # lengths without a cached distance matrix the gathered distances
+            # are kept per length instead of rebuilding the matrix in every
+            # forward. The result is unchanged.
+            if hasattr(self, f"_distances_{seq}"):
+                distance_matrix = getattr(self, f"_distances_{seq}")
+                weights = distance_matrix.gather(1, routes.to(distance_matrix.device))
+                weights = weights.to(device=device, dtype=x_anchor.dtype)
+            else:
+                cache = self.__dict__.setdefault('_route_distance_cache', {})
+                key = (seq, k, str(device), x_anchor.dtype, self.config.use_beatrix_routing)
+                weights = cache.get(key)
+                if weights is None:
+                    if len(cache) >= 16:
+                        cache.clear()
+                    distance_matrix = self._get_cached_distances(seq, device)
+                    weights = distance_matrix.gather(1, routes.to(distance_matrix.device))
+                    weights = weights.to(device=device, dtype=x_anchor.dtype)
+                    cache[key] = weights
 
             weights = 1.0 / (weights + self.config.eps)
             weights = weights.unsqueeze(0).unsqueeze(0).expand(batch, heads, -1, -1)
@@ -521,21 +534,21 @@ class CantorMultiheadFusion(nn.Module):
 
         # Get routes (instant!)
         k = self.config.get_window_size(seq_len)
-        routes = self._get_cached_routes(seq_len, k, x.device)
+        # Speed: the route table is looked up (or built) once per length and
+        # kept, and the neighbours are gathered with one index_select instead
+        # of a gather through a full-size index. The result is unchanged.
+        route_cache = self.__dict__.setdefault('_route_table_cache', {})
+        route_key = (seq_len, k, str(x.device), self.config.use_beatrix_routing)
+        routes = route_cache.get(route_key)
+        if routes is None:
+            if len(route_cache) >= 16:
+                route_cache.clear()
+            routes = self._get_cached_routes(seq_len, k, x.device)
+            route_cache[route_key] = routes
 
-        # FIX #2: Use torch.gather (1.5x faster than advanced indexing!)
         if self.config.use_optimized_gather:
-            # Expand routes for gather: (batch, heads, seq, k)
-            routes_expanded = routes.unsqueeze(0).unsqueeze(0).expand(batch_size, self.num_heads, -1, -1)
-
-            # Reshape for gather: (batch, heads, seq, k, head_dim)
-            routes_gather = routes_expanded.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
-
-            # Expand x for gathering: (batch, heads, seq, 1, head_dim) -> (batch, heads, seq, k, head_dim)
-            x_for_gather = x.unsqueeze(3).expand(-1, -1, -1, k, -1)
-
-            # Gather: much faster than advanced indexing!
-            x_gathered = torch.gather(x_for_gather, 2, routes_gather)
+            x_gathered = x.index_select(2, routes.reshape(-1))
+            x_gathered = x_gathered.view(batch_size, self.num_heads, seq_len, k, self.head_dim)
         else:
             # Old method (slow)
             batch_idx = torch.arange(batch_size, device=x.device).view(-1, 1, 1, 1)

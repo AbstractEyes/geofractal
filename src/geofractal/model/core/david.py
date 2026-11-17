@@ -310,6 +310,15 @@ class PatternSupervisedLoss(nn.Module):
 
         pattern_probs = F.softmax(similarities / self.temperature, dim=1)
 
+        # Rows are written by one batched index instead of a per-sample loop; the result is unchanged.
+        # Inputs outside the batched path's domain (bins out of range, mismatched shapes) take the
+        # per-sample loop, so they raise or behave exactly as before.
+        if (timestep_class.shape == (B,) and pattern_probs.shape == (B, self.num_patterns)
+                and bool(((timestep_class >= 0) & (timestep_class < self.num_bins)).all())):
+            soft_targets = torch.zeros(B, self.num_bins, self.num_patterns, device=device)
+            soft_targets[torch.arange(B, device=device), timestep_class] = pattern_probs.to(soft_targets.dtype)
+            return soft_targets.view(B, self.num_classes)
+
         soft_targets = torch.zeros(B, self.num_classes, device=device)
         for i in range(B):
             t = timestep_class[i]
@@ -327,15 +336,24 @@ class PatternSupervisedLoss(nn.Module):
         """Encourage diverse pattern usage."""
         B = logits.shape[0]
 
-        pattern_probs_list = []
-        for i in range(B):
-            t = timestep_class[i]
-            start_idx = t * self.num_patterns
-            end_idx = start_idx + self.num_patterns
-            probs = F.softmax(logits[i, start_idx:end_idx], dim=0)
-            pattern_probs_list.append(probs)
+        # Each sample's bin is gathered in one batched index instead of a per-sample loop; the result is unchanged.
+        # An empty batch, bins whose columns fall outside the logits, or mismatched shapes take the
+        # per-sample loop, so they raise or behave exactly as before.
+        if (B > 0 and logits.dim() == 2 and timestep_class.shape == (B,) and bool(
+                ((timestep_class >= 0) & (timestep_class * self.num_patterns + self.num_patterns <= logits.shape[1])).all())):
+            cols = (timestep_class * self.num_patterns).unsqueeze(1) + torch.arange(
+                self.num_patterns, device=logits.device)
+            pattern_probs = F.softmax(torch.gather(logits, 1, cols), dim=1)
+        else:
+            pattern_probs_list = []
+            for i in range(B):
+                t = timestep_class[i]
+                start_idx = t * self.num_patterns
+                end_idx = start_idx + self.num_patterns
+                probs = F.softmax(logits[i, start_idx:end_idx], dim=0)
+                pattern_probs_list.append(probs)
 
-        pattern_probs = torch.stack(pattern_probs_list)
+            pattern_probs = torch.stack(pattern_probs_list)
         entropy = -(pattern_probs * torch.log(pattern_probs + 1e-8)).sum(dim=1).mean()
 
         return -entropy
@@ -358,10 +376,15 @@ class PatternSupervisedLoss(nn.Module):
             crystal_centroids
         )
 
-        target_centroids = torch.stack([
-            crystal_centroids[timestep_class[j], pattern_ids[j]]
-            for j in range(len(timestep_class))
-        ])
+        # One batched index instead of a per-sample stack; the result is unchanged
+        # (an empty batch keeps the stack, which raises as before).
+        if len(timestep_class) > 0 and pattern_ids.shape == timestep_class.shape:
+            target_centroids = crystal_centroids[timestep_class, pattern_ids]
+        else:
+            target_centroids = torch.stack([
+                crystal_centroids[timestep_class[j], pattern_ids[j]]
+                for j in range(len(timestep_class))
+            ])
 
         feature_sim_loss = 1.0 - F.cosine_similarity(
             student_features,

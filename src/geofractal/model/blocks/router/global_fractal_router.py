@@ -746,13 +746,20 @@ class GlobalFractalRouter(nn.Module):
 
         q = F.normalize(self.query_proj(x), dim=-1)
         k = F.normalize(self.key_proj(x), dim=-1)
-        scores = torch.bmm(q, k.transpose(1, 2))
 
         fp = external_fingerprint if external_fingerprint is not None else self.fingerprint
         fp_bias = self.fingerprint_to_bias(fp)
 
-        q_mod = q + 0.1 * fp_bias.unsqueeze(0).unsqueeze(0)
-        scores = scores + 0.2 * torch.bmm(q_mod, k.transpose(1, 2))
+        if fp_bias.dim() == 1:
+            # Speed: q.k + 0.2 (q + 0.1 b).k is computed as 1.2 q.k + 0.02 b.k,
+            # one dense product plus a matrix-vector product instead of two
+            # dense products. The result is unchanged.
+            scores = 1.2 * torch.bmm(q, k.transpose(1, 2))
+            scores = scores + 0.02 * torch.matmul(k, fp_bias).unsqueeze(1)
+        else:
+            scores = torch.bmm(q, k.transpose(1, 2))
+            q_mod = q + 0.1 * fp_bias.unsqueeze(0).unsqueeze(0)
+            scores = scores + 0.2 * torch.bmm(q_mod, k.transpose(1, 2))
 
         if self.cantor_weight > 0:
             self._ensure_cantor_bias(P, x.device)

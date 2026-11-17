@@ -178,16 +178,11 @@ class BranchAlignment(TorchComponent):
         # Ensure weights are on same device as input
         level_weights = self.level_weights.to(branch_probs.device)
 
-        # P(same branch) = Σ_b P_i(b) · P_j(b) at each level
-        # Expand: (B, S, 1, L, 3) × (B, 1, S, L, 3) → (B, S, S, L, 3)
-        p_i = branch_probs.unsqueeze(2)
-        p_j = branch_probs.unsqueeze(1)
-
-        # Dot product over branches gives P(same branch at level k)
-        same_branch_prob = (p_i * p_j).sum(dim=-1)  # (B, S, S, L)
-
-        # Weighted sum over levels
-        alignment = (same_branch_prob * level_weights).sum(dim=-1)  # (B, S, S)
+        # Speed: Σ_k w_k Σ_b P_i(b,k) P_j(b,k) is computed as one batched
+        # product Q Q^T with Q = P · sqrt(w), instead of materializing the
+        # (B, S, S, L, 3) product. The result is unchanged.
+        q = (branch_probs * level_weights.sqrt().view(1, 1, L, 1)).reshape(B, S, -1)
+        alignment = torch.bmm(q, q.transpose(1, 2))  # (B, S, S)
 
         return alignment
 

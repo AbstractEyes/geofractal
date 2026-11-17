@@ -292,31 +292,31 @@ class CantorChromaAttention(nn.Module):
         K = self.k_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         V = self.v_proj(x).view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Build routes
-        routes = self._build_cantor_routes(T).to(x.device)
+        # Speed: the route table is built once per length and kept, and all
+        # positions are gathered and attended in one batched product instead of
+        # a Python loop over positions. The result is unchanged.
+        cache = self.__dict__.setdefault('_route_cache', {})
+        key = (T, self.local_window, self.cantor_depth, str(x.device))
+        routes = cache.get(key)
+        if routes is None:
+            if len(cache) >= 16:
+                cache.clear()
+            routes = self._build_cantor_routes(T).reshape(-1).to(x.device)
+            cache[key] = routes
+        W = routes.numel() // T
 
-        # Sparse attention
-        attended = []
-        for i in range(T):
-            neighbors = routes[i]
+        k_neighbors = K.index_select(2, routes).view(B, self.num_heads, T, W, self.head_dim)
+        v_neighbors = V.index_select(2, routes).view(B, self.num_heads, T, W, self.head_dim)
 
-            q_i = Q[:, :, i:i + 1, :]  # [B, H, 1, D]
-            k_neighbors = K[:, :, neighbors, :]  # [B, H, W, D]
-            v_neighbors = V[:, :, neighbors, :]  # [B, H, W, D]
+        # Attention scores
+        scores = torch.einsum('bhqd,bhqkd->bhqk', Q, k_neighbors) / math.sqrt(self.head_dim)
+        scores = scores / self.temperature.abs()
 
-            # Attention scores
-            scores = torch.matmul(q_i, k_neighbors.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            scores = scores / self.temperature.abs()
+        attn = F.softmax(scores, dim=-1)
+        attn = self.dropout(attn)
 
-            attn = F.softmax(scores, dim=-1)
-            attn = self.dropout(attn)
-
-            # Apply attention
-            out_i = torch.matmul(attn, v_neighbors)  # [B, H, 1, D]
-            attended.append(out_i)
-
-        # Concatenate and reshape
-        output = torch.cat(attended, dim=2)  # [B, H, T, D]
+        # Apply attention
+        output = torch.einsum('bhqk,bhqkd->bhqd', attn, v_neighbors)  # [B, H, T, D]
         output = output.transpose(1, 2).reshape(B, T, D)
 
         # Output projection

@@ -628,25 +628,20 @@ class CantorAttention(nn.Module):
         head_idx = head_idx.expand(batch_size, num_heads, seq_len, k_neighbors)
         routes_bc = routes_expanded.unsqueeze(1).expand(batch_size, num_heads, seq_len, k_neighbors)
 
+        # Alpha bleed-over (only if needed)
+        if alpha > 0.0:
+            # For speed, each position is blended with its clamped left and right neighbours once,
+            # before the route gather, instead of gathering six tensors; the forward result is unchanged.
+            pos = torch.arange(seq_len, device=device)
+            adj_left = torch.clamp(pos - 1, 0, seq_len - 1)
+            adj_right = torch.clamp(pos + 1, 0, seq_len - 1)
+
+            k = (k * (1 - alpha)).add_(k[:, :, adj_left].add_(k[:, :, adj_right]).mul_(alpha * 0.5))
+            v = (v * (1 - alpha)).add_(v[:, :, adj_left].add_(v[:, :, adj_right]).mul_(alpha * 0.5))
+
         # Gather k and v
         k_gathered = k[batch_idx, head_idx, routes_bc, :]
         v_gathered = v[batch_idx, head_idx, routes_bc, :]
-
-        # Alpha bleed-over (only if needed)
-        if alpha > 0.0:
-            adj_left = torch.clamp(routes_expanded - 1, 0, seq_len - 1)
-            adj_right = torch.clamp(routes_expanded + 1, 0, seq_len - 1)
-
-            adj_left_bc = adj_left.unsqueeze(1).expand(batch_size, num_heads, seq_len, k_neighbors)
-            adj_right_bc = adj_right.unsqueeze(1).expand(batch_size, num_heads, seq_len, k_neighbors)
-
-            k_left = k[batch_idx, head_idx, adj_left_bc, :]
-            k_right = k[batch_idx, head_idx, adj_right_bc, :]
-            v_left = v[batch_idx, head_idx, adj_left_bc, :]
-            v_right = v[batch_idx, head_idx, adj_right_bc, :]
-
-            k_gathered = k_gathered.mul_(1 - alpha).add_(k_left.add_(k_right).mul_(alpha * 0.5))
-            v_gathered = v_gathered.mul_(1 - alpha).add_(v_left.add_(v_right).mul_(alpha * 0.5))
 
         # Attention computation
         scores = torch.einsum('bhqd,bhqkd->bhqk', q, k_gathered).mul_(self.scale)

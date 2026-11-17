@@ -197,27 +197,17 @@ class CantorConv2d(nn.Module):
         mask = torch.zeros(out_ch, in_ch, kh, kw)
         total_elements = out_ch * in_ch * kh * kw
 
-        for o in range(out_ch):
-            for i in range(in_ch):
-                for h in range(kh):
-                    for w in range(kw):
-                        # Flatten 4D index to 1D
-                        flat_idx = (((o * in_ch + i) * kh + h) * kw + w)
-                        # Normalize to [0, 1]
-                        index_val = flat_idx / (total_elements + 1e-9)
-
-                        # Check Cantor validity
-                        valid = True
-                        x = index_val
-                        for _ in range(depth):
-                            x *= 3.0
-                            digit = int(x)
-                            x -= digit
-                            if digit == 1:  # middle third removed
-                                valid = False
-                                break
-                        if valid:
-                            mask[o, i, h, w] = 1.0
+        # Speed: the per-weight Python loop is replaced by the same float64
+        # operations applied to all flattened indices at once. The mask is
+        # unchanged, bit for bit.
+        x = torch.arange(total_elements, dtype=torch.float64) / (total_elements + 1e-9)
+        valid = torch.ones(total_elements, dtype=torch.bool)
+        for _ in range(depth):
+            x = x * 3.0
+            digit = torch.floor(x)
+            x = x - digit
+            valid &= digit != 1.0
+        mask.view(-1).masked_fill_(valid, 1.0)
         return mask
 
     # --------------------------------------------------------

@@ -413,19 +413,14 @@ class CantorAttention(nn.Module):
         # Get routes for exact sequence length and k
         routes = self._get_routes_for_seq_len(seq_len, k_neighbors, device)  # (seq_len, k)
 
-        # Create broadcast indices for gathering
-        batch_idx = torch.arange(batch_size, device=device).view(-1, 1, 1, 1)
-        head_idx = torch.arange(num_heads, device=device).view(1, -1, 1, 1)
-        routes_bc = routes.view(1, 1, seq_len, k_neighbors)
-
-        # Expand to full dimensions
-        batch_idx = batch_idx.expand(batch_size, num_heads, seq_len, k_neighbors)
-        head_idx = head_idx.expand(batch_size, num_heads, seq_len, k_neighbors)
-        routes_bc = routes_bc.expand(batch_size, num_heads, seq_len, k_neighbors)
-
-        # Gather K and V according to routes
-        k_gathered = k[batch_idx, head_idx, routes_bc, :]  # (batch, heads, seq_len, k, head_dim)
-        v_gathered = v[batch_idx, head_idx, routes_bc, :]  # (batch, heads, seq_len, k, head_dim)
+        # Speed: K and V are gathered with one index_select each through the
+        # flattened route table, instead of advanced indexing with expanded
+        # (batch, heads, seq_len, k) index tensors. The result is unchanged.
+        routes_flat = routes.reshape(-1)
+        k_gathered = k.index_select(2, routes_flat).view(
+            batch_size, num_heads, seq_len, k_neighbors, head_dim)  # (batch, heads, seq_len, k, head_dim)
+        v_gathered = v.index_select(2, routes_flat).view(
+            batch_size, num_heads, seq_len, k_neighbors, head_dim)  # (batch, heads, seq_len, k, head_dim)
 
         # Compute attention scores (only for k neighbors per query)
         # q: (batch, heads, seq_len, head_dim)

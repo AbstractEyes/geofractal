@@ -355,6 +355,15 @@ class SemanticPatternLossCalculator(nn.Module):
         )
 
         # Create full soft targets
+        # (rows written by one batched index instead of a per-sample loop; the result is unchanged;
+        # bins out of range or mismatched shapes take the per-sample loop, so they raise or behave
+        # exactly as before)
+        if (semantic_bin.shape == (B,) and pattern_probs.shape == (B, self.num_patterns)
+                and bool(((semantic_bin >= 0) & (semantic_bin < self.num_bins)).all())):
+            soft_targets = torch.zeros(B, self.num_bins, self.num_patterns, device=device)
+            soft_targets[torch.arange(B, device=device), semantic_bin] = pattern_probs.to(soft_targets.dtype)
+            return soft_targets.view(B, self.num_classes)
+
         soft_targets = torch.zeros(B, self.num_classes, device=device)
         for i in range(B):
             bin_idx = semantic_bin[i]
@@ -372,15 +381,24 @@ class SemanticPatternLossCalculator(nn.Module):
         """Encourage diverse pattern usage."""
         B = logits.shape[0]
 
-        pattern_probs_list = []
-        for i in range(B):
-            bin_idx = semantic_bin[i]
-            start_idx = bin_idx * self.num_patterns
-            end_idx = start_idx + self.num_patterns
-            probs = F.softmax(logits[i, start_idx:end_idx], dim=0)
-            pattern_probs_list.append(probs)
+        # One batched gather instead of a per-sample loop; the result is unchanged.
+        # An empty batch, bins whose columns fall outside the logits, or mismatched shapes take the
+        # per-sample loop, so they raise or behave exactly as before.
+        if (B > 0 and logits.dim() == 2 and semantic_bin.shape == (B,) and bool(
+                ((semantic_bin >= 0) & (semantic_bin * self.num_patterns + self.num_patterns <= logits.shape[1])).all())):
+            cols = (semantic_bin * self.num_patterns).unsqueeze(1) + torch.arange(
+                self.num_patterns, device=logits.device)
+            pattern_probs = F.softmax(torch.gather(logits, 1, cols), dim=1)
+        else:
+            pattern_probs_list = []
+            for i in range(B):
+                bin_idx = semantic_bin[i]
+                start_idx = bin_idx * self.num_patterns
+                end_idx = start_idx + self.num_patterns
+                probs = F.softmax(logits[i, start_idx:end_idx], dim=0)
+                pattern_probs_list.append(probs)
 
-        pattern_probs = torch.stack(pattern_probs_list)
+            pattern_probs = torch.stack(pattern_probs_list)
 
         # Entropy (higher = more diverse)
         entropy = -(pattern_probs * torch.log(pattern_probs + 1e-8)).sum(dim=1).mean()
@@ -437,10 +455,15 @@ class SemanticPatternLossCalculator(nn.Module):
             )
 
             # Get target centroids
-            target_centroids = torch.stack([
-                scale_centroids[semantic_bin[j], pattern_ids[j]]
-                for j in range(batch_size)
-            ])
+            # (one batched index instead of a per-sample stack; the result is unchanged;
+            # an empty batch keeps the stack, which raises as before)
+            if batch_size > 0 and pattern_ids.shape == semantic_bin.shape:
+                target_centroids = scale_centroids[semantic_bin, pattern_ids]
+            else:
+                target_centroids = torch.stack([
+                    scale_centroids[semantic_bin[j], pattern_ids[j]]
+                    for j in range(batch_size)
+                ])
 
             # 1. Feature Similarity Loss
             feature_sim_loss = (1.0 - F.cosine_similarity(
