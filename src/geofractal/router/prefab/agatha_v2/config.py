@@ -12,6 +12,14 @@ Two ready-made configurations:
                           model width 384, 6 heads, a T5-base text sequence.
     smoke_config()        a CPU-sized copy for tests (latent 4 x 8 x 8, width 64).
 
+`arch` selects the model built from a configuration:
+    "agatha"  AgathaFlow: trunk, force towers, banded oscillator (the default).
+    "plain"   PlainFlow, the control: the same patch embedding, time embedding,
+              text projection and trunk blocks, no towers and no oscillator; the
+              velocity is a zero-initialized linear head on LayerNorm(h). The tower,
+              band and oscillator fields are ignored. plain_counterpart() builds the
+              plain configuration of an Agatha configuration at a given trunk depth.
+
 Copyright 2026 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
@@ -23,10 +31,14 @@ from typing import Any, Dict, Optional, Tuple
 
 GEOMETRY_TOWER_KINDS = ("cantor", "beatrix", "simplex", "helix", "plain")
 CONV_TOWER_KINDS = ("wide_resnet", "frequency")
+ARCHITECTURES = ("agatha", "plain")
 
 
 @dataclass
 class AgathaConfig:
+    # ---- which model is built ("agatha" or the "plain" control)
+    arch: str = "agatha"
+
     # ---- latent and tokens
     latent_channels: int = 32
     latent_height: int = 32
@@ -137,6 +149,10 @@ class AgathaConfig:
 
     # ------------------------------------------------------------------ checks
     def validate(self) -> None:
+        if self.arch not in ARCHITECTURES:
+            raise ValueError(f"unknown arch {self.arch!r}; known: {ARCHITECTURES}")
+        if self.trunk_depth < 0:
+            raise ValueError("trunk_depth must be >= 0")
         if self.latent_height % self.patch_size or self.latent_width % self.patch_size:
             raise ValueError("latent height and width must be divisible by patch_size")
         if self.dim % self.num_heads:
@@ -149,7 +165,7 @@ class AgathaConfig:
         for k in self.conv_towers:
             if k not in CONV_TOWER_KINDS:
                 raise ValueError(f"unknown conv tower kind {k!r}; known: {CONV_TOWER_KINDS}")
-        if self.num_towers < 1:
+        if self.arch == "agatha" and self.num_towers < 1:
             raise ValueError("at least one tower is required")
         lo, hi = self.band_edges
         if not (0.0 < lo < hi < 1.0):
@@ -188,6 +204,14 @@ class AgathaConfig:
         if unknown:
             raise ValueError(f"unknown config keys: {sorted(unknown)}")
         return cls(**d)
+
+
+def plain_counterpart(config: AgathaConfig, trunk_depth: int) -> AgathaConfig:
+    """The plain control of `config`: every shared field kept, arch "plain", the given
+    trunk depth, and no towers listed (the plain model has none)."""
+    d = config.to_dict()
+    d.update(arch="plain", trunk_depth=int(trunk_depth), geometry_towers=[], conv_towers=[])
+    return AgathaConfig.from_dict(d)
 
 
 def smoke_config(**overrides: Any) -> AgathaConfig:

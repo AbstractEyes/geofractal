@@ -186,3 +186,50 @@ optimizer state and step. Encoders are recorded by name and revision only.
 | geometry | Riemannian vocabulary for a flat space | flat space, written as the arithmetic it is |
 | optimizer | AdamW | Adam, weight decay 0 |
 | checkpoint | denoiser only | whole model + config |
+
+## 11. Training at scale
+
+**The cache** (`data.build_memmap_cache`, `data.MemmapLatentTextDataset`). Images and
+their captions are encoded once. Each field is one flat file: all latents as one
+float16 array `[N, C, H, W]`; every caption's token states one after another as one
+float16 array `[T, D]`, at their true length (no padding), with an offsets table that
+says where each caption starts; a caption-to-image table; the image and caption lists
+as JSON lines; and `meta.json` with the counts, shapes, the per-channel mean and
+standard deviation of the latents, the empty caption's states and their length, and
+the names and revisions of the encoders. The encoders are passed in as functions, so
+the builder runs anywhere. Reading is random access with no decoding: each data-loader
+worker opens its own memory maps. Latents are normalized per channel with the training
+set's statistics (an evaluation set uses the training statistics too), and decoding
+undoes it.
+
+**The data order** (`data.StepOrderSampler`). The batch of every step is a function of
+the seed and the step number alone: a fresh permutation of the images for each pass
+over the data, and one of each image's captions drawn per pass. A run that stops and
+resumes at step k reads exactly the batches an unbroken run reads from step k on.
+
+**EMA** (`trainer.EMA`). A float32 copy of the model follows it after every optimizer
+step, `p_ema <- 0.9999 p_ema + 0.0001 p`, from the first step. Samples and losses are
+read from both the raw and the EMA weights.
+
+**Exact resume** (`trainer.save_training_state`, `trainer.load_training_state`). A
+training state holds the model, the EMA copy, the optimizer, the step, the global
+random states and the data position. The noise, flow times and condition dropout of
+step s come from a generator seeded by (seed, s), so they do not depend on where a run
+was stopped. On the CPU, k steps + save + rebuild from the file + the remaining steps
+give the same parameters, EMA and optimizer tensors, bit for bit, as an unbroken run.
+
+**The loop** (`trainer.fit`, `hooks`). One progress line per interval (loss, time a
+step, time spent, time left). After the optimizer step and the EMA update, evaluation
+hooks run at set steps: held-out loss per noise band on fixed draws, the caption gap
+(own caption against another item's caption and against the empty caption), sample
+sheets, FID / KID, the CLIP score and a paired grounding read (`metrics`), a check
+that the samples are not a set of centred round blobs (`sphere_check`), and checkpoint
+and milestone pushes with retries. A failing hook is logged and the run goes on.
+
+**The plain control** (`AgathaConfig(arch="plain")`, `model.PlainFlow`). The same patch
+embedding, time embedding, text projection and trunk blocks as AgathaFlow, with no
+towers and no oscillator: `v_hat = unpatchify(Linear(LN(h)))`, the linear layer zero
+at initialization. It shares AgathaFlow's objective, condition handling and samplers.
+`model.match_plain_trunk_depth(config)` gives the trunk depth whose parameter count is
+closest to a given Agatha configuration (for the default configuration: 13 blocks,
+42,907,904 parameters against 42,023,588).

@@ -24,6 +24,12 @@ loss = mean (v_hat - (z_1 - z_0))^2 with z_t = (1 - t) z_0 + t z_1.
 sample() and sample_midpoint() integrate dz/dt = v_hat(z, t, text) with the same
 velocity() call, hence the same oscillator step count, as loss().
 
+PlainFlow is the control of equal parts: the same front (X, C, e, trunk) and
+    v_hat = unpatchify( D(h) ),   D = Linear(LN(h)), zero at initialization
+with no towers and no oscillator. It inherits the objective, the condition
+handling and the samplers, so both models are trained and sampled by the same
+code. build_model(config) returns the model named by config.arch.
+
 Copyright 2026 AbstractPhil
 Licensed under the Apache License, Version 2.0
 """
@@ -44,7 +50,7 @@ from geofractal.router.prefab.agatha_v2.bands import (
     band_weights,
 )
 from geofractal.router.prefab.agatha_v2.blocks import AxialRotary2D, TransformerBlock
-from geofractal.router.prefab.agatha_v2.config import AgathaConfig
+from geofractal.router.prefab.agatha_v2.config import AgathaConfig, plain_counterpart
 from geofractal.router.prefab.agatha_v2.oscillator import DampedOscillator, affine_coefficients
 from geofractal.router.prefab.agatha_v2.towers import ConvTower, GeometryTower, ZeroHead
 
@@ -73,9 +79,12 @@ class AgathaFlow(nn.Module):
     def __init__(self, config: AgathaConfig):
         super().__init__()
         self.config = config
-        cfg = config
-        d, p_dim, n_tok = cfg.dim, cfg.token_dim, cfg.num_tokens
+        self._build_front(config)
+        self._build_readout(config)
 
+    def _build_front(self, cfg: AgathaConfig) -> None:
+        """Patch embedding, time embedding, text projection, null caption, trunk."""
+        d, p_dim = cfg.dim, cfg.token_dim
         self.patch_embed = nn.Linear(p_dim, d)
         self.time_embed = TimeEmbedding(cfg.time_freq_dim, d, cfg.time_scale)
         self.text_proj = nn.Linear(cfg.text_dim, d)
@@ -85,6 +94,10 @@ class AgathaFlow(nn.Module):
         self.trunk_rotary = AxialRotary2D(cfg.head_dim, cfg.grid_height, cfg.grid_width, cfg.rope_theta)
         self.trunk = nn.ModuleList([TransformerBlock(d, cfg.num_heads, cfg.mlp_ratio)
                                     for _ in range(cfg.trunk_depth)])
+
+    def _build_readout(self, cfg: AgathaConfig) -> None:
+        """Anchor head, towers, banded parameters, oscillator, velocity head."""
+        d, p_dim, n_tok = cfg.dim, cfg.token_dim, cfg.num_tokens
         self.anchor_head = ZeroHead(d, p_dim)
 
         towers = []
@@ -338,3 +351,74 @@ class AgathaFlow(nn.Module):
 
     def num_trained_parameters(self) -> int:
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+class PlainFlow(AgathaFlow):
+    """The control: AgathaFlow's front and trunk, then v_hat = unpatchify(Linear(LN(h))).
+
+    No towers, no banded parameters, no oscillator. The head's weight and bias are zero
+    at initialization (there is no gate), so the first velocity is exactly zero, as for
+    AgathaFlow. The head runs in at least float32 under autocast, like AgathaFlow's
+    velocity head. `towers` is an empty list, so tower-wise utilities see no towers.
+    """
+
+    def _build_readout(self, cfg: AgathaConfig) -> None:
+        self.head = ZeroHead(cfg.dim, cfg.token_dim)
+        self.towers = nn.ModuleList()
+
+    def velocity(self, z_t: Tensor, t: Union[float, Tensor], text: Tensor,
+                 text_mask: Optional[Tensor] = None) -> Tensor:
+        """Predicted velocity [B, C, H, W] for the noisy latent z_t at flow time t."""
+        b = z_t.shape[0]
+        t = self._time(t, b, z_t)
+        text, text_mask = self.check_text(text, text_mask, b)
+        _, h, _, _ = self.encode(z_t, t, text, text_mask)
+        with _float_section(z_t.device):
+            v = self.head(h.to(torch.promote_types(h.dtype, torch.float32)))
+        return self.unpatchify(v)
+
+    def tower_forces(self, h, c, text_mask, e):
+        raise NotImplementedError("the plain control has no towers")
+
+    def schedule(self, t):
+        raise NotImplementedError("the plain control has no banded parameters")
+
+    def combine_forces(self, forces, w, h):
+        raise NotImplementedError("the plain control has no towers")
+
+    @torch.no_grad()
+    def diagnostics(self, z_t: Tensor, t: Union[float, Tensor], text: Tensor,
+                    text_mask: Optional[Tensor] = None) -> Dict[str, Tensor]:
+        """Norms of the trunk states and of the velocity (the plain model has no gains)."""
+        b = z_t.shape[0]
+        t = self._time(t, b, z_t)
+        text, text_mask = self.check_text(text, text_mask, b)
+        _, h, _, _ = self.encode(z_t, t, text, text_mask)
+        v = self.velocity(z_t, t, text, text_mask)
+        return {"trunk_norm": h.float().flatten(1).norm(dim=1), "velocity_norm": v.flatten(1).norm(dim=1)}
+
+
+def build_model(config: AgathaConfig) -> AgathaFlow:
+    """The model named by config.arch: AgathaFlow ("agatha") or PlainFlow ("plain")."""
+    if config.arch == "plain":
+        return PlainFlow(config)
+    return AgathaFlow(config)
+
+
+def count_trained_parameters(config: AgathaConfig) -> int:
+    """Trained parameters of the model a configuration builds (the model is built on the CPU)."""
+    return build_model(config).num_trained_parameters()
+
+
+def match_plain_trunk_depth(config: AgathaConfig, max_depth: int = 256) -> Tuple[int, int, int]:
+    """The plain control's trunk depth whose trained-parameter count is closest to `config`'s.
+
+    Returns (depth, plain_parameters, reference_parameters). Trunk blocks are identical, so the
+    plain count is affine in the depth: count(D) = count(0) + D * (count(1) - count(0)); the two
+    end points are built and the depth is the nearest whole number in [1, max_depth].
+    """
+    reference = count_trained_parameters(config)
+    base = count_trained_parameters(plain_counterpart(config, 0))
+    per_block = count_trained_parameters(plain_counterpart(config, 1)) - base
+    best = min(range(1, max_depth + 1), key=lambda depth: abs(base + depth * per_block - reference))
+    return best, base + best * per_block, reference
