@@ -237,6 +237,7 @@ class HookRunner:
 
     def run(self, ctx: HookContext, final: bool = False, force: bool = False) -> List[Dict[str, Any]]:
         """Call the hooks due at ctx.step (all of them when force is set)."""
+        final = final or bool(getattr(ctx, "final", False))
         done = []
         for hook in self.hooks:
             try:

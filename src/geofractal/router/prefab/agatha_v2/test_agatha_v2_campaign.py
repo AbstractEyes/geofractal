@@ -533,6 +533,25 @@ def test_e4_fit_progress_lines_and_hooks_never_raise():
     _record("E4: progress lines / hook errors logged / count hook steps", (len(progress), len(runner.errors), count.steps))
 
 
+def test_e4b_end_of_run_hooks_fire_off_the_interval_grid():
+    """A run that ends between intervals still gets its end-of-run hooks; a hook without at_end does not."""
+    with _tmpdir() as d:
+        build_toy_cache(os.path.join(d, "cache"), n=10)
+        ds = MemmapLatentTextDataset(os.path.join(d, "cache"))
+        tc = TrainConfig(lr=1e-3, batch_size=4, seed=0, log_every=10)
+        torch.manual_seed(0)
+        m = build_model(smoke_config())
+        with_end = _Count(every=2, at_end=True)
+        without_end = _Count(every=2, at_end=False, name="count_no_end")    # control: must not fire at step 5
+        runner = HookRunner([with_end, without_end], log=lambda s: None)
+        fit(m, build_optimizer(m, tc), _loader(ds, StepOrderSampler(ds.image_captions, 4, 0, 0, 5)), tc,
+            start_step=0, end_step=5, ema=EMA(m, 0.99), device="cpu", hooks=runner, log=lambda s: None, run_name="toy")
+        _close(ds)
+    assert with_end.steps == [(2, False), (4, False), (5, True)], with_end.steps
+    assert without_end.steps == [(2, False), (4, False)], without_end.steps
+    _record("E4b: end-of-run hook steps / control steps", (with_end.steps, without_end.steps))
+
+
 def _eval_tensors(cfg, n=8, seed=21):
     g = torch.Generator().manual_seed(seed)
     lat = torch.randn((n,) + cfg.latent_shape, generator=g)
